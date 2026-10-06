@@ -637,7 +637,9 @@ pub(crate) fn blit_decoded_image_format2_source_over(
     source: &DecodedImage,
     destination_x: i32,
     destination_y: i32,
+    transparency: i32,
 ) {
+    let coverage = (256 - transparency.clamp(0, 256)) as u32;
     for source_y in 0..source.height as i32 {
         let target_y = destination_y + source_y;
         if !(0..destination.height as i32).contains(&target_y) {
@@ -654,7 +656,7 @@ pub(crate) fn blit_decoded_image_format2_source_over(
             let source_pixel = &source.rgba[source_index..source_index + 4];
             let destination_pixel = &mut destination.rgba[target_index..target_index + 4];
 
-            let source_alpha = u32::from(source_pixel[3]);
+            let source_alpha = (u32::from(source_pixel[3]) * coverage) >> 8;
             if source_alpha == 0 {
                 continue;
             }

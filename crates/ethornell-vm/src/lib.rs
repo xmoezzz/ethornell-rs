@@ -597,6 +597,8 @@ pub trait SysApi {
 
     fn configure_screen_size(&mut self, _width: i32, _height: i32) {}
 
+    fn register_display_mode(&mut self, _index: usize, _width: i32, _height: i32) {}
+
     fn set_window_monitor_adapter_mode(&mut self, mode: i32) -> bool {
         (0..=1).contains(&mode)
     }
@@ -8799,6 +8801,7 @@ impl Vm {
                     2
                 } else {
                     self.display_mode_slots[index as usize] = Some((first, second));
+                    api.register_display_mode(index as usize, first, second);
                     0
                 };
                 Value::Int(status)

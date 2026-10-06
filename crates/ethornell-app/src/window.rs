@@ -1,7 +1,7 @@
 use super::*;
 use winit::application::ApplicationHandler;
 use winit::data_transfer::TypeHint;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{
     ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
 };
@@ -337,6 +337,19 @@ impl ApplicationHandler for WindowApp {
                         window.set_fullscreen(
                             fullscreen.then(|| Fullscreen::Borderless(window.current_monitor())),
                         );
+                    }
+                    if runtime.api.window_mode == 0 {
+                        if let Some((width, height)) = runtime.api.pending_window_size.take() {
+                            if let Some(size) =
+                                window.request_surface_size(PhysicalSize::new(width, height).into())
+                            {
+                                renderer.resize(size.width, size.height);
+                                runtime.api.window_surface_width =
+                                    size.width.min(i32::MAX as u32) as i32;
+                                runtime.api.window_surface_height =
+                                    size.height.min(i32::MAX as u32) as i32;
+                            }
+                        }
                     }
                     if let Some(visible) = runtime.api.pending_window_visible.take() {
                         window.set_visible(visible);

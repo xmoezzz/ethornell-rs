@@ -470,6 +470,7 @@ struct RuntimeTraceApi {
     window_mode: i32,
     screen_width: i32,
     screen_height: i32,
+    display_mode_sizes: [Option<(i32, i32)>; 8],
     window_surface_width: i32,
     window_surface_height: i32,
     engine_time_ms: u64,
@@ -753,6 +754,7 @@ struct RuntimeTraceApi {
     pending_transition_destination: Option<i32>,
     pending_window_title: Option<String>,
     pending_window_position: Option<(i32, i32)>,
+    pending_window_size: Option<(u32, u32)>,
     pending_fullscreen: Option<bool>,
     pending_window_visible: Option<bool>,
     pending_window_minimize: bool,
@@ -805,8 +807,9 @@ impl RuntimeTraceApi {
             system92_text_fragment_records: Vec::new(),
             system92_text_render_override: 0,
             window_mode: 0,
-            screen_width: 0,
-            screen_height: 0,
+            screen_width: 1280,
+            screen_height: 720,
+            display_mode_sizes: [None, None, None, None, None, None, Some((1280, 720)), None],
             window_surface_width: 0,
             window_surface_height: 0,
             engine_time_ms: 0,
@@ -1040,6 +1043,7 @@ impl RuntimeTraceApi {
             pending_transition_destination: None,
             pending_window_title: None,
             pending_window_position: None,
+            pending_window_size: None,
             pending_fullscreen: None,
             pending_window_visible: None,
             pending_window_minimize: false,
@@ -5746,14 +5750,16 @@ impl RuntimeTraceApi {
             // clipped replacement. Treating it as source-over can preserve a
             // stale transparent work buffer over the newly composed portrait.
             blit_decoded_image_raw_copy(&mut destination_image, &source_image, x, y);
-        } else if alpha_parameter == 0
-            && mode == 1
-            && source_format == Some(2)
-            && destination_format == Some(2)
-        {
+        } else if mode == 1 && source_format == Some(2) && destination_format == Some(2) {
             // sub_40B200: format-2 selector 1 stores straight-alpha RGB and
             // normalizes channels by the resulting coverage.
-            blit_decoded_image_format2_source_over(&mut destination_image, &source_image, x, y);
+            blit_decoded_image_format2_source_over(
+                &mut destination_image,
+                &source_image,
+                x,
+                y,
+                alpha_parameter,
+            );
         } else if alpha_parameter == 0 {
             blit_decoded_image(&mut destination_image, &source_image, x, y, mode);
         } else {
@@ -12839,6 +12845,87 @@ mod input_tests {
     }
 
     #[test]
+    fn window_resolution_changes_preserve_the_display_mode_canvas() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (width, height) in [(960, 540), (1920, 1080), (1280, 720)] {
+            call_sys(
+                &mut api,
+                0x81,
+                0x64,
+                &mut vec![Value::Int(width), Value::Int(height)],
+            )
+            .unwrap();
+            assert_eq!(
+                api.pending_window_size.take(),
+                Some((width as u32, height as u32))
+            );
+            assert_eq!((api.screen_width, api.screen_height), (1280, 720));
+        }
+        // A script can register a taller logical canvas independently of the
+        // requested window size, then switch back to the widescreen mode.
+        api.register_display_mode(7, 1280, 960);
+        call_sys(
+            &mut api,
+            0x80,
+            0x60,
+            &mut vec![Value::Int(7), Value::Int(1), Value::Int(0)],
+        )
+        .unwrap();
+        api.configure_screen_size(800, 600);
+        assert_eq!((api.screen_width, api.screen_height), (1280, 960));
+        assert_eq!(api.pending_window_size.take(), Some((800, 600)));
+        call_sys(
+            &mut api,
+            0x80,
+            0x60,
+            &mut vec![Value::Int(6), Value::Int(1), Value::Int(0)],
+        )
+        .unwrap();
+        assert_eq!((api.screen_width, api.screen_height), (1280, 720));
+        api.configure_screen_size(0, 600);
+        assert_eq!(api.pending_window_size, None);
+    }
+
+    #[test]
+    fn message_bitmap_transparency_preserves_straight_rgb() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.store_runtime_bitmap(
+            1151,
+            DecodedImage {
+                width: 2,
+                height: 1,
+                rgba: vec![174, 122, 90, 255, 52, 26, 10, 128],
+            },
+            2,
+        );
+        for (transparency, alpha) in [(0, [255, 128]), (25, [230, 115]), (256, [0, 0])] {
+            api.store_runtime_bitmap(
+                1262,
+                DecodedImage {
+                    width: 2,
+                    height: 1,
+                    rgba: vec![0; 8],
+                },
+                2,
+            );
+            api.composite_graph_bitmap(1262, 1151, 0, 0, 1, transparency)
+                .unwrap();
+            let pixels = api.graph_bitmap_image(1262).unwrap().rgba;
+            assert_eq!([pixels[3], pixels[7]], alpha);
+            if transparency != 256 {
+                assert_eq!(&pixels[..3], &[174, 122, 90]);
+                assert_eq!(&pixels[4..7], &[52, 26, 10]);
+            } else {
+                assert_eq!(pixels, vec![0; 8]);
+            }
+        }
+    }
+
+    #[test]
     fn bitmap_tile_composition_preserves_the_allocated_destination_canvas() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -16777,10 +16864,16 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn configure_screen_size(&mut self, width: i32, height: i32) {
         if width > 0 && height > 0 {
-            self.screen_width = width;
-            self.screen_height = height;
-            self.graph90_refresh_background_screen_layout();
-            tracing::info!(width, height, "native screen size configured");
+            // Sys81:64 selects the presentation size. Script coordinates and
+            // bitmap layouts stay in the display mode's logical canvas.
+            self.pending_window_size = Some((width as u32, height as u32));
+            tracing::info!(width, height, "native window size requested");
+        }
+    }
+
+    fn register_display_mode(&mut self, index: usize, width: i32, height: i32) {
+        if let Some(slot) = self.display_mode_sizes.get_mut(index) {
+            *slot = Some((width, height));
         }
     }
 
@@ -18030,6 +18123,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 }
                 self.window_mode = i32::from(fullscreen);
                 self.pending_fullscreen = Some(fullscreen);
+                if let Some((width, height)) = self.display_mode_sizes[mode as usize] {
+                    if width > 0 && height > 0 {
+                        self.screen_width = width;
+                        self.screen_height = height;
+                        self.graph90_refresh_background_screen_layout();
+                    }
+                }
                 tracing::info!(mode, adapter, fullscreen, "ConfigureDisplayMode");
                 return Ok(ethornell_vm::Value::None);
             }
@@ -18360,17 +18460,18 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(0));
             }
             (0x81, 0x60) => {
-                self.screen_height = pop_int_value(stack).unwrap_or_default();
-                self.screen_width = pop_int_value(stack).unwrap_or_default();
-                let flags = pop_int_value(stack).unwrap_or_default();
-                self.graph90_refresh_background_screen_layout();
-                tracing::info!(
-                    flags,
-                    width = self.screen_width,
-                    height = self.screen_height,
-                    "ConfigureScreen"
-                );
-                return Ok(ethornell_vm::Value::None);
+                let height = pop_int_value(stack).unwrap_or_default();
+                let width = pop_int_value(stack).unwrap_or_default();
+                let index = pop_int_value(stack).unwrap_or_default();
+                let status = if !(0..8).contains(&index) {
+                    1
+                } else if width == 0 || height == 0 {
+                    2
+                } else {
+                    self.register_display_mode(index as usize, width, height);
+                    0
+                };
+                return Ok(ethornell_vm::Value::Int(status));
             }
             (0x81, 0x62) => {
                 let value = pop_int_value(stack).unwrap_or_default();
@@ -18388,14 +18489,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(self.system_config_input_mode));
             }
             (0x81, 0x64) => {
-                self.screen_height = pop_int_value(stack).unwrap_or_default();
-                self.screen_width = pop_int_value(stack).unwrap_or_default();
-                self.graph90_refresh_background_screen_layout();
-                tracing::info!(
-                    width = self.screen_width,
-                    height = self.screen_height,
-                    "ConfigureScreenSize"
-                );
+                let height = pop_int_value(stack).unwrap_or_default();
+                let width = pop_int_value(stack).unwrap_or_default();
+                self.configure_screen_size(width, height);
                 return Ok(ethornell_vm::Value::None);
             }
             (0x81, 0x6f) => {
