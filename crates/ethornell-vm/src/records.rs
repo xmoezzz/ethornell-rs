@@ -32,7 +32,8 @@ impl Vm {
         let start = Self::value_key(ptr);
         let end = start.saturating_add(size as u32);
         self.mem_values
-            .retain(|addr, _| *addr < start || *addr >= end);
+            .extract_if(start..end, |_, _| true)
+            .for_each(drop);
     }
 
     pub(crate) fn copy_shadow_values(&mut self, src: u32, dst: u32, size: usize) {
@@ -45,14 +46,8 @@ impl Vm {
         let end = src_start.saturating_add(size as u32);
         let copied: Vec<_> = self
             .mem_values
-            .iter()
-            .filter_map(|(addr, value)| {
-                if *addr >= src_start && *addr < end {
-                    Some((dst_start.saturating_add(*addr - src_start), value.clone()))
-                } else {
-                    None
-                }
-            })
+            .range(src_start..end)
+            .map(|(addr, value)| (dst_start.saturating_add(*addr - src_start), value.clone()))
             .collect();
         self.mem_values.extend(copied);
     }
@@ -642,10 +637,8 @@ impl Vm {
         let src_end = src_start.saturating_add(state.record_size);
         let shadow_values = self
             .mem_values
-            .iter()
-            .filter_map(|(addr, value)| {
-                (*addr >= src_start && *addr < src_end).then(|| (*addr - src_start, value.clone()))
-            })
+            .range(src_start..src_end)
+            .map(|(addr, value)| (*addr - src_start, value.clone()))
             .collect();
         let entry = IndexedRecordEntry {
             bytes: self.memory[src_range].to_vec(),
@@ -852,6 +845,25 @@ fn read_dcfs_varint(encoded: &[u8], input: &mut usize) -> VmResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_range_copy_and_clear_preserve_adjacent_values() {
+        let mut vm = Vm::new();
+        for addr in [99, 100, 103, 104, 199, 200, 203, 204, 100_000] {
+            vm.mem_values.insert(addr, Value::Str(addr.to_string()));
+        }
+        vm.copy_shadow_values(100, 200, 4);
+        assert_eq!(vm.mem_values[&200], Value::Str("100".into()));
+        assert_eq!(vm.mem_values[&203], Value::Str("103".into()));
+        vm.clear_shadow_values(100, 4);
+        assert!(!vm.mem_values.contains_key(&100));
+        assert!(!vm.mem_values.contains_key(&103));
+        vm.clear_shadow_values(200, 0);
+        assert!(vm.mem_values.contains_key(&200));
+        for addr in [99, 104, 199, 204, 100_000] {
+            assert_eq!(vm.mem_values[&addr], Value::Str(addr.to_string()));
+        }
+    }
 
     #[test]
     fn keyed_record_fetch_uses_zero_for_success_and_replaces_duplicate_keys() {

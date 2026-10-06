@@ -2075,7 +2075,9 @@ pub struct Vm {
     target_loaded_programs: Vec<usize>,
     pub current_program: usize,
     pub memory: Vec<u8>,
-    pub mem_values: HashMap<u32, Value>,
+    // Native writes and thread transfers operate on address ranges. Keep the
+    // shadow values ordered so a small write does not scan every scene record.
+    pub mem_values: BTreeMap<u32, Value>,
     pub mem_ptr: u32,
     pub heap_ptr: u32,
     heap_allocations: BTreeMap<u32, u32>,
@@ -2157,7 +2159,7 @@ pub struct Vm {
 #[derive(Debug, Default)]
 struct SharedHeapState {
     bytes: Vec<u8>,
-    values: HashMap<u32, Value>,
+    values: BTreeMap<u32, Value>,
     generation: u64,
     journal: Vec<SharedHeapJournalEntry>,
 }
