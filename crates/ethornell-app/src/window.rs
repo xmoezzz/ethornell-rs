@@ -115,6 +115,8 @@ impl ApplicationHandler for WindowApp {
                         runtime.api.pending_object_state = None;
                         runtime.api.input_down_descriptors.clear();
                         runtime.api.input_down_reported.clear();
+                        runtime.api.mouse_pressed = false;
+                        runtime.api.finish_graph_knob_drag();
                     }
                 }
             }

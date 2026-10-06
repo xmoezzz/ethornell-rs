@@ -2497,7 +2497,7 @@ impl RuntimeTraceApi {
                 state.target
             });
             if !enabled && self.graph_active_input_handle == current {
-                self.graph_active_input_handle = 0;
+                self.finish_graph_knob_drag();
             }
             let children = self.graph_native_member_children(current);
             // sub_4210E0 forwards to the controlled target after the base
@@ -3244,7 +3244,11 @@ impl RuntimeTraceApi {
         if let Some(state) = self.graph_knob_states.get_mut(&handle) {
             state.begin_drag(point.0, point.1, target_x, target_y);
         }
+        self.finish_graph_knob_drag();
         self.graph_active_input_handle = handle;
+        // Scripts track knob capture through PollQueuedEvent, independently
+        // of the host handle returned by Graph91:DB.
+        self.queued_system_events.push_back([0x1000, handle, 0]);
         tracing::info!(
             handle,
             target = state.target,
@@ -3268,11 +3272,11 @@ impl RuntimeTraceApi {
             return false;
         }
         let Some(state_before) = self.graph_knob_states.get(&handle).copied() else {
-            self.graph_active_input_handle = 0;
+            self.finish_graph_knob_drag();
             return false;
         };
         if !state_before.enabled {
-            self.graph_active_input_handle = 0;
+            self.finish_graph_knob_drag();
             return false;
         }
         let Some((target_x, target_y, _, _)) =
@@ -3316,6 +3320,13 @@ impl RuntimeTraceApi {
         true
     }
 
+    fn finish_graph_knob_drag(&mut self) {
+        let handle = std::mem::take(&mut self.graph_active_input_handle);
+        if handle != 0 {
+            self.queued_system_events.push_back([0x1001, handle, 0]);
+        }
+    }
+
     /// WM_LBUTTONUP ends the active native knob gesture before the generic
     /// message/icon input system sees a release. Target WndProc keeps a
     /// separate knob-capture flag for exactly this reason.
@@ -3325,7 +3336,7 @@ impl RuntimeTraceApi {
             return false;
         }
         let _ = self.process_graph_knob_pointer_motion(point);
-        self.graph_active_input_handle = 0;
+        self.finish_graph_knob_drag();
         tracing::info!(
             handle,
             mouse_x = point.0,
@@ -3669,6 +3680,16 @@ impl RuntimeTraceApi {
         self.remove_surface_control_layers(surface);
         self.detach_graph_surface_relations(surface);
         self.graph_bindings.remove(&surface);
+        // Window backgrounds are private retained copies registered under
+        // the Window handle. Leaving this binding behind makes
+        // graph_handle_exists reserve the released slot forever. After 16
+        // slots, a new Window returns 0 (the BackF handle), so subsequent
+        // Window positioning can move the background instead of the UI.
+        self.graph_resources.remove(&surface);
+        self.graph91_object_transforms.remove(&surface);
+        let backing_key = format!("runtime:surface:{surface}:backing");
+        self.graph_images.remove(&backing_key);
+        self.graph_image_revisions.remove(&backing_key);
         self.surface_text_states.remove(&surface);
         self.surface_text_buffers.remove(&surface);
         self.graph_object_layers.remove(&surface);
@@ -9022,6 +9043,41 @@ mod input_tests {
     }
 
     #[test]
+    fn released_window_backings_do_not_exhaust_native_slots() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 1900;
+        let source_key = "test:window-backing-source";
+        api.store_graph_image(
+            source_key.to_string(),
+            DecodedImage {
+                width: 8,
+                height: 8,
+                rgba: vec![255; 8 * 8 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(source_key.to_string()));
+
+        // Repeated dialogue/menu lifetimes must reuse the same native slot,
+        // while the independent source bitmap remains available.
+        for _ in 0..32 {
+            let window = api.alloc_window_surface(8, 8).expect("free Window slot");
+            assert_eq!(window, 0xB000_0000_u32 as i32);
+            assert!(api.retain_surface_backing(window, bitmap));
+            let backing_key = api.graph_resources[&window].key.clone();
+            let mut release = vec![Value::Int(window)];
+            call_graph(&mut api, 0x90, 0x81, &mut release).unwrap();
+            assert!(!api.graph_handle_exists(window));
+            assert!(!api.graph_images.contains_key(&backing_key));
+            assert!(!api.graph_image_revisions.contains_key(&backing_key));
+            assert!(api.graph_images.contains_key(source_key));
+            assert!(api.graph_resources.contains_key(&bitmap));
+        }
+    }
+
+    #[test]
     fn native_graph_scheduler_and_work_bitmap_follow_validated_configuration() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -11549,6 +11605,10 @@ mod input_tests {
             super::RuntimeInputEvent::MousePress { x: 110.0, y: 210.0 },
         );
         assert_eq!(api.graph_active_input_handle, handle);
+        assert_eq!(
+            SysApi::poll_queued_event(&mut api),
+            Some([0x1000, handle, 0])
+        );
         let mut active = Vec::new();
         assert_eq!(
             call_graph(&mut api, 0x91, 0xdb, &mut active).unwrap(),
@@ -11573,10 +11633,34 @@ mod input_tests {
         );
         assert_eq!(api.graph_active_input_handle, 0);
         assert!(api.pending_click.is_none());
+        assert_eq!(
+            SysApi::poll_queued_event(&mut api),
+            Some([0x1001, handle, 0])
+        );
+        api.finish_graph_knob_drag();
+        assert_eq!(SysApi::poll_queued_event(&mut api), None);
         let mut inactive = Vec::new();
         assert_eq!(
             call_graph(&mut api, 0x91, 0xdb, &mut inactive).unwrap(),
             Value::Int(0)
+        );
+
+        // Hiding a captured slider must also release the script-side gate,
+        // even when no mouse-up event reaches the control.
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 210.0, y: 210.0 },
+        );
+        assert_eq!(
+            SysApi::poll_queued_event(&mut api),
+            Some([0x1000, handle, 0])
+        );
+        let mut disable = vec![Value::Int(handle), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd4, &mut disable).unwrap();
+        assert_eq!(api.graph_active_input_handle, 0);
+        assert_eq!(
+            SysApi::poll_queued_event(&mut api),
+            Some([0x1001, handle, 0])
         );
     }
 
@@ -14024,6 +14108,7 @@ mod input_tests {
             &mut api,
             button_object,
             GraphInputDescriptor {
+                flags: [0, 0, 2, 0, 1, 0, 0],
                 regions: vec![GraphInputRegion {
                     group: 0,
                     index: 5,
@@ -14052,6 +14137,7 @@ mod input_tests {
             &mut api,
             fallback_object,
             GraphInputDescriptor {
+                flags: [0, 1, 0, 0, 0, 0, 0],
                 regions: vec![GraphInputRegion {
                     group: 0,
                     index: 0,
@@ -14330,23 +14416,37 @@ mod input_tests {
             );
         }
 
-        assert!(api.process_graph_input_mouse_press((115.0, 525.0)));
-        let lower_has_no_item = api
-            .graph_input_objects
-            .get_mut(&lower_object)
-            .unwrap()
-            .queued_events
-            .iter()
-            .any(|event| event[0] == 0x1000_0007 && event[1] == -1);
-        let upper_has_no_item = api
-            .graph_input_objects
-            .get_mut(&upper_object)
-            .unwrap()
-            .queued_events
-            .iter()
-            .any(|event| event[0] == 0x1000_0007 && event[1] == -1);
-        assert!(!lower_has_no_item);
-        assert!(upper_has_no_item);
+        // Item-only processors leave a click in their empty Window rectangle
+        // available to the story's input scope, including after reconfiguration.
+        for window_flags in [[0, 0], [1, 0], [0, 1], [0, 0]] {
+            for object in [lower_object, upper_object] {
+                let mut descriptor = api.graph_input_objects[&object].descriptor.clone();
+                descriptor.flags[..2].copy_from_slice(&window_flags);
+                GraphApi::configure_graph_input_object(&mut api, object, descriptor);
+            }
+            super::note_native_input_release(&mut api, INPUT_DESCRIPTOR_MOUSE_LEFT);
+            super::note_native_input_press(&mut api, INPUT_DESCRIPTOR_MOUSE_LEFT);
+            let captures_window = window_flags != [0, 0];
+            assert_eq!(
+                api.process_graph_input_mouse_press((115.0, 525.0)),
+                captures_window
+            );
+            assert_eq!(
+                super::drain_native_input_descriptor(&mut api, INPUT_DESCRIPTOR_MOUSE_LEFT),
+                if captures_window { 0 } else { i32::MIN | 1 },
+                "blank toolbar clicks must remain available for message advancement"
+            );
+            for (object, expects_event) in [(lower_object, false), (upper_object, captures_window)]
+            {
+                assert_eq!(
+                    api.graph_input_objects[&object]
+                        .queued_events
+                        .iter()
+                        .any(|event| event[0] == 0x1000_0007 && event[1] == -1),
+                    expects_event
+                );
+            }
+        }
     }
 
     #[test]
@@ -15772,12 +15872,15 @@ impl RuntimeTraceApi {
         // No live item was hit. Target sub_46D830 still scopes the destructive
         // input read to the top registered pointer object, so do not emit Ex
         // no-item callbacks for every processor. Restrict fallback candidates
-        // to visible owning Windows that actually contain the pointer, then
-        // select the highest native id/registration priority.
+        // to processors that sample their owning Window (root+0x0C/+0x10),
+        // with a visible Window containing the pointer. Item-only toolbars
+        // must leave blank-area clicks available to CProcDspMsg.
         let fallback = mapped
             .iter()
-            .filter(|(_, surface, _, hit)| {
-                hit.is_none() && self.graph_input_surface_contains_point(*surface, point)
+            .filter(|(object, surface, _, hit)| {
+                hit.is_none()
+                    && self.graph_input_objects[object].samples_window_pointer_input()
+                    && self.graph_input_surface_contains_point(*surface, point)
             })
             .max_by_key(|(object, _, _, _)| *object)
             .cloned();
@@ -20635,7 +20738,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let _ = state;
                     self.graph_knob_watches.retain(|watched| *watched != handle);
                     if self.graph_active_input_handle == handle {
-                        self.graph_active_input_handle = 0;
+                        self.finish_graph_knob_drag();
                     }
                     self.graph_object_enabled.remove(&handle);
                     self.graph_object_draw_enabled.remove(&handle);
