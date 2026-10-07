@@ -3986,10 +3986,20 @@ impl Vm {
                     let height = self.pop_int()?;
                     let width = self.pop_int()?;
                     let bitmap = self.pop_int()?;
+                    // sub_4080B0: format 1 (and 7, which sub_407DA0 maps to
+                    // 1) reads packed 3-byte B,G,R pixels into XRGB dwords;
+                    // every other format is a tightly packed copy using the
+                    // registry pixel size of 0x4E41B0.
+                    const FORMAT_BYTES: [usize; 8] = [2, 4, 4, 1, 4, 4, 6, 4];
+                    let source_bpp = match format {
+                        1 | 7 => 3,
+                        0..=6 => FORMAT_BYTES[format as usize],
+                        _ => 0,
+                    };
                     let byte_count = (width.max(0) as usize)
                         .checked_mul(height.max(0) as usize)
-                        .and_then(|pixels| pixels.checked_mul(3))
-                        .ok_or_else(|| VmError::Runtime("bitmap RGB size overflow".into()))?;
+                        .and_then(|pixels| pixels.checked_mul(source_bpp))
+                        .ok_or_else(|| VmError::Runtime("bitmap pixel size overflow".into()))?;
                     let range = self.resolve_range(pixels, byte_count)?;
                     let bytes = self.memory[range].to_vec();
                     api.create_bitmap_from_rgb(bitmap, width, height, format, &bytes);
@@ -10743,7 +10753,28 @@ impl Vm {
             } else {
                 encoding_rs::SHIFT_JIS
             };
-            let text = self.value_as_text_descriptor_string(original.clone(), encoding)?;
+            // sub_48DF50 turns a script pointer into a native `char *`; it does
+            // not look for a string elsewhere. Only untyped integers keep the
+            // descriptor fallback.
+            // A script may cut a double-byte character in half to make a
+            // string fit (usdtwnd's save-slot excerpt loop); the lone lead
+            // byte is not damage and must not send a valid pointer into the
+            // descriptor fallback.
+            let text = match original {
+                Value::Ptr(ptr) if ptr != 0 && self.shadow_string_at(ptr).is_some() => {
+                    self.shadow_string_at(ptr).unwrap_or_default()
+                }
+                Value::Ptr(ptr) if ptr != 0 => {
+                    let direct = self.value_as_string_with_encoding(original.clone(), encoding)?;
+                    let trimmed = direct.trim_matches('\0').trim_end_matches('\u{fffd}');
+                    if trimmed.is_empty() || is_plausible_text_payload(trimmed) {
+                        trimmed.to_string()
+                    } else {
+                        self.value_as_text_descriptor_string(original.clone(), encoding)?
+                    }
+                }
+                _ => self.value_as_text_descriptor_string(original.clone(), encoding)?,
+            };
             if std::env::var_os("TRACE_RESOURCE_ARGS").is_some() {
                 let ptr = match original {
                     Value::Int(value) if value != 0 => Some(value as u32),
@@ -10768,9 +10799,6 @@ impl Vm {
             // plausibility test because they may be plain numbers.
             let non_null_pointer = matches!(original, Value::Ptr(ptr) if ptr != 0);
             if non_null_pointer && !text.starts_with("0x") {
-                // A script may cut a double-byte character in half to make a
-                // string fit; the lone lead byte decodes to U+FFFD and the
-                // target layout simply ignores it.
                 let cleaned = text.trim_matches('\0').trim_end_matches('\u{fffd}');
                 self.replace_stack_value(index, Value::Str(cleaned.to_string()));
             } else if is_plausible_text_payload(&text) {

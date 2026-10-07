@@ -118,11 +118,9 @@ pub(crate) fn compose_runtime_frame_through_priority(
         px.copy_from_slice(&[0, 0, 0, 255]);
     }
 
-    let draw_items = if maximum_priority.is_some() {
-        api.graph_draw_items()
-    } else {
-        api.graph_output_draw_items()
-    };
+    // sub_430D30 draws the same CObjectManager list as the frame, stopping at
+    // the priority bound; stale Back-class resources are not part of it.
+    let draw_items = api.graph_output_draw_items();
     for item in draw_items {
         if maximum_priority.is_some_and(|maximum| item.z > maximum) {
             continue;

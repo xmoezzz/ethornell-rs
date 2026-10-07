@@ -1173,7 +1173,9 @@ impl RuntimeTraceApi {
         self.graph_bindings.remove(&bitmap);
         self.reset_bitmap_auxiliary_pair(bitmap);
         self.bitmap_dimensions.insert(bitmap, (width, height));
-        self.bitmap_formats.insert(bitmap, 2);
+        // sub_442EE0/sub_442F80 create the bitmap in the back buffer's
+        // format (sub_442E10), which is RGB format 1.
+        self.bitmap_formats.insert(bitmap, 1);
         self.graph_surfaces.insert(
             bitmap,
             RuntimeSurface::bitmap(bitmap, width as f32, height as f32),
@@ -9165,6 +9167,26 @@ mod input_tests {
     }
 
     #[test]
+    fn bitmap_pixel_bridge_uses_target_dib_byte_order_per_format() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        // sub_4080B0 packs format-1 bytes as B,G,R into XRGB dwords.
+        assert!(api.create_bitmap_from_rgb(10, 2, 1, 1, &[1, 2, 3, 4, 5, 6]));
+        let image = api.graph_bitmap_image(10).unwrap();
+        assert_eq!(image.rgba, [3, 2, 1, 255, 6, 5, 4, 255]);
+        assert_eq!(api.bitmap_formats[&10], 1);
+        // sub_408200 copies three bytes per format-1 pixel and rejects a
+        // buffer that is too small.
+        assert_eq!(api.read_bitmap_pixels(10, 5), None);
+        assert_eq!(api.read_bitmap_pixels(10, 6), Some(vec![1, 2, 3, 4, 5, 6]));
+        // Format 2 keeps alpha in the fourth byte.
+        assert!(api.create_bitmap_from_rgb(11, 1, 1, 2, &[1, 2, 3, 0x80]));
+        assert_eq!(api.graph_bitmap_image(11).unwrap().rgba, [3, 2, 1, 0x80]);
+        assert_eq!(api.read_bitmap_pixels(11, 4), Some(vec![1, 2, 3, 0x80]));
+    }
+
+    #[test]
     fn native_graph_scheduler_and_work_bitmap_follow_validated_configuration() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -9192,7 +9214,7 @@ mod input_tests {
         let mut create = vec![Value::Int(bitmap)];
         call_graph(&mut api, 0x90, 0x04, &mut create).unwrap();
         assert_eq!(api.bitmap_dimensions[&bitmap], (1280, 720));
-        assert_eq!(api.bitmap_formats[&bitmap], 2);
+        assert_eq!(api.bitmap_formats[&bitmap], 1);
         assert_eq!(api.graph_surfaces[&bitmap].width, 1280.0);
         assert_eq!(api.graph_surfaces[&bitmap].height, 720.0);
         assert!(!api.graph_config.bitmap_priorities.contains_key(&bitmap));
@@ -19168,16 +19190,32 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         format: i32,
         pixels: &[u8],
     ) -> bool {
-        if !(0..0x4000).contains(&bitmap) || width <= 0 || height <= 0 || format != 1 {
+        // sub_4080B0. Pixel bytes are in the target's little-endian DIB
+        // order: format 1 is packed B,G,R; format 2 is B,G,R,A; format 0 is a
+        // 555 word; format 3 is one coverage byte.
+        let format = if format == 7 { 1 } else { format };
+        if !(0..0x4000).contains(&bitmap) || width <= 0 || height <= 0 || !(0..=3).contains(&format)
+        {
             return false;
         }
         let pixel_count = width as usize * height as usize;
-        if pixels.len() < pixel_count * 3 {
+        let source_bpp = [2, 3, 4, 1][format as usize];
+        if pixels.len() < pixel_count * source_bpp {
             return false;
         }
         let mut rgba = Vec::with_capacity(pixel_count * 4);
-        for rgb in pixels[..pixel_count * 3].as_chunks::<3>().0 {
-            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        for px in pixels[..pixel_count * source_bpp].chunks_exact(source_bpp) {
+            let value = match format {
+                0 => {
+                    let word = u16::from_le_bytes([px[0], px[1]]);
+                    let channel = |shift: u16| (((word >> shift) & 0x1f) << 3) as u8;
+                    [channel(10), channel(5), channel(0), 255]
+                }
+                1 => [px[2], px[1], px[0], 255],
+                2 => [px[2], px[1], px[0], px[3]],
+                _ => [px[0], 0, 0, 255],
+            };
+            rgba.extend_from_slice(&value);
         }
         let image = DecodedImage {
             width: width as u32,
@@ -19186,6 +19224,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         };
         let key = format!("runtime:rgb:{bitmap}");
         self.store_graph_image(key.clone(), image);
+        self.bitmap_formats.insert(bitmap, format);
         self.graph_resources
             .insert(bitmap, RuntimeGraphResource::whole(key));
         self.reset_bitmap_auxiliary_pair(bitmap);
@@ -19199,16 +19238,28 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
     }
 
     fn read_bitmap_pixels(&mut self, bitmap: i32, capacity: usize) -> Option<Vec<u8>> {
+        // sub_408200 copies `{2, 3, 4, 1}[format]` bytes of every pixel in
+        // the target's DIB byte order and fails when the buffer is smaller.
         let image = self.graph_bitmap_image(bitmap)?;
-        let required = image.width as usize * image.height as usize * 3;
+        let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+        let bytes_per_pixel = [2usize, 3, 4, 1].get(usize::try_from(format).ok()?).copied()?;
+        let required = image.width as usize * image.height as usize * bytes_per_pixel;
         if capacity < required {
             return None;
         }
-        let mut rgb = Vec::with_capacity(required);
-        for rgba in image.rgba.as_chunks::<4>().0 {
-            rgb.extend_from_slice(&rgba[..3]);
+        let mut out = Vec::with_capacity(required);
+        for [r, g, b, a] in image.rgba.as_chunks::<4>().0.iter().copied() {
+            match format {
+                0 => {
+                    let word = (u16::from(r >> 3) << 10) | (u16::from(g >> 3) << 5) | u16::from(b >> 3);
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                1 => out.extend_from_slice(&[b, g, r]),
+                2 => out.extend_from_slice(&[b, g, r, a]),
+                _ => out.push(r),
+            }
         }
-        Some(rgb)
+        Some(out)
     }
 
     fn collect_ruby_substitutions(&mut self, source: &str) -> (String, i32) {
@@ -23036,9 +23087,17 @@ fn run_headless(
 
     let frame_interval = Duration::from_millis(NATIVE_TICK_MS);
     let snapshot_path = std::env::var_os("ETHORNELL_HEADLESS_SNAPSHOT").map(PathBuf::from);
-    let snapshot_frame = std::env::var("ETHORNELL_HEADLESS_SNAPSHOT_FRAME")
+    // A comma-separated list writes one PNG per frame; every frame but the
+    // last gets its frame number inserted before the extension.
+    let snapshot_frames = std::env::var("ETHORNELL_HEADLESS_SNAPSHOT_FRAME")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| item.trim().parse::<usize>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut frame_snapshot_written = false;
     let mut latest_framebuffer = None;
     let mut previous_native_calls = runtime
@@ -23078,9 +23137,19 @@ fn run_headless(
             // render tree and produces a complete offscreen framebuffer.
             let frame_composition =
                 snapshot::compose_runtime_frame_with_diagnostics(&runtime.api, true);
-            if snapshot_frame == Some(frame)
-                && let Some(path) = snapshot_path.as_ref()
+            if snapshot_frames.contains(&frame)
+                && let Some(base_path) = snapshot_path.as_ref()
             {
+                let path = if snapshot_frames.last() == Some(&frame) {
+                    base_path.clone()
+                } else {
+                    let stem = base_path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    base_path.with_file_name(format!("{stem}_{frame}.png"))
+                };
+                let path = &path;
                 snapshot::write_composed_runtime_snapshot(
                     &runtime.api,
                     &frame_composition.framebuffer,

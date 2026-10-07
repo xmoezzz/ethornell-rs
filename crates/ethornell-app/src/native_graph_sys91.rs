@@ -2049,9 +2049,17 @@ impl RuntimeTraceApi {
         scale_y: i32,
         _interpolation: i32,
     ) {
-        let Some(image) = self
-            .graph_bitmap_image(source)
-            .and_then(|image| scale_decoded_image_fixed(&image, scale_x, scale_y))
+        let source_image = self.graph_bitmap_image(source);
+        tracing::info!(
+            destination,
+            source,
+            scale_x,
+            scale_y,
+            source_size = ?source_image.as_ref().map(|image| (image.width, image.height)),
+            "GraphScaleTrueColorBitmap"
+        );
+        let Some(image) =
+            source_image.and_then(|image| scale_decoded_image_fixed(&image, scale_x, scale_y))
         else {
             return;
         };
