@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 mod animation;
 mod audio_runtime;
+mod bitmap_blend;
 mod auto_input;
 mod character_image;
 mod debug_trace;
@@ -5763,46 +5764,71 @@ impl RuntimeTraceApi {
             }
         };
 
-        if alpha_parameter == 0
-            && mode == 128
-            && source_format == Some(1)
-            && destination_format == Some(2)
-        {
-            // sub_40AF50: when a format-1 RGB source is copied into a
-            // format-2 bitmap, the target preserves RGB and forces alpha to
-            // 255. The fourth decoded byte of a format-1 resource is not
-            // source alpha and must never leak into the destination.
-            blit_decoded_image_format1_to_format2(&mut destination_image, &source_image, x, y);
-        } else if alpha_parameter == 0
-            && mode == 128
-            && source_format.is_some()
-            && source_format == destination_format
-        {
-            // sub_40AF50 -> sub_40ADF0: same-format selector 128 is a raw
-            // clipped replacement. Treating it as source-over can preserve a
-            // stale transparent work buffer over the newly composed portrait.
-            blit_decoded_image_raw_copy(&mut destination_image, &source_image, x, y);
-        } else if mode == 1 && source_format == Some(2) && destination_format == Some(2) {
-            // sub_40B200: format-2 selector 1 stores straight-alpha RGB and
-            // normalizes channels by the resulting coverage.
-            blit_decoded_image_format2_source_over(
-                &mut destination_image,
-                &source_image,
-                x,
-                y,
-                alpha_parameter,
-            );
-        } else if alpha_parameter == 0 {
-            blit_decoded_image(&mut destination_image, &source_image, x, y, mode);
-        } else {
-            blit_decoded_image_parameter(
-                &mut destination_image,
-                &source_image,
-                x,
-                y,
-                mode,
-                alpha_parameter,
-            );
+        // Integer kernels of the target bitmap library for the selector
+        // families it implements for the two live pixel formats; any other
+        // combination keeps the previous portable compositor.
+        let native = match (source_format, destination_format) {
+            (Some(sf @ (1 | 2)), Some(df @ (1 | 2))) => match mode {
+                0 => Some(bitmap_blend::blit_alpha_over(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                )),
+                1 | 0x20 if alpha_parameter < 256 => Some(bitmap_blend::blit_alpha_over_parameter(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                    alpha_parameter,
+                )),
+                0x80 => Some(bitmap_blend::blit_copy(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                )),
+                0xf0 if alpha_parameter == 0 => Some(bitmap_blend::blit_copy(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                )),
+                0xf0 if alpha_parameter < 256 => {
+                    bitmap_blend::blit_interpolate(
+                        &mut destination_image,
+                        &source_image,
+                        x,
+                        y,
+                        alpha_parameter,
+                    );
+                    Some(true)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if native != Some(true) {
+            if alpha_parameter == 0 {
+                blit_decoded_image(&mut destination_image, &source_image, x, y, mode);
+            } else {
+                blit_decoded_image_parameter(
+                    &mut destination_image,
+                    &source_image,
+                    x,
+                    y,
+                    mode,
+                    alpha_parameter,
+                );
+            }
         }
         self.store_graph_image(composite_key.clone(), destination_image);
         self.graph_resources.insert(
