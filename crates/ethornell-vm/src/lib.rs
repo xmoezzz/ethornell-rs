@@ -18,6 +18,7 @@ mod debug;
 mod extended_opcodes;
 mod input;
 pub mod native_call;
+pub mod target_thread;
 pub mod native_input;
 pub mod native_motion;
 pub mod native_ownership;
