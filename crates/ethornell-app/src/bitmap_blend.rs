@@ -11,7 +11,14 @@
 //! * 0 (`sub_40B080`) alpha-over with 7-bit source alpha;
 //! * 1 / 0x20 (`sub_40B320`) the same with a 0..255 transparency parameter;
 //! * 0x80 (`sub_40AF50`) copy, with the target's format conversions;
-//! * 0xF0 (`sub_40BC10`) linear interpolation by parameter.
+//! * 0xF0 (`sub_40BC10`) linear interpolation by parameter;
+//! * 0x40 (`sub_40DF80`) mask clear: destination pixels become 0 where the
+//!   source mask is set;
+//! * 0x41 (`sub_40E150`) clear the destination region;
+//! * 2 / 0x21 (`sub_40CA70`) additive blend, 3 / 0x22 (`sub_40D200`) subtractive
+//!   blend, 4 / 0x23 (`sub_40D440`) multiply for the format pairs listed on
+//!   each function. Modes 4 (ARGB source), 5-9, 0xC0/0xC1 and 0xFF are not
+//!   ported and keep the previous float approximation.
 //! Other selectors keep their previous float approximation.
 
 use ethornell_image::DecodedImage;
@@ -268,12 +275,182 @@ pub(crate) fn blit_interpolate(
     });
 }
 
+fn weight_table(parameter: i32) -> impl Fn(u8) -> i32 {
+    // w[k] = (k * p) >> 8 with k = alpha >> 1 (sub_40CDD0 builds this table;
+    // for p = 256 the target substitutes the identity table, which is the
+    // same value).
+    move |alpha| ((i32::from(alpha >> 1)) * parameter) >> 8
+}
+
+/// Mode 2 (additive). `parameter` is the intensity 1..=256; 0 does nothing.
+/// For mode 0x21 the caller passes `256 - p`.
+pub(crate) fn blit_add(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 {
+        return true;
+    }
+    let p = parameter.clamp(0, 256);
+    let saturating = |d: u8, add: i32| clamp_u8(i32::from(d) + add);
+    match (source_format, destination_format) {
+        (1, 1 | 2) => {
+            let touch_alpha = destination_format == 2;
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if u32::from(s[0]) + u32::from(s[1]) + u32::from(s[2]) == 0 {
+                    return;
+                }
+                for lane in 0..3 {
+                    d[lane] = saturating(d[lane], (p * i32::from(s[lane])) >> 8);
+                }
+                if touch_alpha {
+                    d[3] = saturating(d[3], p);
+                }
+            });
+            true
+        }
+        (2, 1 | 2) => {
+            let weight = weight_table(p);
+            let touch_alpha = destination_format == 2;
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] < 2 {
+                    return;
+                }
+                let w = weight(s[3]);
+                for lane in 0..3 {
+                    d[lane] = saturating(d[lane], (i32::from(s[lane]) * w) >> 7);
+                }
+                if touch_alpha {
+                    d[3] = saturating(d[3], (i32::from(s[3]) * (p >> 1)) >> 7);
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mode 3 (subtractive): only an ARGB source into an RGB destination is
+/// implemented by the target; every other pair leaves the destination alone.
+pub(crate) fn blit_subtract(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 || (source_format, destination_format) != (2, 1) {
+        return true;
+    }
+    let weight = weight_table(parameter.clamp(0, 256));
+    for_each_pixel(destination, source, x, y, |s, d| {
+        if s[3] < 2 {
+            return;
+        }
+        let w = weight(s[3]);
+        for lane in 0..3 {
+            d[lane] = clamp_u8(i32::from(d[lane]) - ((i32::from(s[lane]) * w) >> 7));
+        }
+    });
+    true
+}
+
+/// Mode 4 (multiply) for an RGB source (`sub_40D4A0`, `sub_40D670`). An ARGB
+/// source (`sub_40D820`) is not ported; the caller falls back.
+pub(crate) fn blit_multiply(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 {
+        return true;
+    }
+    let w = parameter.clamp(0, 256) >> 1;
+    match (source_format, destination_format) {
+        (1, 1) => {
+            for_each_pixel(destination, source, x, y, |s, d| {
+                for lane in 0..3 {
+                    let scaled = i32::from(((i32::from(s[lane]) - 256) * w) as i16);
+                    let high = (scaled * (i32::from(d[lane]) * 2)) >> 16;
+                    d[lane] = clamp_u8(i32::from(d[lane]) + high);
+                }
+            });
+            true
+        }
+        (1, 2) => {
+            for_each_pixel(destination, source, x, y, |s, d| {
+                for lane in 0..3 {
+                    let product = (i32::from(d[lane]) * i32::from(s[lane])) >> 8;
+                    let delta = i32::from(((product - i32::from(d[lane])) * w) as i16) >> 7;
+                    d[lane] = clamp_u8(i32::from(d[lane]) + delta);
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mode 0x40. A format-1 source masks where `R + G + B > 0`; a format-2
+/// source masks where `alpha == 255` (parameter 0) or `alpha != 0`.
+pub(crate) fn blit_mask_clear(
+    destination: &mut DecodedImage,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    match source_format {
+        1 => for_each_pixel(destination, source, x, y, |s, d| {
+            if u32::from(s[0]) + u32::from(s[1]) + u32::from(s[2]) > 0 {
+                *d = [0; 4];
+            }
+        }),
+        2 => for_each_pixel(destination, source, x, y, |s, d| {
+            let masked = if parameter != 0 {
+                s[3] != 0
+            } else {
+                s[3] == 255
+            };
+            if masked {
+                *d = [0; 4];
+            }
+        }),
+        _ => return false,
+    }
+    true
+}
+
+/// Mode 0x41: zero the destination pixels covered by the blit.
+pub(crate) fn blit_clear_region(
+    destination: &mut DecodedImage,
+    source: &DecodedImage,
+    x: i32,
+    y: i32,
+) {
+    for_each_pixel(destination, source, x, y, |_, d| *d = [0; 4]);
+}
+
 fn copy(destination: &mut DecodedImage, source: &DecodedImage, x: i32, y: i32) {
     for_each_pixel(destination, source, x, y, |s, d| *d = *s);
 }
 
 fn force_opaque_copy(destination: &mut DecodedImage, source: &DecodedImage, x: i32, y: i32) {
-    for_each_pixel(destination, source, x, y, |s, d| *d = [s[0], s[1], s[2], 0xff]);
+    for_each_pixel(destination, source, x, y, |s, d| {
+        *d = [s[0], s[1], s[2], 0xff]
+    });
 }
 
 #[cfg(test)]
@@ -358,6 +535,94 @@ mod tests {
         let mut same = image(&[[0, 0, 0, 0]]);
         assert!(blit_copy(&mut same, 2, &src2, 2, 0, 0));
         assert_eq!(same.rgba, [200, 100, 50, 128]);
+    }
+
+    #[test]
+    fn mask_clear_follows_the_source_format_rules() {
+        let rgb_mask = image(&[[0, 0, 0, 255], [0, 1, 0, 255]]);
+        let mut dst = image(&[[9, 9, 9, 9], [9, 9, 9, 9]]);
+        assert!(blit_mask_clear(&mut dst, &rgb_mask, 1, 0, 0, 0));
+        assert_eq!(dst.rgba, [9, 9, 9, 9, 0, 0, 0, 0]);
+        let argb_mask = image(&[[1, 1, 1, 255], [1, 1, 1, 100], [1, 1, 1, 0]]);
+        let mut exact = image(&[[9, 9, 9, 9]; 3]);
+        assert!(blit_mask_clear(&mut exact, &argb_mask, 2, 0, 0, 0));
+        assert_eq!(&exact.rgba[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&exact.rgba[4..8], &[9, 9, 9, 9]);
+        let mut any = image(&[[9, 9, 9, 9]; 3]);
+        assert!(blit_mask_clear(&mut any, &argb_mask, 2, 0, 0, 1));
+        assert_eq!(&any.rgba[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&any.rgba[8..12], &[9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn additive_blend_scales_by_parameter_and_saturates() {
+        let src = image(&[[100, 200, 0, 0], [0, 0, 0, 0]]);
+        let mut dst = image(&[[10, 100, 7, 50], [1, 2, 3, 4]]);
+        assert!(blit_add(&mut dst, 1, &src, 1, 0, 0, 128));
+        // 128 * 100 >> 8 = 50 ; 128 * 200 >> 8 = 100 ; black source is skipped
+        assert_eq!(&dst.rgba[0..4], &[60, 200, 7, 50]);
+        assert_eq!(&dst.rgba[4..8], &[1, 2, 3, 4]);
+        let mut sat = image(&[[250, 250, 250, 250]]);
+        assert!(blit_add(
+            &mut sat,
+            2,
+            &image(&[[255, 255, 255, 0]]),
+            1,
+            0,
+            0,
+            256
+        ));
+        assert_eq!(sat.rgba, [255, 255, 255, 255]);
+        // parameter 0 is a no-op
+        let mut same = image(&[[1, 2, 3, 4]]);
+        assert!(blit_add(&mut same, 1, &src, 1, 0, 0, 0));
+        assert_eq!(same.rgba, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn additive_blend_with_argb_source_uses_alpha_weights() {
+        let src = image(&[[200, 100, 40, 254]]);
+        let mut dst = image(&[[10, 10, 10, 10]]);
+        // k = 127, w = (127 * 256) >> 8 = 127: 200*127>>7 = 198
+        assert!(blit_add(&mut dst, 2, &src, 2, 0, 0, 256));
+        // alpha lane: (254 * (256 >> 1)) >> 7 = 254, 10 + 254 saturates at 255
+        assert_eq!(dst.rgba, [208, 109, 49, 255]);
+    }
+
+    #[test]
+    fn subtractive_blend_only_exists_for_argb_into_rgb() {
+        let src = image(&[[200, 100, 40, 254]]);
+        let mut dst = image(&[[220, 50, 100, 7]]);
+        assert!(blit_subtract(&mut dst, 1, &src, 2, 0, 0, 256));
+        assert_eq!(&dst.rgba[0..3], &[22, 0, 61]);
+        let mut other = image(&[[220, 50, 100, 7]]);
+        assert!(blit_subtract(&mut other, 2, &src, 2, 0, 0, 256));
+        assert_eq!(other.rgba, [220, 50, 100, 7]);
+    }
+
+    #[test]
+    fn multiply_darkens_by_the_source_and_parameter() {
+        // RGB -> RGB: d + ((((s - 256) * w) * 2d) >> 16), w = p >> 1
+        let src = image(&[[128, 0, 255, 0]]);
+        let mut dst = image(&[[200, 200, 200, 9]]);
+        assert!(blit_multiply(&mut dst, 1, &src, 1, 0, 0, 256));
+        // lane 0: (128-256)*128 = -16384; * 400 = -6553600 >> 16 = -100 -> 100
+        // lane 2: (255-256)*128 = -128; * 400 >> 16 = -1 -> 199
+        assert_eq!(&dst.rgba[0..4], &[100, 0, 199, 9]);
+        // RGB -> ARGB: d + ((((d*s)>>8) - d) * w >> 7)
+        let mut dst2 = image(&[[200, 200, 200, 255]]);
+        assert!(blit_multiply(&mut dst2, 2, &src, 1, 0, 0, 256));
+        assert_eq!(&dst2.rgba[0..4], &[100, 0, 199, 255]);
+    }
+
+    #[test]
+    fn clear_region_zeroes_only_the_covered_pixels() {
+        let src = image(&[[1, 2, 3, 4]; 2]);
+        let mut dst = image(&[[9, 9, 9, 9]; 4]);
+        blit_clear_region(&mut dst, &src, 1, 0);
+        assert_eq!(&dst.rgba[0..4], &[9, 9, 9, 9]);
+        assert_eq!(&dst.rgba[4..12], &[0; 8]);
+        assert_eq!(&dst.rgba[12..16], &[9, 9, 9, 9]);
     }
 
     #[test]

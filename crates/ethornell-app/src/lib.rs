@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 mod animation;
 mod audio_runtime;
-mod bitmap_blend;
 mod auto_input;
+mod bitmap_blend;
 mod character_image;
 mod debug_trace;
 mod display_tree;
@@ -5786,6 +5786,53 @@ impl RuntimeTraceApi {
                     y,
                     alpha_parameter,
                 )),
+                2 | 0x21 if alpha_parameter <= 256 => Some(bitmap_blend::blit_add(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                    if mode == 2 {
+                        alpha_parameter
+                    } else {
+                        256 - alpha_parameter
+                    },
+                )),
+                3 | 0x22 if alpha_parameter <= 256 => Some(bitmap_blend::blit_subtract(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                    if mode == 3 {
+                        alpha_parameter
+                    } else {
+                        256 - alpha_parameter
+                    },
+                )),
+                4 | 0x23 if alpha_parameter <= 256 => Some(bitmap_blend::blit_multiply(
+                    &mut destination_image,
+                    df,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                    alpha_parameter,
+                )),
+                0x40 => Some(bitmap_blend::blit_mask_clear(
+                    &mut destination_image,
+                    &source_image,
+                    sf,
+                    x,
+                    y,
+                    alpha_parameter,
+                )),
+                0x41 => {
+                    bitmap_blend::blit_clear_region(&mut destination_image, &source_image, x, y);
+                    Some(true)
+                }
                 0x80 => Some(bitmap_blend::blit_copy(
                     &mut destination_image,
                     df,
