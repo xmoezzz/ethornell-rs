@@ -15532,7 +15532,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: WAIT_TIMING_PARAMETERS,
         returns: "procedure completion result",
         scheduling: NativeSchedulingEffect::WaitProcedure,
-        notes: "Installs a timing/input CProcedure. The caller remains blocked until the procedure becomes ready.",
+        notes: "Target sub_4891F0 pops scope, input flag, duration and installs CProcWaitTimingEx (sub_43D2E0): deadline = engine tick + duration in the procedure (not the 0x80:0x5A thread timer); with input enabled the packed scope is registered like 0x80:0x18 and primed. Tick sub_43D430 pushes 0 on deadline, cleared dword_507688, callback code 0 or 1, and 1 on input bits & (dword_507690|0x80000181); the destructor unregisters the scope.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SWITCH_PROGRAM,
@@ -20877,6 +20877,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH92_DRAIN_TEXT_FRAGMENT_RECORDS,
     opcodes::GRAPH92_SET_TEXT_RENDER_OVERRIDE,
     opcodes::SOUND_QUERY_CHANNEL_COUNT,
+    opcodes::SYS_WAIT_TIMING_EX,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21164,7 +21165,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_WAIT_WINDOW_MESSAGE,
     opcodes::SYS_SET_THREAD_TIMER,
     opcodes::SYS_WAIT_THREAD_TIMER,
-    opcodes::SYS_WAIT_TIMING_EX,
     opcodes::SYS_SWITCH_PROGRAM,
     opcodes::SYS_SET_MAIN_LOOP_WAIT_OVERRIDE,
     opcodes::SYS_SET_EXCLUSIVE_THREAD,

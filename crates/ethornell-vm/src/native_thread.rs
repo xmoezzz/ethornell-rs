@@ -442,6 +442,9 @@ impl CThread {
     }
 
     pub(crate) fn clear_current_procedure(&mut self) -> Option<InstalledCProcedure> {
+        // The callback queue lives in the procedure object (`+0x14/+0x18`);
+        // sub_431950 frees it together with the procedure.
+        self.host.procedure_callbacks.clear();
         self.native.current_procedure = 0;
         self.native.status_flags &= !CTHREAD_FLAG_PROCEDURE_ACTIVE;
         self.host.current_procedure.take()

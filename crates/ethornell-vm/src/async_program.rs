@@ -233,6 +233,9 @@ impl Vm {
                 if self.thread.thread_id() == 0 {
                     return self.enqueue_native_callback(callback, trace_events);
                 }
+                if !self.root_procedure_active {
+                    return false;
+                }
                 self.pending_root_program_callbacks.push_back(callback);
                 return true;
             }
@@ -378,6 +381,11 @@ impl Vm {
             scheduler_tasks.append(&mut task.vm.async_tasks);
             task.vm.async_tasks = scheduler_tasks;
             task.vm.suppress_async_pump_once = true;
+            task.vm.root_procedure_active = if self.thread.thread_id() == 0 {
+                self.thread.current_procedure().is_some()
+            } else {
+                self.root_procedure_active
+            };
             let report = task.vm.run_loaded(api, &options);
             let requested_switch = task.vm.scheduler_switch_target.take();
             if report.stop_reason == VmStopReason::WatchdogExceeded {

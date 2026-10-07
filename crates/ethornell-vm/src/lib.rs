@@ -2152,6 +2152,10 @@ pub struct Vm {
     thread: CThread,
     pending_root_program_messages: VecDeque<Value>,
     pending_root_program_callbacks: VecDeque<[Value; 3]>,
+    /// Whether the root CThread had a procedure when this child slice began.
+    /// The root cannot change it while a child runs, so 0x80:0x4C aimed at
+    /// thread 0 can return sub_445230's "procedure present" result at once.
+    root_procedure_active: bool,
     next_program_instance_id: u64,
     /// Process-wide monotonically increasing CThread id source. Root uses 0;
     /// child threads start at 1, matching the target constructor counter.
@@ -5606,6 +5610,9 @@ impl Vm {
     }
 
     fn install_cprocedure(&mut self, procedure: InstalledCProcedure, trace_events: bool) {
+        // sub_4451C0 deletes the previous object, and with it any callbacks
+        // still queued on it; the new object starts with an empty queue.
+        self.thread.take_procedure_callbacks();
         if let Some(previous) = self.thread.replace_current_procedure(procedure) {
             tracing::warn!(
                 previous_class = previous.object.class_name(),
@@ -5760,6 +5767,27 @@ impl Vm {
         }
     }
 
+    /// `CProcedure::DrainCallbacks` (sub_431AF0): pops queued callbacks in
+    /// order. A record whose code is 0 sets the terminal latch `+0x10` and
+    /// stops the drain, leaving later records queued; every other record is
+    /// handed to the subclass handler (vtable slot 6), returned here in order.
+    fn drain_procedure_callbacks(&mut self) -> (bool, Vec<[Value; 3]>) {
+        let mut dispatched = Vec::new();
+        while let Some(callback) = self.thread.pop_procedure_callback() {
+            if callback[0].as_i32() == 0 {
+                return (true, dispatched);
+            }
+            dispatched.push(callback);
+        }
+        (false, dispatched)
+    }
+
+    /// sub_4319C0: a procedure keeps running only while the process-global
+    /// wait state `dword_507688` is non-zero and its terminal latch is clear.
+    fn procedure_alive(&self, terminal_latch: bool) -> bool {
+        self.system_wait_state != 0 && !terminal_latch
+    }
+
     /// Poll the single procedure object stored in target `CThread+0x58`.
     ///
     /// The target does not have independent `wait_blocked`, graph-wait, and
@@ -5774,10 +5802,11 @@ impl Vm {
         let installed = self.thread.current_procedure()?;
         match installed.object {
             CProcedure::WaitTiming(procedure) => {
-                // CProcedure::DrainCallbacks sets the base terminal latch
-                // after draining any non-empty callback queue, regardless of
-                // the subclass callback code.
-                let cancelled = !self.thread.take_procedure_callbacks().is_empty();
+                // CProcWaitTiming::Tick (sub_43D2B0): drain (its callback
+                // handler is a no-op), then finish when the deadline passed
+                // or the procedure is no longer alive. Nothing is pushed.
+                let (terminal, _) = self.drain_procedure_callbacks();
+                let cancelled = !self.procedure_alive(terminal);
                 let now_tick = self.timing.tick_count().max(0) as u32;
                 let deadline_reached = now_tick >= procedure.base.native.deadline_tick;
                 if !cancelled && !deadline_reached {
@@ -5796,24 +5825,29 @@ impl Vm {
                 None
             }
             CProcedure::WaitTimingEx(procedure) => {
-                let callbacks = self.thread.take_procedure_callbacks();
-                let callback_completed = callbacks.iter().any(|callback| callback[0].as_i32() == 1);
-                // sub_431AF0 sets CProcedure+0x10 after every non-empty drain;
-                // CProcWaitTimingEx's code-1 handler additionally sets +0x28.
-                let cancelled = !callbacks.is_empty();
-                // sub_43D430: sub_46DF00((scope << 16) | 0xFFFF) filtered by
-                // dword_507690 | 0x80000181.
-                let aux_mask = self
-                    .system81_shared
-                    .lock()
-                    .expect("system81 state poisoned")
-                    .message_auxiliary_input_mask as u32;
-                let input_interrupted = procedure.input_enabled()
-                    && (api.query_input_event_bits(procedure.input_scope()) as u32
-                        & (aux_mask | 0x8000_0181))
-                        != 0;
+                // CProcWaitTimingEx::Tick (sub_43D430). Its callback handler
+                // (sub_43D4B0) sets +0x28 for code 1 and ignores other codes.
+                let (terminal, callbacks) = self.drain_procedure_callbacks();
+                let callback_completed = procedure.native.callback_completion != 0
+                    || callbacks.iter().any(|callback| callback[0].as_i32() == 1);
+                let cancelled = !self.procedure_alive(terminal);
                 let now_tick = self.timing.tick_count().max(0) as u32;
                 let deadline_reached = now_tick >= procedure.native.base.deadline_tick;
+                // The input query (sub_46DF00((scope << 16) | 0xFFFF) filtered
+                // by dword_507690 | 0x80000181) runs only when the deadline,
+                // liveness and +0x28 checks did not already finish the wait.
+                let input_interrupted = !(deadline_reached || cancelled || callback_completed)
+                    && procedure.input_enabled()
+                    && {
+                        let aux_mask = self
+                            .system81_shared
+                            .lock()
+                            .expect("system81 state poisoned")
+                            .message_auxiliary_input_mask as u32;
+                        api.query_input_event_bits(procedure.input_scope()) as u32
+                            & (aux_mask | 0x8000_0181)
+                            != 0
+                    };
                 if !cancelled && !callback_completed && !input_interrupted && !deadline_reached {
                     return Some(if procedure.input_enabled() {
                         VmStopReason::WaitingForInputOrTime
@@ -5826,20 +5860,29 @@ impl Vm {
                 // Target result is 1 only for an input-driven completion.
                 // Timeout, cancellation, and callback code 1 all return 0.
                 self.push_value(Value::Int(i32::from(input_interrupted)));
+                // Destructor sub_43D3B0 removes the scope from both lists
+                // without a final query.
+                if procedure.input_enabled() {
+                    api.unregister_message_input_scope(
+                        procedure.input_scope().wrapping_shl(16) | 0xFFFF,
+                    );
+                }
                 if trace_events || self.collect_diagnostics {
                     tracing::debug!(
                         input_interrupted,
                         callback_completed,
                         cancelled,
                         deadline_reached,
-                        deadline_tick = self.thread.deadline_tick(),
+                        deadline_tick = procedure.native.base.deadline_tick,
                         "CProcWaitTimingEx completed"
                     );
                 }
                 None
             }
             CProcedure::WaitWndMsg(procedure) => {
-                let cancelled = !self.thread.take_procedure_callbacks().is_empty();
+                // CProcWaitWndMsg::Tick (sub_43D5D0); no-op callback handler.
+                let (terminal, _) = self.drain_procedure_callbacks();
+                let cancelled = !self.procedure_alive(terminal);
                 let result = if cancelled {
                     // Target's engine-disabled path pushes -1 then 0.
                     Some((-1, 0))
@@ -5865,10 +5908,10 @@ impl Vm {
             }
             CProcedure::DspMsg(mut procedure) => {
                 let now_tick = self.timing.tick_count().max(0) as u32;
-                let mut cancel = false;
-                for callback in self.thread.take_procedure_callbacks() {
+                let (terminal, callbacks) = self.drain_procedure_callbacks();
+                let cancel = !self.procedure_alive(terminal);
+                for callback in callbacks {
                     match callback[0].as_i32() {
-                        0 => cancel = true,
                         // CProcDspMsg::OnCallback (sub_434150): callbacks 1
                         // and 258 set both force-completion (+0x74) and the
                         // completion latch (+0x30).
@@ -5894,6 +5937,9 @@ impl Vm {
                     api.finish_native_message();
                     api.unregister_message_input_scope(procedure.config.input_scope);
                     self.thread.clear_current_procedure();
+                    // sub_433600 pushes +0x34 (set by any filtered input) on
+                    // every completion; scrmsg stores it as "ended by input".
+                    self.push_value(Value::Int(procedure.native.ordinary_input_latch as i32));
                     return None;
                 }
 
@@ -5922,6 +5968,9 @@ impl Vm {
                     api.finish_native_message();
                     api.unregister_message_input_scope(procedure.config.input_scope);
                     self.thread.clear_current_procedure();
+                    // sub_433600 pushes +0x34 (set by any filtered input) on
+                    // every completion; scrmsg stores it as "ended by input".
+                    self.push_value(Value::Int(procedure.native.ordinary_input_latch as i32));
                     return None;
                 }
 
@@ -5951,6 +6000,9 @@ impl Vm {
                     api.finish_native_message();
                     api.unregister_message_input_scope(procedure.config.input_scope);
                     self.thread.clear_current_procedure();
+                    // sub_433600 pushes +0x34 (set by any filtered input) on
+                    // every completion; scrmsg stores it as "ended by input".
+                    self.push_value(Value::Int(procedure.native.ordinary_input_latch as i32));
                     return None;
                 }
 
@@ -5959,6 +6011,9 @@ impl Vm {
                     api.finish_native_message();
                     api.unregister_message_input_scope(procedure.config.input_scope);
                     self.thread.clear_current_procedure();
+                    // sub_433600 pushes +0x34 (set by any filtered input) on
+                    // every completion; scrmsg stores it as "ended by input".
+                    self.push_value(Value::Int(procedure.native.ordinary_input_latch as i32));
                     return None;
                 }
 
@@ -5974,6 +6029,9 @@ impl Vm {
                             api.finish_native_message();
                             api.unregister_message_input_scope(procedure.config.input_scope);
                             self.thread.clear_current_procedure();
+                            // sub_433600 pushes +0x34 (set by any filtered input) on
+                            // every completion; scrmsg stores it as "ended by input".
+                            self.push_value(Value::Int(procedure.native.ordinary_input_latch as i32));
                             return None;
                         }
                     }
@@ -6023,7 +6081,21 @@ impl Vm {
                 None
             }
             CProcedure::Graph(procedure) => {
-                let cancelled = !self.thread.take_procedure_callbacks().is_empty();
+                // Code 0 / a cleared dword_507688 end every graph procedure.
+                // Of the non-zero codes only CProcCtrlDspObj's code 1
+                // (sub_4320B0: stop request +0x98) and CProcSelectIcon's
+                // code 512 (sub_43A830: forced selection) do anything;
+                // CProcSelectItem* and CProcShakeScreen ignore them.
+                let (terminal, callbacks) = self.drain_procedure_callbacks();
+                let cancelled = !self.procedure_alive(terminal)
+                    || callbacks.iter().any(|callback| {
+                        let code = callback[0].as_i32();
+                        match procedure.mode {
+                            native_thread::NativeGraphProcedureMode::Control => code == 1,
+                            native_thread::NativeGraphProcedureMode::Select => code == 512,
+                            native_thread::NativeGraphProcedureMode::Shake => false,
+                        }
+                    });
                 match procedure.mode {
                     native_thread::NativeGraphProcedureMode::Select => {
                         let selected = if cancelled {
@@ -6112,8 +6184,9 @@ impl Vm {
                 None
             }
             CProcedure::Exclusion(procedure) => {
-                let cancelled = !self.thread.take_procedure_callbacks().is_empty()
-                    || self.system_wait_state == 0;
+                // CProcExclusion::Tick (sub_439620); no-op callback handler.
+                let (terminal, _) = self.drain_procedure_callbacks();
+                let cancelled = !self.procedure_alive(terminal);
                 let status = if cancelled {
                     -1
                 } else {
@@ -15481,7 +15554,8 @@ mod tests {
         assert_eq!(vm.poll_current_procedure(&mut api, false), None);
         assert!(vm.thread.current_procedure().is_none());
         assert_eq!(api.message_finishes, 1);
-        assert_eq!(vm.stack, [Value::Int(42)]);
+        // sub_433600 pushes +0x34, which input latched to 1.
+        assert_eq!(vm.stack, [Value::Int(42), Value::Int(1)]);
     }
 
     #[test]
@@ -15561,7 +15635,8 @@ mod tests {
         assert!(vm.thread.current_procedure().is_none());
         assert_eq!(api.message_reveals, 1);
         assert_eq!(api.message_finishes, 1);
-        assert_eq!(vm.stack, [Value::Int(77)]);
+        // Completion pushes +0x34; callback 256 does not set it.
+        assert_eq!(vm.stack, [Value::Int(77), Value::Int(0)]);
     }
 
     #[test]
@@ -15886,6 +15961,65 @@ mod tests {
         ));
         assert!(!vm.poll_wait_timing_procedure(&mut TraceApi, false));
         assert_eq!(vm.stack, [Value::Int(0)]);
+    }
+
+    #[test]
+    fn wait_timing_ex_ignores_callback_codes_other_than_zero_and_one() {
+        // sub_43D4B0 reacts to code 1 only; sub_431AF0 latches only code 0.
+        let mut vm = Vm::new();
+        install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
+        assert!(vm.post_async_program_callback(
+            Value::Int(0),
+            [Value::Int(2), Value::Int(0), Value::Int(0)],
+            false,
+        ));
+        assert!(vm.poll_wait_timing_procedure(&mut TraceApi, false));
+        assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn wait_timing_ex_stops_when_the_system_wait_state_is_cleared() {
+        let mut vm = Vm::new();
+        install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
+        vm.system_wait_state = 0;
+        assert!(!vm.poll_wait_timing_procedure(&mut TraceApi, false));
+        assert_eq!(vm.stack, [Value::Int(0)]);
+    }
+
+    #[test]
+    fn wait_timing_ex_timeout_wins_over_pending_input() {
+        // sub_43D430 tests the deadline before it queries input.
+        let mut vm = Vm::new();
+        install_wait_timing_ex(&mut vm, 10, 1, 1808);
+        vm.advance_time_ms(10);
+        let mut api = SchedulingApi {
+            input_class_state: 1,
+            ..Default::default()
+        };
+        assert!(!vm.poll_wait_timing_procedure(&mut api, false));
+        assert_eq!(vm.stack, [Value::Int(0)]);
+    }
+
+    #[test]
+    fn wait_timing_ex_keeps_the_thread_timer_of_0x5a() {
+        let mut vm = Vm::new();
+        vm.thread.set_deadline_from_now(vm.timing.tick_count(), 500);
+        let before = vm.thread.deadline_tick();
+        install_wait_timing_ex(&mut vm, 20, 0, 1808);
+        assert_eq!(vm.thread.deadline_tick(), before);
+    }
+
+    #[test]
+    fn replacing_or_finishing_a_procedure_discards_its_queued_callbacks() {
+        let mut vm = Vm::new();
+        install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
+        assert!(vm.post_async_program_callback(
+            Value::Int(0),
+            [Value::Int(7), Value::Int(0), Value::Int(0)],
+            false,
+        ));
+        install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
+        assert!(vm.thread.procedure_callbacks_is_empty());
     }
 
     #[test]

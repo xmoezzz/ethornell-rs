@@ -112,16 +112,23 @@ impl Vm {
                 let mut call = self.scheduler_call_frame(opcode)?;
                 let input_scope = call.pop_i32("input_scope")?;
                 let input_enabled = call.pop_i32("input_enabled")? != 0;
-                let duration_ms = call.pop_i32("duration_ms")?.max(0);
+                let duration_ms = call.pop_i32("duration_ms")?;
                 call.require_consumed()?;
 
-                self.thread
-                    .set_deadline_from_now(self.timing.tick_count(), duration_ms);
+                // sub_43D2E0: the deadline lives in the procedure (+0x08,
+                // sub_431A10); the thread timer of 0x80:0x5A is untouched.
+                // With input enabled the scope is registered exactly like
+                // 0x80:0x18 and primed by one discarded sub_46DF00 query.
+                let deadline_tick =
+                    (self.timing.tick_count().max(0) as u32).wrapping_add(duration_ms as u32);
+                if input_enabled {
+                    api.register_input_scope(input_scope);
+                }
                 self.install_cprocedure(
                     InstalledCProcedure::wait_timing_ex(
                         self.thread.thread_id(),
                         opcode,
-                        self.thread.deadline_tick(),
+                        deadline_tick,
                         duration_ms,
                         i32::from(input_enabled),
                         input_scope,
