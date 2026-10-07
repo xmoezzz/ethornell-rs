@@ -26,13 +26,23 @@ visible to the closure walk and must be followed through the vtables by hand.
 
 | Subsystem | C | Rust |
 |---|---|---|
-| `CThread` (0x444000–0x445500): operand ring, code/data regions, modules, reservations, callbacks | `engine/cthread.c` | `ethornell-vm/src/target_thread.rs` (tested, **not yet wired in**) |
-| Message markup / ruby registry / reveal timeline | — (ported straight from raw) | `ethornell-app/src/{ruby_registry,text_anim,text}.rs` |
+| `CThread` (0x444000–0x445500): operand ring, code/data regions, modules, reservations, callbacks | `engine/cthread.c` | `ethornell-vm/src/target_thread.rs` is the tested reference; its limits are enforced on the live thread (see below) |
+| BP interpreter: scheduler loop, 89-entry opcode table, base opcodes, call/ret/jmp/jc | `engine/bp_interp.c` | `ethornell-vm/src/lib.rs` (verified opcode by opcode; see `ethornell-script/src/vm_opcode.rs` for evidence addresses) |
+| Message markup / ruby registry / reveal timeline | ported straight from `raw/` | `ethornell-app/src/{ruby_registry,text_anim,text}.rs` |
 
-## Integration note
+## How the live VM follows the target thread
 
-The running VM (`ethornell-vm/src/lib.rs`) stores operands as `Vec<Value>` and
-BP memory as a sparse map, with `native_thread::CThreadLayout32` holding audit
-handles. `target_thread.rs` owns real byte regions and the wrapping DWORD ring.
-Switching the VM to it means moving BP pointers to region offsets, so it is a
-deliberate, separate step.
+The interpreter keeps `Value`-typed operands and a sparse BP memory map, so it
+does not store its state inside `TargetThread`. The target's observable rules
+are enforced on `native_thread::CThread` instead:
+
+* region sizes: main thread 4096 operand slots / 0x80000 code / 0x40000 data
+  (`sub_48C990`); children take them from `0x80:0x44` (pop order: data bytes,
+  code bytes, slots, file, archive);
+* `0x80:0x40`: the module must fit the code region (`sub_444CE0`); the used
+  size is the sum of the LIFO module chain using the header's code length
+  (`BpProgram::module_size`), not the instruction extent;
+* `store_base` / `call`: the frame pointer must stay below the data region;
+* `call` / `jmp` to 0 are fatal (`sub_473910`); `ret` with an empty data stack
+  ends the thread (status 4);
+* `i32::MIN / -1` wraps instead of trapping.
