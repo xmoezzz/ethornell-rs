@@ -1163,9 +1163,10 @@ impl RuntimeTraceApi {
             return false;
         }
         let (width, height) = snapshot::runtime_frame_size(self);
-        let captured = priority.map(|priority| {
-            snapshot::compose_runtime_frame_through_priority(self, true, Some(priority))
-        });
+        // sub_442EE0 (CreateWorkBitmap) copies the whole current back buffer
+        // into the new bitmap; sub_442F80 (CreatePrioritizedWorkBitmap)
+        // renders the display tree up to the given priority into it.
+        let captured = snapshot::compose_runtime_frame_through_priority(self, true, priority);
         self.clear_bitmap_text(bitmap);
         self.effects.remove_bitmap(bitmap);
         self.graph_resources.remove(&bitmap);
@@ -1179,18 +1180,15 @@ impl RuntimeTraceApi {
         );
         if let Some(priority) = priority {
             self.graph_config.bitmap_priorities.insert(bitmap, priority);
-            let key = format!("runtime:priority-bitmap:{bitmap}");
-            self.store_graph_image(
-                key.clone(),
-                captured.expect("priority capture exists for prioritized bitmap"),
-            );
-            self.graph_resources
-                .insert(bitmap, RuntimeGraphResource::whole(key));
-            if let Some(surface) = self.graph_surfaces.get_mut(&bitmap) {
-                surface.resource_id = Some(bitmap);
-            }
         } else {
             self.graph_config.bitmap_priorities.remove(&bitmap);
+        }
+        let key = format!("runtime:priority-bitmap:{bitmap}");
+        self.store_graph_image(key.clone(), captured);
+        self.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        if let Some(surface) = self.graph_surfaces.get_mut(&bitmap) {
+            surface.resource_id = Some(bitmap);
         }
         true
     }

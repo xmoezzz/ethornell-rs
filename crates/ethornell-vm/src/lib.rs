@@ -2808,6 +2808,12 @@ impl Vm {
                     )));
                 }
                 if next > previous {
+                    // The target leaves the new frame untouched (sub_4738A0).
+                    // Clearing it is kept on purpose: some scripts read frame
+                    // slots that the original had filled by a step the
+                    // portable runtime does not reproduce yet (the save-slot
+                    // excerpt line), and stale bytes there decode as garbage
+                    // text. See src/README.md "Open fidelity items".
                     let size = (next - previous) as usize;
                     let ptr = 0x1200_0000u32 | previous;
                     let range = self.resolve_write_range(ptr, size)?;
@@ -4496,7 +4502,9 @@ impl Vm {
                 } else if (code, id) == (0x91, 0x9f) {
                     let source = self.pop_string_lossy()?;
                     let destination = self.pop_ptr()?;
-                    self.write_c_string(destination, &strip_native_markup_tags(&source))?;
+                    let stripped = strip_native_markup_tags(&source);
+                    tracing::debug!(%source, %stripped, "GraphStripTextMarkup");
+                    self.write_c_string(destination, &stripped)?;
                     Value::None
                 } else if (code, id) == (0x91, 0x3e) {
                     let call_stack = self.take_dispatch_call_frame(code, id)?;
@@ -10750,8 +10758,12 @@ impl Vm {
             // pointer that a renderer would draw as "0x...". Integers keep the
             // plausibility test because they may be plain numbers.
             let non_null_pointer = matches!(original, Value::Ptr(ptr) if ptr != 0);
-            if non_null_pointer && !is_damaged_text_payload(&text) && !text.starts_with("0x") {
-                self.replace_stack_value(index, Value::Str(text.trim_matches('\0').to_string()));
+            if non_null_pointer && !text.starts_with("0x") {
+                // A script may cut a double-byte character in half to make a
+                // string fit; the lone lead byte decodes to U+FFFD and the
+                // target layout simply ignores it.
+                let cleaned = text.trim_matches('\0').trim_end_matches('\u{fffd}');
+                self.replace_stack_value(index, Value::Str(cleaned.to_string()));
             } else if is_plausible_text_payload(&text) {
                 self.replace_stack_value(index, Value::Str(text));
             }

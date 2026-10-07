@@ -46,3 +46,11 @@ are enforced on `native_thread::CThread` instead:
 * `call` / `jmp` to 0 are fatal (`sub_473910`); `ret` with an empty data stack
   ends the thread (status 4);
 * `i32::MIN / -1` wraps instead of trapping.
+
+## Open fidelity items
+
+* `store_base` zero-fills new frames; the target does not (`sub_4738A0`).
+  Removing the fill makes the save-slot excerpt line (usdtwnd.\_bp, the
+  shrink-to-two-lines loop at 0x1CA6) show stale bytes, so some earlier step
+  that fills that buffer in the original is not reproduced yet.
+* Blit modes 4 (ARGB source), 5-9, 0xC0/0xC1, 0xFF keep a float approximation.
