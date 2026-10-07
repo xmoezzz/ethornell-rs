@@ -630,6 +630,149 @@ pub(crate) fn rasterize_bitmap_text(
     (x.round() as i32, line_y.round() as i32)
 }
 
+/// Direct bitmap text of `Graph92:1E` (`sub_403840`).
+///
+/// There is no markup here: `<` is an ordinary glyph. Control characters:
+/// * `0x03 n` sets the line spacing to `n` percent of the cell height;
+/// * `0x04` enables wrapping at the destination bitmap width;
+/// * `0x0A` starts a new line at the original x;
+/// * every other character below 0x20 is skipped.
+///
+/// With wrapping enabled a glyph that would cross the bitmap width moves to
+/// the next line first. The result is the accumulated advance
+/// (`glyph width + spacing` over every drawn glyph, across all lines).
+pub(crate) fn rasterize_direct_bitmap_text(
+    dst: &mut DecodedImage,
+    text: &str,
+    start_x: i32,
+    start_y: i32,
+    size: f32,
+    spacing: f32,
+    color: [f32; 4],
+) -> i32 {
+    let size = size.max(1.0);
+    let font = snapshot_font();
+    let scale = PxScale::from(size);
+    let mut x = start_x as f32;
+    let mut y = start_y as f32;
+    let mut wrap_width: Option<f32> = None;
+    let mut line_percent = 100.0f32;
+    let mut total = 0.0f32;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if (ch as u32) < 0x20 {
+            match ch as u32 {
+                3 => {
+                    if let Some(next) = chars.next() {
+                        line_percent = (next as u32 & 0xff) as f32;
+                    }
+                }
+                4 => wrap_width = Some(dst.width as f32),
+                0x0a => {
+                    x = start_x as f32;
+                    y += size * line_percent / 100.0;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let advance = match font {
+            Some(font) => font
+                .as_scaled(scale)
+                .h_advance(font.glyph_id(ch))
+                .max(size * 0.5),
+            None => {
+                if ch.is_ascii() {
+                    size * 0.5
+                } else {
+                    size
+                }
+            }
+        };
+        if let Some(width) = wrap_width {
+            if x + advance > width {
+                x = start_x as f32;
+                y += size * line_percent / 100.0;
+            }
+        }
+        match font {
+            Some(font) => {
+                let baseline = y + font.as_scaled(scale).ascent();
+                let glyph = font
+                    .glyph_id(ch)
+                    .with_scale_and_position(scale, point(x, baseline));
+                draw_glyph(dst, font, glyph, color, 0, 0, false, false, None);
+            }
+            None => fill_rect(
+                dst,
+                x.round() as i32,
+                y.round() as i32,
+                advance.max(1.0) as i32,
+                (size * 0.85).max(1.0) as i32,
+                color,
+                None,
+            ),
+        }
+        x += advance + spacing;
+        total += advance + spacing;
+    }
+    total.round() as i32
+}
+
+/// Horizontal advance of one glyph, scaled by the horizontal percentage.
+pub(crate) fn glyph_advance(ch: char, size: f32, horizontal_scale_percent: f32) -> f32 {
+    let scale = if horizontal_scale_percent > 0.0 {
+        horizontal_scale_percent / 100.0
+    } else {
+        1.0
+    };
+    let size = size.max(1.0);
+    let base = match snapshot_font() {
+        Some(font) => font
+            .as_scaled(PxScale::from(size))
+            .h_advance(font.glyph_id(ch))
+            .max(size * 0.5),
+        None if ch.is_ascii() => size * 0.5,
+        None => size,
+    };
+    base * scale
+}
+
+/// Draw glyphs placed by [`crate::text_layout::layout_text`]. `color_of` may
+/// override the colour of a character (markup colour spans).
+pub(crate) fn rasterize_placed_glyphs(
+    dst: &mut DecodedImage,
+    glyphs: &[crate::text_layout::PlacedGlyph],
+    size: f32,
+    color: [f32; 4],
+    color_of: &dyn Fn(usize) -> Option<[f32; 4]>,
+) {
+    let size = size.max(1.0);
+    let scale = PxScale::from(size);
+    let font = snapshot_font();
+    for glyph in glyphs {
+        let color = color_of(glyph.index).unwrap_or(color);
+        match font {
+            Some(font) => {
+                let baseline = glyph.y + font.as_scaled(scale).ascent();
+                let placed = font
+                    .glyph_id(glyph.ch)
+                    .with_scale_and_position(scale, point(glyph.x, baseline));
+                draw_glyph(dst, font, placed, color, 0, 0, false, false, None);
+            }
+            None => fill_rect(
+                dst,
+                glyph.x.round() as i32,
+                glyph.y.round() as i32,
+                (size * 0.5).max(1.0) as i32,
+                (size * 0.85).max(1.0) as i32,
+                color,
+                None,
+            ),
+        }
+    }
+}
+
 pub(crate) fn measure_text_advance(text: &str, size: f32, spacing: f32) -> i32 {
     let glyph_count = text.chars().count();
     if glyph_count == 0 {
@@ -1231,5 +1374,66 @@ mod styled_text_snapshot_tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_bitmap_text_tests {
+    use super::rasterize_direct_bitmap_text;
+    use ethornell_image::DecodedImage;
+
+    fn blank(width: u32, height: u32) -> DecodedImage {
+        DecodedImage {
+            width,
+            height,
+            rgba: vec![0; (width * height * 4) as usize],
+        }
+    }
+
+    fn ink_rows(image: &DecodedImage) -> Vec<u32> {
+        (0..image.height)
+            .filter(|row| {
+                (0..image.width)
+                    .any(|col| image.rgba[((row * image.width + col) * 4 + 3) as usize] != 0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wraps_only_after_control_code_four() {
+        let white = [1.0; 4];
+        let mut plain = blank(30, 60);
+        let advance =
+            rasterize_direct_bitmap_text(&mut plain, "あいうえお", 0, 0, 12.0, 0.0, white);
+        assert!(advance >= 5 * 6);
+        // Without 0x04 the text stays on the first row band (it is clipped).
+        assert!(ink_rows(&plain).iter().all(|row| *row < 14));
+
+        let mut wrapped = blank(30, 60);
+        rasterize_direct_bitmap_text(&mut wrapped, "\u{4}あいうえお", 0, 0, 12.0, 0.0, white);
+        assert!(ink_rows(&wrapped).iter().any(|row| *row >= 12));
+    }
+
+    #[test]
+    fn newline_and_line_spacing_percent_move_the_next_row() {
+        let white = [1.0; 4];
+        let mut a = blank(40, 80);
+        rasterize_direct_bitmap_text(&mut a, "あ\nあ", 0, 0, 12.0, 0.0, white);
+        let mut b = blank(40, 80);
+        // 0x03 followed by the raw byte 200: line spacing 200 percent.
+        rasterize_direct_bitmap_text(&mut b, "\u{3}\u{c8}あ\nあ", 0, 0, 12.0, 0.0, white);
+        let last = |image: &DecodedImage| *ink_rows(image).last().unwrap();
+        assert!(last(&b) >= last(&a) + 11);
+    }
+
+    #[test]
+    fn angle_brackets_are_glyphs_not_markup() {
+        let white = [1.0; 4];
+        let mut with_tags = blank(80, 20);
+        let tagged =
+            rasterize_direct_bitmap_text(&mut with_tags, "<b>x</b>", 0, 0, 12.0, 0.0, white);
+        let mut plain = blank(80, 20);
+        let untagged = rasterize_direct_bitmap_text(&mut plain, "x", 0, 0, 12.0, 0.0, white);
+        assert!(tagged > untagged);
     }
 }

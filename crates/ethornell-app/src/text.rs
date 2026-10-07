@@ -318,6 +318,126 @@ impl RuntimeTraceApi {
         ));
     }
 
+    /// Draw markup text into a bitmap the way `sub_435290` lays it out and
+    /// return the number of lines it needed (what `Graph91:9C`/`Graph92:9C`
+    /// hand back to the script) together with the final cursor.
+    ///
+    /// `kinsoku` is the script argument; the global `dword_565CF0` must also be
+    /// set for the kinsoku rules to apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_wrapped_bitmap_text(
+        &mut self,
+        bitmap: i32,
+        raw_text: &str,
+        x: i32,
+        y: i32,
+        size: f32,
+        horizontal_scale: f32,
+        pitch_percent: i32,
+        kinsoku: bool,
+        color: [f32; 4],
+    ) -> Option<(i32, (i32, i32))> {
+        let link_color = (self.system92_text_render_override != -1)
+            .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
+        let parsed = parse_message_markup_with(
+            raw_text,
+            &mut self.graph_defaults.ruby_registry,
+            link_color,
+        );
+        let mut image = self.graph_bitmap_image(bitmap)?;
+        let params = crate::text_layout::LayoutParams {
+            x: x as f32,
+            y: y as f32,
+            size,
+            bitmap_width: image.width as f32,
+            spacing: self.graph_defaults.text_layout.character_spacing as f32,
+            pitch_percent,
+            kinsoku,
+            indent_brackets: self.graph_defaults.text_layout.mode_flag != 0,
+        };
+        let layout = crate::text_layout::layout_text(&parsed.text, &params, &|ch| {
+            crate::snapshot::glyph_advance(ch, size, horizontal_scale)
+        });
+        let spans = parsed.style_spans.clone();
+        let color_of = move |index: usize| {
+            spans
+                .iter()
+                .find(|span| span.start_char <= index && index < span.end_char)
+                .and_then(|span| span.style.packed_rgb)
+                .map(|rgb| {
+                    [
+                        ((rgb >> 16) & 0xff) as f32 / 255.0,
+                        ((rgb >> 8) & 0xff) as f32 / 255.0,
+                        (rgb & 0xff) as f32 / 255.0,
+                        1.0,
+                    ]
+                })
+        };
+        crate::snapshot::rasterize_placed_glyphs(&mut image, &layout.glyphs, size, color, &color_of);
+        // `<l>` fragments feed Graph92:9E with the position the layout gave
+        // the first glyph of each link.
+        self.system92_text_fragment_records = parsed
+            .link_spans
+            .iter()
+            .filter_map(|link| {
+                let first = layout.glyphs.iter().find(|g| g.index >= link.start_char)?;
+                Some(ethornell_vm::System92TextFragmentRecord {
+                    text: link.text.clone(),
+                    x: first.x.round() as i32,
+                    y: first.y.round() as i32,
+                })
+            })
+            .collect();
+        if !self.replace_graph_bitmap_pixels(bitmap, image) {
+            return None;
+        }
+        self.clear_bitmap_text(bitmap);
+        Some((layout.lines, (layout.end_x.round() as i32, layout.end_y.round() as i32)))
+    }
+
+    /// `Graph91:9C` / `Graph91:9D` (`sub_484A30`, `sub_484C40`): draw markup text
+    /// into a bitmap and return the number of lines. `shift` is 0 for 9C and 1
+    /// for 9D, which pops one extra leading flag (non-zero disables the shadow).
+    /// In pop order after the shift:
+    /// `[0]` colour, `[1]` line-spacing percent, `[2]` kinsoku, `[3]` vertical,
+    /// `[5]` horizontal percent, `[6]` font height, `[8]` ruby-record text,
+    /// `[10]` text, `[11]` y, `[12]` x, `[13]` target bitmap.
+    pub(crate) fn graph91_draw_text(&mut self, args: &[ethornell_vm::Value], shift: usize) -> i32 {
+        let at = |index: usize| args.get(index + shift).map(value_to_i32).unwrap_or_default();
+        let target = at(13);
+        let (x, y) = (at(12), at(11));
+        let text = args.get(10 + shift).and_then(value_to_text_string);
+        let size = Some(at(6))
+            .filter(|size| (4..=256).contains(size))
+            .unwrap_or(self.text_state.font_size.max(1.0) as i32);
+        let horizontal_scale = Some(at(5)).filter(|value| *value > 0).unwrap_or(100);
+        let packed_color = args.get(shift).map(value_to_i32).unwrap_or(0x00ff_ffff);
+        let color = [
+            ((packed_color >> 16) & 0xff) as f32 / 255.0,
+            ((packed_color >> 8) & 0xff) as f32 / 255.0,
+            (packed_color & 0xff) as f32 / 255.0,
+            1.0,
+        ];
+        let lines = match text.as_deref().filter(|text| !text.is_empty()) {
+            Some(text) => self
+                .draw_wrapped_bitmap_text(
+                    target,
+                    text,
+                    x,
+                    y,
+                    size as f32,
+                    horizontal_scale as f32,
+                    at(1),
+                    at(2) != 0,
+                    color,
+                )
+                .map_or(1, |(lines, _)| lines),
+            None => 1,
+        };
+        tracing::info!(target, text = ?text, size, kinsoku = at(2) != 0, pitch_percent = at(1), lines, "GraphDrawTextEx");
+        lines
+    }
+
     pub(crate) fn store_bitmap_text_run(&mut self, bitmap: i32, node: RuntimeTextNode) {
         self.text_nodes.insert(bitmap, node.clone());
         self.bitmap_text_runs.entry(bitmap).or_default().push(node);

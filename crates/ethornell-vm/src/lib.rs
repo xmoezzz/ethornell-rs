@@ -10745,7 +10745,14 @@ impl Vm {
                     "TRACE_RESOURCE_ARG"
                 );
             }
-            if is_plausible_text_payload(&text) {
+            // sub_48DF50 converts every pointer argument, so a non-null pointer
+            // to an empty string must become an empty string rather than stay a
+            // pointer that a renderer would draw as "0x...". Integers keep the
+            // plausibility test because they may be plain numbers.
+            let non_null_pointer = matches!(original, Value::Ptr(ptr) if ptr != 0);
+            if non_null_pointer && !is_damaged_text_payload(&text) && !text.starts_with("0x") {
+                self.replace_stack_value(index, Value::Str(text.trim_matches('\0').to_string()));
+            } else if is_plausible_text_payload(&text) {
                 self.replace_stack_value(index, Value::Str(text));
             }
         }

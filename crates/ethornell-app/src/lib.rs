@@ -55,6 +55,7 @@ mod snapshot;
 mod surface_controls;
 mod text;
 mod text_anim;
+mod text_layout;
 mod timeline;
 mod timing;
 mod title;
@@ -5777,7 +5778,10 @@ impl RuntimeTraceApi {
                     x,
                     y,
                 )),
-                1 | 0x20 if alpha_parameter < 256 => Some(bitmap_blend::blit_alpha_over_parameter(
+                // sub_40B320 only acts for parameters below 0x100; a fully
+                // transparent source (256) leaves the destination untouched.
+                1 | 0x20 if alpha_parameter >= 256 => Some(true),
+                1 | 0x20 => Some(bitmap_blend::blit_alpha_over_parameter(
                     &mut destination_image,
                     df,
                     &source_image,
@@ -21544,31 +21548,29 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::debug!(object, enabled, "GraphSetObjectUpdateFlag");
             }
             (0x92, 0x9c) => {
-                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values. Target
-                // sub_403B10 -> sub_434BA0 -> sub_434C50 rasterizes glyphs
-                // directly into the supplied bitmap descriptor; it does not
-                // create a separate display/text node. This distinction is
-                // required by cnfgwnd._bp, which first tiles resource 3838 as
-                // the yellow help-strip background and then burns the hover
-                // help string into the same bitmap before displaying it.
+                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values and calls
+                // sub_403B10 -> sub_434BA0 -> sub_434C50 -> sub_435290, which
+                // lays the markup text out inside the target bitmap and draws
+                // it there; no display node is created. In pop order:
+                //   [20] target bitmap   [19] x   [18] y   [17] text
+                //   [16] colour          [14] ruby-record text
+                //   [11] font height     [10] horizontal percent
+                //   [8]  vertical flag   [7]  kinsoku flag
+                //   [6]  line-spacing percent
+                //   [4]..[0] shadow style (mode, x%, y%, colour, concentration)
+                // The value pushed back is the number of lines (sub_435290
+                // stores 1 through its first argument and counts every wrap).
                 let args = pop_args(stack, 21);
-                self.system92_text_fragment_records.clear();
                 let target = args.get(20).map(value_to_i32).unwrap_or_default();
                 let x = args.get(19).map(value_to_i32).unwrap_or_default();
                 let y = args.get(18).map(value_to_i32).unwrap_or_default();
                 let text = args.get(17).and_then(value_to_string);
                 let auxiliary_text = args.get(14).and_then(value_to_string);
-                // Script argument 9 is the visible glyph height. In reverse-pop
-                // order that is args[11]; the previous args[9] interpretation
-                // accidentally read source argument 11 (zero in config).
                 let size = args
                     .get(11)
                     .map(value_to_i32)
                     .filter(|size| (4..=256).contains(size))
                     .unwrap_or(self.text_state.font_size.max(1.0) as i32);
-                // Script argument 4 is the primary packed 0xRRGGBB color. Zero
-                // is a valid black color (used by config hover help), so this
-                // path must not use the old nonzero-color heuristic.
                 let packed_color = args.get(16).map(value_to_i32).unwrap_or_default();
                 let color = [
                     ((packed_color >> 16) & 0xff) as f32 / 255.0,
@@ -21581,82 +21583,45 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     .map(value_to_i32)
                     .filter(|value| *value > 0)
                     .unwrap_or(100);
-                let spacing = args.get(7).map(value_to_i32).unwrap_or_default();
-
-                let normalized = text
-                    .as_deref()
-                    .map(text_anim::normalize_message_text)
-                    .unwrap_or_default();
-                if !normalized.is_empty() {
-                    self.system92_text_fragment_records.push(
-                        ethornell_vm::System92TextFragmentRecord {
-                            text: normalized.clone(),
+                let pitch_percent = args.get(6).map(value_to_i32).unwrap_or_default();
+                let kinsoku = args.get(7).map(value_to_i32).unwrap_or_default() != 0;
+                self.system92_text_fragment_records.clear();
+                let (lines, end) = match text.as_deref().filter(|text| !text.is_empty()) {
+                    Some(text) => self
+                        .draw_wrapped_bitmap_text(
+                            target,
+                            text,
                             x,
                             y,
-                        },
-                    );
-                }
-
-                let output_pair = if normalized.is_empty() {
-                    (x, y)
-                } else {
-                    self.rasterize_graph_bitmap_text(
-                        target,
-                        &normalized,
-                        x,
-                        y,
-                        size as f32,
-                        spacing as f32,
-                        horizontal_scale as f32,
-                        color,
-                    )
-                    .unwrap_or_else(|| {
-                        let advance = snapshot::measure_text_advance(
-                            &normalized,
                             size as f32,
-                            spacing as f32,
-                        );
-                        (x.saturating_add(advance), y)
-                    })
+                            horizontal_scale as f32,
+                            pitch_percent,
+                            kinsoku,
+                            color,
+                        )
+                        .unwrap_or((1, (x, y))),
+                    None => (1, (x, y)),
                 };
-                self.system92_text_output_pair = [output_pair.0, output_pair.1];
-                let result = output_pair.0;
-                if let Some(text) = text {
-                    tracing::info!(
-                        target,
-                        %text,
-                        ?auxiliary_text,
-                        size,
-                        spacing,
-                        horizontal_scale,
-                        packed_color = format_args!("0x{packed_color:06X}"),
-                        output_pair = ?self.system92_text_output_pair,
-                        "GraphRenderTextBitmap"
-                    );
-                } else {
-                    tracing::debug!(
-                        target,
-                        ?auxiliary_text,
-                        output_pair = ?self.system92_text_output_pair,
-                        "GraphRenderTextBitmap without inline string"
-                    );
-                }
-                return Ok(ethornell_vm::Value::Int(result));
+                self.system92_text_output_pair = [end.0, end.1];
+                tracing::info!(
+                    target,
+                    text = ?text,
+                    ?auxiliary_text,
+                    size,
+                    horizontal_scale,
+                    pitch_percent,
+                    kinsoku,
+                    packed_color = format_args!("0x{packed_color:06X}"),
+                    lines,
+                    end = ?end,
+                    "GraphRenderTextBitmap"
+                );
+                return Ok(ethornell_vm::Value::Int(lines));
             }
             (0x91, 0x9c) => {
                 let args = pop_args(stack, 14);
-                let color = self.text_state.color;
-                let text = args.iter().rev().find_map(|value| match value {
-                    ethornell_vm::Value::Str(text) => Some(text.as_str()),
-                    _ => None,
-                });
-                self.render_graph_text(&args);
-                if let Some(text) = text {
-                    tracing::info!(%text, state = ?self.text_state, ?color, ?args, "GraphDrawTextEx");
-                } else {
-                    tracing::debug!(state = ?self.text_state, ?color, ?args, "GraphDrawTextEx without inline string");
-                }
-                return Ok(ethornell_vm::Value::Int(0));
+                let lines = self.graph91_draw_text(&args, 0);
+                return Ok(ethornell_vm::Value::Int(lines));
             }
             (0x90, 0x31) => {
                 let args = pop_args(stack, 2);

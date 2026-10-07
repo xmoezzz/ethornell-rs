@@ -889,12 +889,8 @@ impl RuntimeTraceApi {
             0x9c | 0x9d => {
                 let count = if id == 0x9c { 14 } else { 15 };
                 let args = pop_args(stack, count);
-                self.render_native_text_args(&args);
-                args.iter()
-                    .map(value_to_i32)
-                    .find(|value| *value > 0)
-                    .map(ethornell_vm::Value::Int)
-                    .unwrap_or(ethornell_vm::Value::Int(0))
+                let lines = self.graph91_draw_text(&args, usize::from(id == 0x9d));
+                ethornell_vm::Value::Int(lines)
             }
             0x9e => {
                 let source = pop_string_value(stack).unwrap_or_default();

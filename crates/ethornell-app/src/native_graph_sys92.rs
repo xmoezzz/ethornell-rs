@@ -221,35 +221,33 @@ impl RuntimeTraceApi {
                     .unwrap_or(self.text_state.font_size as i32);
                 let spacing = source.get(7).map(value_to_i32).unwrap_or_default();
                 let packed_rgb = source.get(8).map(value_to_i32).unwrap_or(0x00ff_ffff);
-                let normalized = text_anim::normalize_message_text(&text);
                 let color = [
                     ((packed_rgb >> 16) & 0xff) as f32 / 255.0,
                     ((packed_rgb >> 8) & 0xff) as f32 / 255.0,
                     (packed_rgb & 0xff) as f32 / 255.0,
                     1.0,
                 ];
-                if destination > 0 && !normalized.is_empty() {
-                    // sub_485F10 -> sub_4039E0 -> sub_403840 writes glyph
-                    // coverage directly into the selected bitmap descriptor.
-                    // Keep the public result as the accumulated text advance;
-                    // the rasterizer's absolute output X is not the syscall
-                    // return value.
-                    let _ = self.rasterize_graph_bitmap_text(
-                        destination,
-                        &normalized,
-                        x,
-                        y,
-                        size as f32,
-                        spacing as f32,
-                        100.0,
-                        color,
-                    );
+                // sub_485F10 -> sub_4039E0 -> sub_403840 writes glyph
+                // coverage straight into the selected bitmap descriptor and
+                // returns the accumulated advance. The string is not markup.
+                let mut advance = 0;
+                if destination > 0 && !text.is_empty() {
+                    if let Some(mut image) = self.graph_bitmap_image(destination) {
+                        advance = snapshot::rasterize_direct_bitmap_text(
+                            &mut image,
+                            &text,
+                            x,
+                            y,
+                            size as f32,
+                            spacing as f32,
+                            color,
+                        );
+                        if self.replace_graph_bitmap_pixels(destination, image) {
+                            self.clear_bitmap_text(destination);
+                        }
+                    }
                 }
-                ethornell_vm::Value::Int(snapshot::measure_text_advance(
-                    &normalized,
-                    size as f32,
-                    spacing as f32,
-                ))
+                ethornell_vm::Value::Int(advance)
             }
             0x1f => {
                 // sub_4020D0 allocates a temporary input buffer, searches the
