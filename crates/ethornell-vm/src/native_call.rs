@@ -16532,7 +16532,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_BLIT_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_479C70 validates both handles and selector/parameter ranges before sub_402720 clips and blits. Source order is (destination, x, y, source, mode, parameter). Missing destination/source and incompatible formats enter the target VM error path; formats 1 and 2 are mutually compatible. For selector 128, sub_40AF50 uses sub_40ADF0 for same-format raw clipped replacement; format-1 RGB copied into format-2 preserves RGB and forces alpha to 255 rather than treating the format-1 fourth byte as source alpha. For format-2 selector 1, sub_40B200 performs straight-alpha source-over and normalizes RGB by the resulting alpha coverage.",
+        notes: "sub_479C70 pops parameter, mode, source, y, x, destination; handles must be < 0x4000, the mode one of 0-9, 0x20-0x27, 0x40, 0x41, 0x80, 0xC0, 0xC1, 0xF0, 0xFF and the parameter <= 0x100 (script errors otherwise). sub_402720 -> sub_40A530 clips and sub_40A9E0 dispatches the integer kernels (bitmap_blend.rs): 0x20/0xC0 alias 1/5, 0x21-0x27 run 2-4/6-9 with 256-p; incompatible formats (sub_40A9A0) are a script error, unsupported format pairs leave the destination unchanged. The 16-bit format-0 kernels are not ported; no script creates format-0 bitmaps.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SYNTHESIZE_BITMAP,
@@ -20878,6 +20878,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH92_SET_TEXT_RENDER_OVERRIDE,
     opcodes::SOUND_QUERY_CHANNEL_COUNT,
     opcodes::SYS_WAIT_TIMING_EX,
+    opcodes::GRAPH90_BLIT_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21006,7 +21007,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_COPY_BITMAP_PIXELS,
     opcodes::GRAPH90_QUERY_BITMAP_INFO,
     opcodes::GRAPH90_VALIDATE_BITMAP_FORMAT,
-    opcodes::GRAPH90_BLIT_BITMAP,
     opcodes::GRAPH90_SYNTHESIZE_BITMAP,
     opcodes::GRAPH90_COMPOSITE_BITMAPS,
     opcodes::GRAPH90_COPY_BITMAP,

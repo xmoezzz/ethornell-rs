@@ -5765,109 +5765,87 @@ impl RuntimeTraceApi {
             }
         };
 
-        // Integer kernels of the target bitmap library for the selector
-        // families it implements for the two live pixel formats; any other
-        // combination keeps the previous portable compositor.
+        // sub_40A9E0: integer kernels of the target bitmap library. The
+        // jump table maps 0x20 to mode 1 and 0xC0 to mode 5, and runs
+        // 0x21..0x27 as modes 2..4 / 6..9 with `256 - p`. A format pair a
+        // kernel does not implement leaves the destination unchanged.
+        // Bitmaps whose format is unknown keep the portable compositor.
+        let inverted = 256 - alpha_parameter;
         let native = match (source_format, destination_format) {
-            (Some(sf @ (1 | 2)), Some(df @ (1 | 2))) => match mode {
-                0 => Some(bitmap_blend::blit_alpha_over(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                )),
+            (Some(sf), Some(df)) => Some(match mode {
+                0 => bitmap_blend::blit_alpha_over(&mut destination_image, df, &source_image, sf, x, y),
                 // sub_40B320 only acts for parameters below 0x100; a fully
                 // transparent source (256) leaves the destination untouched.
-                1 | 0x20 if alpha_parameter >= 256 => Some(true),
-                1 | 0x20 => Some(bitmap_blend::blit_alpha_over_parameter(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                    alpha_parameter,
-                )),
-                2 | 0x21 if alpha_parameter <= 256 => Some(bitmap_blend::blit_add(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                    if mode == 2 {
-                        alpha_parameter
-                    } else {
-                        256 - alpha_parameter
-                    },
-                )),
-                3 | 0x22 if alpha_parameter <= 256 => Some(bitmap_blend::blit_subtract(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                    if mode == 3 {
-                        alpha_parameter
-                    } else {
-                        256 - alpha_parameter
-                    },
-                )),
-                4 | 0x23 if alpha_parameter <= 256 => Some(bitmap_blend::blit_multiply(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                    alpha_parameter,
-                )),
-                0x40 => Some(bitmap_blend::blit_mask_clear(
-                    &mut destination_image,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                    alpha_parameter,
-                )),
+                1 | 0x20 if alpha_parameter >= 256 => true,
+                1 | 0x20 => bitmap_blend::blit_alpha_over_parameter(
+                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
+                ),
+                2 | 0x21 => bitmap_blend::blit_add(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode == 2 { alpha_parameter } else { inverted },
+                ),
+                3 | 0x22 => bitmap_blend::blit_subtract(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode == 3 { alpha_parameter } else { inverted },
+                ),
+                4 | 0x23 => bitmap_blend::blit_multiply(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode == 4 { alpha_parameter } else { inverted },
+                ),
+                5 | 0xc0 => bitmap_blend::blit_fade(
+                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
+                ),
+                6 | 0x24 => bitmap_blend::blit_screen(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode == 6 { alpha_parameter } else { inverted },
+                ),
+                7 | 0x25 => bitmap_blend::blit_cut_out(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode == 7 { alpha_parameter } else { inverted },
+                ),
+                8 | 0x26 | 9 | 0x27 => bitmap_blend::blit_overlay(
+                    &mut destination_image, df, &source_image, sf, x, y,
+                    if mode <= 9 { alpha_parameter } else { inverted },
+                    matches!(mode, 9 | 0x27),
+                ),
+                0x40 => bitmap_blend::blit_mask_clear(
+                    &mut destination_image, &source_image, sf, x, y, alpha_parameter,
+                ),
                 0x41 => {
                     bitmap_blend::blit_clear_region(&mut destination_image, &source_image, x, y);
-                    Some(true)
+                    true
                 }
-                0x80 => Some(bitmap_blend::blit_copy(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                )),
-                0xf0 if alpha_parameter == 0 => Some(bitmap_blend::blit_copy(
-                    &mut destination_image,
-                    df,
-                    &source_image,
-                    sf,
-                    x,
-                    y,
-                )),
-                0xf0 if alpha_parameter < 256 => {
-                    bitmap_blend::blit_interpolate(
-                        &mut destination_image,
-                        &source_image,
-                        x,
-                        y,
-                        alpha_parameter,
-                    );
-                    Some(true)
+                0x80 => bitmap_blend::blit_copy(&mut destination_image, df, &source_image, sf, x, y),
+                0xc1 => bitmap_blend::blit_fade_to_white(
+                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
+                ),
+                0xf0 if alpha_parameter == 0 => {
+                    bitmap_blend::blit_copy(&mut destination_image, df, &source_image, sf, x, y)
                 }
-                _ => None,
-            },
+                0xf0 => {
+                    if alpha_parameter < 256 {
+                        bitmap_blend::blit_interpolate(
+                            &mut destination_image, &source_image, x, y, alpha_parameter,
+                        );
+                    }
+                    true
+                }
+                0xff => bitmap_blend::blit_extract_channel(
+                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
+                ),
+                _ => true,
+            }),
             _ => None,
         };
-        if native != Some(true) {
+        if native.is_none() {
+            tracing::debug!(
+                destination,
+                source,
+                mode,
+                ?source_format,
+                ?destination_format,
+                "Graph90:18 blit with an untracked bitmap format uses the portable compositor"
+            );
             if alpha_parameter == 0 {
                 blit_decoded_image(&mut destination_image, &source_image, x, y, mode);
             } else {
@@ -20485,6 +20463,27 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     // raw-copy paths use `(1, 0)` and `(128, 0)`.
                     let mode = values[1];
                     let parameter = values[0];
+                    // sub_479C70 validates the handles (sub_497B60, < 0x4000),
+                    // the mode list (sub_497C40) and the parameter
+                    // (sub_497DB0, <= 0x100) before blitting; each failure is
+                    // a script error.
+                    for handle in [destination, source] {
+                        if !(0..0x4000).contains(&handle) {
+                            return Err(ethornell_vm::VmError::Runtime(format!(
+                                "Graph90:18 bitmap handle {handle} is out of range"
+                            )));
+                        }
+                    }
+                    if !matches!(mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xc0 | 0xc1 | 0xf0 | 0xff) {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:18 blit mode {mode:#x} is invalid"
+                        )));
+                    }
+                    if !(0..=0x100).contains(&parameter) {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:18 blit parameter {parameter} exceeds 256"
+                        )));
+                    }
                     let status = self.validate_native_bitmap_blit(destination, source);
                     if status != 0 {
                         return Err(ethornell_vm::VmError::Runtime(match status {

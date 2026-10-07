@@ -16,10 +16,13 @@
 //!   source mask is set;
 //! * 0x41 (`sub_40E150`) clear the destination region;
 //! * 2 / 0x21 (`sub_40CA70`) additive blend, 3 / 0x22 (`sub_40D200`) subtractive
-//!   blend, 4 / 0x23 (`sub_40D440`) multiply for the format pairs listed on
-//!   each function. Modes 4 (ARGB source), 5-9, 0xC0/0xC1 and 0xFF are not
-//!   ported and keep the previous float approximation.
-//! Other selectors keep their previous float approximation.
+//!   blend, 4 / 0x23 (`sub_40D440`) multiply;
+//! * 5 / 0xC0 (`sub_40DAD0`) faded copy, 6 / 0x24 screen, 7 / 0x25 cut-out,
+//!   8 / 0x26 overlay, 9 / 0x27 hard light, 0xC1 fade to white and 0xFF
+//!   channel extraction.
+//! The 0x2X aliases run with `256 - p` (the dispatcher's jump table), 0x20 and
+//! 0xC0 are plain aliases of 1 and 5. A format pair a kernel does not handle
+//! leaves the destination unchanged, exactly as the target does.
 
 use ethornell_image::DecodedImage;
 
@@ -117,7 +120,9 @@ pub(crate) fn blit_alpha_over(
                 if k == 127 {
                     *d = [s[0], s[1], s[2], 0];
                 } else {
-                    for lane in 0..4 {
+                    // unk_50B0F0 weights are [k, k, k, 0]: the fourth byte
+                    // keeps its value.
+                    for lane in 0..3 {
                         d[lane] = lerp7(d[lane], s[lane], k);
                     }
                 }
@@ -199,7 +204,8 @@ pub(crate) fn blit_alpha_over_parameter(
                     return;
                 }
                 let weight = ((u32::from(s[3] >> 1)) * coverage >> 8) as i32;
-                for lane in 0..4 {
+                // sub_40B6F0's table is [w, w, w, 0].
+                for lane in 0..3 {
                     d[lane] = lerp7(d[lane], s[lane], weight);
                 }
             });
@@ -237,7 +243,8 @@ pub(crate) fn blit_copy(
     y: i32,
 ) -> bool {
     match (source_format, destination_format) {
-        (a, b) if a == b && (a == 1 || a == 2) => {
+        // sub_40ADF0: equal formats are a raw row copy, whatever the format.
+        (a, b) if a == b => {
             copy(destination, source, x, y);
             true
         }
@@ -246,12 +253,14 @@ pub(crate) fn blit_copy(
             true
         }
         (2, 1) => {
-            // colour * (alpha >> 1) >> 7 on every lane, packus-saturated.
+            // colour * (alpha >> 1) >> 7 with the unk_50B0F0 weights
+            // [k, k, k, 0]: the fourth byte becomes 0.
             for_each_pixel(destination, source, x, y, |s, d| {
                 let k = u32::from(s[3] >> 1);
-                for lane in 0..4 {
+                for lane in 0..3 {
                     d[lane] = ((u32::from(s[lane]) * k) >> 7).min(255) as u8;
                 }
+                d[3] = 0;
             });
             true
         }
@@ -362,8 +371,8 @@ pub(crate) fn blit_subtract(
     true
 }
 
-/// Mode 4 (multiply) for an RGB source (`sub_40D4A0`, `sub_40D670`). An ARGB
-/// source (`sub_40D820`) is not ported; the caller falls back.
+/// Mode 4 (multiply): RGB source (`sub_40D4A0`, `sub_40D670`), ARGB source
+/// into RGB (`sub_40D820`) and the 8-bit coverage format (`sub_40DA40`).
 pub(crate) fn blit_multiply(
     destination: &mut DecodedImage,
     destination_format: i32,
@@ -398,8 +407,309 @@ pub(crate) fn blit_multiply(
             });
             true
         }
+        (2, 1) => {
+            // pmulhuw(d, s << 8) = d * s >> 8, mixed in with the alpha table
+            // weight; the fourth lane has weight 0.
+            let weight = weight_table(parameter.clamp(0, 256));
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] < 2 {
+                    return;
+                }
+                let w = weight(s[3]);
+                for lane in 0..3 {
+                    let product = ((u32::from(d[lane]) * u32::from(s[lane])) >> 8) as u8;
+                    d[lane] = lerp7(d[lane], product, w);
+                }
+            });
+            true
+        }
+        (3, 3) => {
+            // The parameter is used as a 16-bit value and the (negative)
+            // product is truncated to u16 before the shift; the byte add wraps.
+            let p = i32::from(parameter as i16);
+            for_each_pixel(destination, source, x, y, |s, d| {
+                let dv = i32::from(d[0]);
+                let product = (257 * (dv * i32::from(s[0]) + 1)) >> 16;
+                let step = (((p * (product - dv)) as u16) >> 8) as u8;
+                d[0] = d[0].wrapping_add(step);
+            });
+            true
+        }
         _ => false,
     }
+}
+
+/// Mode 5 / 0xC0 (`sub_40DAD0`): copy the source faded by `256 - p`.
+/// `p == 0` is the 0x80 copy. RGB->RGB with `p >= 256` clears the region.
+pub(crate) fn blit_fade(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 {
+        return blit_copy(destination, destination_format, source, source_format, x, y);
+    }
+    let keep = 256 - parameter.clamp(0, 256);
+    let fade = |value: u8| ((i32::from(value) * keep) >> 8) as u8;
+    match (source_format, destination_format) {
+        (1, 1) => {
+            if parameter >= 256 {
+                blit_clear_region(destination, source, x, y);
+            } else {
+                // sub_40DB60: the fourth lane's weight is 0.
+                for_each_pixel(destination, source, x, y, |s, d| {
+                    *d = [fade(s[0]), fade(s[1]), fade(s[2]), 0];
+                });
+            }
+            true
+        }
+        (2, 1) => {
+            // sub_40DCE0: faded colour mixed in by alpha >> 1.
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] < 2 {
+                    return;
+                }
+                let k = i32::from(s[3] >> 1);
+                for lane in 0..3 {
+                    d[lane] = lerp7(d[lane], fade(s[lane]), k);
+                }
+            });
+            true
+        }
+        (2, 2) => {
+            // sub_40DE60: straight-alpha composite of the faded source.
+            let keep = keep as u32;
+            for_each_pixel(destination, source, x, y, |s, d| {
+                let sa = u32::from(s[3]);
+                if sa == 0 {
+                    return;
+                }
+                let weighted_dst = u32::from(d[3]) * (256 - sa);
+                let total = weighted_dst + (sa << 8);
+                let ws = ((keep * sa) << 16) / total;
+                let wd = (weighted_dst << 16) / total;
+                for lane in 0..3 {
+                    d[lane] = ((ws.wrapping_mul(u32::from(s[lane]))
+                        .wrapping_add(wd.wrapping_mul(u32::from(d[lane]))))
+                        >> 16) as u8;
+                }
+                d[3] = (total >> 8) as u8;
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mode 6 / 0x24 screen (`sub_414C60`, `sub_414D10`):
+/// `d + s' - (d * s' >> 8)`, saturated.
+pub(crate) fn blit_screen(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 {
+        return true;
+    }
+    let p = parameter.clamp(0, 256);
+    let screen = |d: u8, s: i32| {
+        let d = i32::from(d);
+        clamp_u8(d + s - ((d * s) >> 8))
+    };
+    match (source_format, destination_format) {
+        (1, 1) => {
+            // All four lanes; s' = pmulhw(s << 4, 16p) = s * p >> 8.
+            for_each_pixel(destination, source, x, y, |s, d| {
+                for lane in 0..4 {
+                    d[lane] = screen(d[lane], (i32::from(s[lane]) * p) >> 8);
+                }
+            });
+            true
+        }
+        (2, 1) => {
+            let weight = weight_table(p);
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] < 2 {
+                    return;
+                }
+                let w = weight(s[3]);
+                for lane in 0..3 {
+                    d[lane] = screen(d[lane], (i32::from(s[lane]) * w) >> 7);
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mode 7 / 0x25 cut-out by source alpha (`sub_415900`, `sub_415A30`,
+/// `sub_415AB0`). Only an ARGB source does anything.
+pub(crate) fn blit_cut_out(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if parameter == 0 {
+        return true;
+    }
+    let p = parameter.clamp(0, 256) as u32;
+    let keep = |alpha: u8| 256 - ((u32::from(alpha) * p) >> 8);
+    match (source_format, destination_format) {
+        (2, 1) => {
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] == 0 {
+                    return;
+                }
+                let k = keep(s[3]);
+                for lane in 0..3 {
+                    d[lane] = ((u32::from(d[lane]) * k) >> 8) as u8;
+                }
+                d[3] = 0;
+            });
+            true
+        }
+        (2, 2) => {
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] != 0 {
+                    d[3] = ((keep(s[3]) * u32::from(d[3])) >> 8) as u8;
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Shared core of modes 8 (overlay, mask from the destination) and 9 (hard
+/// light, mask from the source): channels above 127 are mirrored through
+/// 256 before the `pmulhw(x << 5, y << 4)` product.
+fn overlay_core(s: u8, d: u8, mask: u8) -> u8 {
+    let (s, d) = (i32::from(s), i32::from(d));
+    if mask > 127 {
+        let product = (((256 - s) << 5) * ((256 - d) << 4)) >> 16;
+        clamp_u8(255 - product)
+    } else {
+        clamp_u8(((s << 5) * (d << 4)) >> 16)
+    }
+}
+
+/// Modes 8 / 0x26 and 9 / 0x27 (`sub_414F50`, `sub_415000`, `sub_4150E0`;
+/// `sub_4152A0`, `sub_415350`, `sub_415430`).
+pub(crate) fn blit_overlay(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+    hard_light: bool,
+) -> bool {
+    if parameter == 0 {
+        return true;
+    }
+    let lane_result = move |s: u8, d: u8| overlay_core(s, d, if hard_light { s } else { d });
+    match (source_format, destination_format) {
+        (1, 1) if parameter >= 256 => {
+            for_each_pixel(destination, source, x, y, |s, d| {
+                for lane in 0..4 {
+                    d[lane] = lane_result(s[lane], d[lane]);
+                }
+            });
+            true
+        }
+        (1, 1) => {
+            let q = parameter >> 1;
+            for_each_pixel(destination, source, x, y, |s, d| {
+                for lane in 0..3 {
+                    d[lane] = lerp7(d[lane], lane_result(s[lane], d[lane]), q);
+                }
+            });
+            true
+        }
+        (2, 1) => {
+            let weight = weight_table(parameter.clamp(0, 256));
+            for_each_pixel(destination, source, x, y, |s, d| {
+                if s[3] < 2 {
+                    return;
+                }
+                let w = weight(s[3]);
+                for lane in 0..3 {
+                    d[lane] = lerp7(d[lane], lane_result(s[lane], d[lane]), w);
+                }
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Mode 0xC1 (`sub_40E190` with colour 0xFFFFFF): fade the RGB source toward
+/// white, `s * (256 - p) >> 8 + 255 * p >> 8`; the fourth lane becomes 0.
+pub(crate) fn blit_fade_to_white(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if (source_format, destination_format) != (1, 1) {
+        return false;
+    }
+    let p = parameter.clamp(0, 256);
+    let white = (255 * p) >> 8;
+    for_each_pixel(destination, source, x, y, |s, d| {
+        for lane in 0..3 {
+            d[lane] = clamp_u8(((i32::from(s[lane]) * (256 - p)) >> 8) + white);
+        }
+        d[3] = 0;
+    });
+    true
+}
+
+/// Mode 0xFF (`sub_413900`): `p >= 4` is mode 0; otherwise one source channel
+/// is written as an opaque pixel (`sub_413930`). `p` selects the target's
+/// dword byte: 0 = blue, 1 = green, 2 = red (kept in place), 3 = alpha copied
+/// to all three colour channels.
+pub(crate) fn blit_extract_channel(
+    destination: &mut DecodedImage,
+    destination_format: i32,
+    source: &DecodedImage,
+    source_format: i32,
+    x: i32,
+    y: i32,
+    parameter: i32,
+) -> bool {
+    if !(0..4).contains(&parameter) {
+        return blit_alpha_over(destination, destination_format, source, source_format, x, y);
+    }
+    if !matches!(source_format, 1 | 2) {
+        return false;
+    }
+    for_each_pixel(destination, source, x, y, |s, d| {
+        *d = match parameter {
+            0 => [0, 0, s[2], 255],
+            1 => [0, s[1], 0, 255],
+            2 => [s[0], 0, 0, 255],
+            _ => [s[3], s[3], s[3], 255],
+        };
+    });
+    true
 }
 
 /// Mode 0x40. A format-1 source masks where `R + G + B > 0`; a format-2
@@ -463,6 +773,92 @@ mod tests {
             height: 1,
             rgba: pixels.concat(),
         }
+    }
+
+    #[test]
+    fn faded_copy_scales_rgb_and_clears_at_full_parameter() {
+        let src = image(&[[200, 100, 4, 9]]);
+        let mut dst = image(&[[1, 2, 3, 4]]);
+        assert!(blit_fade(&mut dst, 1, &src, 1, 0, 0, 64));
+        // keep = 192: 200 -> 150, 100 -> 75, 4 -> 3; fourth lane weight 0.
+        assert_eq!(dst.rgba, [150, 75, 3, 0]);
+        assert!(blit_fade(&mut dst, 1, &src, 1, 0, 0, 256));
+        assert_eq!(dst.rgba, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn faded_argb_source_mixes_by_seven_bit_alpha() {
+        let src = image(&[[200, 0, 50, 255]]);
+        let mut dst = image(&[[100, 100, 100, 7]]);
+        assert!(blit_fade(&mut dst, 1, &src, 2, 0, 0, 128));
+        // faded = [100, 0, 25], k = 127; the fourth lane is untouched.
+        assert_eq!(dst.rgba, [100, 0, 25, 7]);
+    }
+
+    #[test]
+    fn screen_adds_and_subtracts_the_product() {
+        let src = image(&[[100, 0, 255, 0]]);
+        let mut dst = image(&[[100, 50, 0, 0]]);
+        assert!(blit_screen(&mut dst, 1, &src, 1, 0, 0, 256));
+        // 100 + 100 - (100*100 >> 8) = 161; 50 + 0 = 50; 0 + 255 = 255.
+        assert_eq!(&dst.rgba[0..3], &[161, 50, 255]);
+    }
+
+    #[test]
+    fn cut_out_darkens_rgb_or_scales_destination_alpha() {
+        let src = image(&[[9, 9, 9, 128]]);
+        let mut rgb = image(&[[200, 100, 50, 77]]);
+        assert!(blit_cut_out(&mut rgb, 1, &src, 2, 0, 0, 256));
+        assert_eq!(rgb.rgba, [100, 50, 25, 0]);
+        let mut argb = image(&[[200, 100, 50, 200]]);
+        assert!(blit_cut_out(&mut argb, 2, &src, 2, 0, 0, 256));
+        assert_eq!(argb.rgba, [200, 100, 50, 100]);
+        // An RGB source is not handled by the target.
+        let mut untouched = image(&[[1, 2, 3, 4]]);
+        assert!(!blit_cut_out(&mut untouched, 1, &src, 1, 0, 0, 256));
+        assert_eq!(untouched.rgba, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn overlay_mirrors_on_the_destination_and_hard_light_on_the_source() {
+        let src = image(&[[200, 100, 0, 0]]);
+        let mut dst = image(&[[100, 200, 0, 0]]);
+        assert!(blit_overlay(&mut dst, 1, &src, 1, 0, 0, 256, false));
+        // d <= 127: (200<<5)*(100<<4) >> 16 = 156; d > 127: 255 - 68 = 187.
+        assert_eq!(&dst.rgba[0..2], &[156, 187]);
+        let mut dst = image(&[[100, 200, 0, 0]]);
+        assert!(blit_overlay(&mut dst, 1, &src, 1, 0, 0, 256, true));
+        // s > 127 mirrors: 187; s <= 127: 156.
+        assert_eq!(&dst.rgba[0..2], &[187, 156]);
+    }
+
+    #[test]
+    fn fade_to_white_and_channel_extraction() {
+        let src = image(&[[0, 255, 10, 20]]);
+        let mut dst = image(&[[5, 5, 5, 5]]);
+        assert!(blit_fade_to_white(&mut dst, 1, &src, 1, 0, 0, 128));
+        assert_eq!(dst.rgba, [127, 254, 132, 0]);
+        let src = image(&[[1, 2, 3, 4]]);
+        let mut dst = image(&[[9; 4]]);
+        // Target byte 0 is blue, our lane 2.
+        assert!(blit_extract_channel(&mut dst, 1, &src, 2, 0, 0, 0));
+        assert_eq!(dst.rgba, [0, 0, 3, 255]);
+        assert!(blit_extract_channel(&mut dst, 1, &src, 2, 0, 0, 3));
+        assert_eq!(dst.rgba, [4, 4, 4, 255]);
+    }
+
+    #[test]
+    fn multiply_with_argb_source_and_coverage_bytes() {
+        let src = image(&[[128, 0, 0, 255]]);
+        let mut dst = image(&[[200, 50, 0, 9]]);
+        assert!(blit_multiply(&mut dst, 1, &src, 2, 0, 0, 256));
+        // product 100, weight 127 -> 100; 50 * 0 -> 0; fourth lane kept.
+        assert_eq!(dst.rgba, [100, 0, 0, 9]);
+        let src = image(&[[255, 0, 0, 0], [0, 0, 0, 0]]);
+        let mut dst = image(&[[100, 0, 0, 0], [100, 0, 0, 0]]);
+        assert!(blit_multiply(&mut dst, 3, &src, 3, 0, 0, 256));
+        // 100 * 255 keeps 100; 100 * 0 wraps through the u16 step to 0.
+        assert_eq!([dst.rgba[0], dst.rgba[4]], [100, 0]);
     }
 
     #[test]
