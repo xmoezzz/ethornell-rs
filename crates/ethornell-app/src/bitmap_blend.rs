@@ -493,7 +493,8 @@ pub(crate) fn blit_fade(
                 let ws = ((keep * sa) << 16) / total;
                 let wd = (weighted_dst << 16) / total;
                 for lane in 0..3 {
-                    d[lane] = ((ws.wrapping_mul(u32::from(s[lane]))
+                    d[lane] = ((ws
+                        .wrapping_mul(u32::from(s[lane]))
                         .wrapping_add(wd.wrapping_mul(u32::from(d[lane]))))
                         >> 16) as u8;
                 }
@@ -761,6 +762,103 @@ fn force_opaque_copy(destination: &mut DecodedImage, source: &DecodedImage, x: i
     for_each_pixel(destination, source, x, y, |s, d| {
         *d = [s[0], s[1], s[2], 0xff]
     });
+}
+
+/// `sub_40A9E0` for one blit: the jump table maps 0x20 to mode 1 and 0xC0 to
+/// mode 5 and runs 0x21..0x27 as modes 2..4 / 6..9 with `256 - p`. A format
+/// pair a kernel does not implement leaves the destination unchanged and
+/// still counts as handled.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_mode(
+    destination: &mut DecodedImage,
+    df: i32,
+    source: &DecodedImage,
+    sf: i32,
+    x: i32,
+    y: i32,
+    mode: i32,
+    alpha_parameter: i32,
+) -> bool {
+    let inverted = 256 - alpha_parameter;
+    match mode {
+        0 => blit_alpha_over(destination, df, source, sf, x, y),
+        // sub_40B320 only acts for parameters below 0x100; a fully
+        // transparent source (256) leaves the destination untouched.
+        1 | 0x20 if alpha_parameter >= 256 => true,
+        1 | 0x20 => blit_alpha_over_parameter(destination, df, source, sf, x, y, alpha_parameter),
+        2 | 0x21 => blit_add(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode == 2 { alpha_parameter } else { inverted },
+        ),
+        3 | 0x22 => blit_subtract(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode == 3 { alpha_parameter } else { inverted },
+        ),
+        4 | 0x23 => blit_multiply(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode == 4 { alpha_parameter } else { inverted },
+        ),
+        5 | 0xc0 => blit_fade(destination, df, source, sf, x, y, alpha_parameter),
+        6 | 0x24 => blit_screen(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode == 6 { alpha_parameter } else { inverted },
+        ),
+        7 | 0x25 => blit_cut_out(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode == 7 { alpha_parameter } else { inverted },
+        ),
+        8 | 0x26 | 9 | 0x27 => blit_overlay(
+            destination,
+            df,
+            source,
+            sf,
+            x,
+            y,
+            if mode <= 9 { alpha_parameter } else { inverted },
+            matches!(mode, 9 | 0x27),
+        ),
+        0x40 => blit_mask_clear(destination, source, sf, x, y, alpha_parameter),
+        0x41 => {
+            blit_clear_region(destination, source, x, y);
+            true
+        }
+        0x80 => blit_copy(destination, df, source, sf, x, y),
+        0xc1 => blit_fade_to_white(destination, df, source, sf, x, y, alpha_parameter),
+        0xf0 if alpha_parameter == 0 => blit_copy(destination, df, source, sf, x, y),
+        0xf0 => {
+            if alpha_parameter < 256 {
+                blit_interpolate(destination, source, x, y, alpha_parameter);
+            }
+            true
+        }
+        0xff => blit_extract_channel(destination, df, source, sf, x, y, alpha_parameter),
+        _ => true,
+    }
 }
 
 #[cfg(test)]

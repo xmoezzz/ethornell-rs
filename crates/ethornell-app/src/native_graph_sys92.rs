@@ -108,8 +108,11 @@ impl RuntimeTraceApi {
                 source.reverse();
                 let resource = source.first().and_then(value_to_string).unwrap_or_default();
                 let context = source.get(1).and_then(value_to_string).unwrap_or_default();
-                let loaded =
-                    !resource.is_empty() && self.load_graph_image_resource(0, &context, &resource);
+                let loaded = !resource.is_empty()
+                    && self.load_graph_image_resource_target(None, &context, &resource);
+                if loaded {
+                    self.preloaded_bitmap_keys.insert(format!("{context}:{resource}"));
+                }
                 tracing::debug!(resource, context, loaded, "Graph92PreloadBitmap");
                 call.complete_procedure(
                     ethornell_vm::native_call::NativeProcedureClass::PreloadBitmap,

@@ -1239,7 +1239,7 @@ pub mod opcodes {
         id: 0x06,
     };
     /// Target stores the default duration used by later graph control procedures.
-    pub const GRAPH90_SET_DEFAULT_PROCEDURE_DURATION: NativeOpcode = NativeOpcode {
+    pub const GRAPH90_SET_SYNC_LOAD_HOLD: NativeOpcode = NativeOpcode {
         group: 0x90,
         id: 0x07,
     };
@@ -4389,11 +4389,11 @@ const GRAPH90_SET_CENTER_PARAMETERS: &[NativeParameterSpec] = &[
         description: "Target-recovered BP argument.",
     },
 ];
-const GRAPH90_SET_DEFAULT_PROCEDURE_DURATION_PARAMETERS: &[NativeParameterSpec] =
+const GRAPH90_SET_SYNC_LOAD_HOLD_PARAMETERS: &[NativeParameterSpec] =
     &[NativeParameterSpec {
-        name: "duration",
-        kind: "i32 time value",
-        description: "Default control/procedure duration.",
+        name: "hold_ms",
+        kind: "i32 milliseconds",
+        description: "dword_565AE0: how long Graph90:10 keeps loading synchronously after the first load (sub_402080); 0 disables the window.",
     }];
 const GRAPH90_SET_DISPLAY_ENABLED_PARAMETERS: &[NativeParameterSpec] = &[NativeParameterSpec {
     name: "enabled",
@@ -16391,12 +16391,12 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         notes: "Target sub_461E30/sub_442E70 stores an optional graph centre. CObjectManager initializes it to (-1,-1); sub_442E90 accepts it only when 0<=x<display_width and 0<=y<display_height. Normal Sprite projection sub_429AF0 uses this validated centre instead of display_width/2,display_height/2 when CDspObj+0x100 is enabled.",
     },
     NativeOpcodeSpec {
-        opcode: opcodes::GRAPH90_SET_DEFAULT_PROCEDURE_DURATION,
-        symbol: "Graph90_07_SetDefaultProcedureDuration",
-        parameters: GRAPH90_SET_DEFAULT_PROCEDURE_DURATION_PARAMETERS,
+        opcode: opcodes::GRAPH90_SET_SYNC_LOAD_HOLD,
+        symbol: "Graph90_07_SetSyncLoadHold",
+        parameters: GRAPH90_SET_SYNC_LOAD_HOLD_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target stores the default duration used by later graph control procedures.",
+        notes: "sub_479560 -> sub_402070 stores dword_565AE0. sub_402080 then keeps Graph90:10 synchronous for that many ms after the first load (the configured gate always does); the first load after the window yields once through CProcLoadBitmap.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_DISPLAY_ENABLED,
@@ -16468,7 +16468,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_LOAD_BITMAP_PARAMETERS,
         returns: "procedure completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
-        notes: "Target uses a synchronous cache hit path or installs CProcLoadBitmap and returns native scheduler status 2. CBG native bitmap format is selected from bpp plus header subtype by sub_401C10; decoded 24-bpp CBGs become format 1 through the sub_469EE0 subtype-7 rewrite and sub_407DA0 normalization. Cache/preload paths preserve the recovered native format when pixels are later bound to a bitmap handle.",
+        notes: "sub_4797E0 pops name, archive, handle (< 0x4000). A cached (preloaded) image, or a name without '/' while sub_402080 allows it, loads synchronously; otherwise CProcLoadBitmap loads it and the thread yields until it completes. Names with '/' are DCProcImageSynth compositions (elements name[,x,y[,mode[,param]]] blitted through sub_40A530). A failed load is fatal on both paths (CProcLoad +400 is 0, so its tick returns -1 and the scheduler ends the engine).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_BITMAP,
@@ -20226,7 +20226,7 @@ const TARGET_CONFIRMED_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CREATE_WORK_BITMAP,
     opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
     opcodes::GRAPH90_SET_CENTER,
-    opcodes::GRAPH90_SET_DEFAULT_PROCEDURE_DURATION,
+    opcodes::GRAPH90_SET_SYNC_LOAD_HOLD,
     opcodes::GRAPH90_SET_DISPLAY_ENABLED,
     opcodes::GRAPH90_SET_DEFAULT_PRIORITY,
     opcodes::GRAPH90_SET_OBJECT_UPDATE_REDRAW_POLICY,
@@ -20639,7 +20639,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_SCHEDULER_GATE,
     opcodes::GRAPH90_SET_FRAME_RATE,
     opcodes::GRAPH90_SET_CENTER,
-    opcodes::GRAPH90_SET_DEFAULT_PROCEDURE_DURATION,
+    opcodes::GRAPH90_SET_SYNC_LOAD_HOLD,
     opcodes::GRAPH90_SET_DISPLAY_ENABLED,
     opcodes::GRAPH90_SET_DEFAULT_PRIORITY,
     opcodes::GRAPH90_SET_OBJECT_UPDATE_REDRAW_POLICY,
@@ -20897,6 +20897,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_REGISTER_INPUT_CLASS_DESCRIPTORS,
     opcodes::SYS_QUERY_INPUT_CLASS_LEVEL,
     opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
+    opcodes::GRAPH90_LOAD_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21019,7 +21020,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_DISPLAY_OPTIONS,
     opcodes::GRAPH90_SET_RASTER_FORMAT_MODE,
     opcodes::GRAPH90_REGISTER_FONT,
-    opcodes::GRAPH90_LOAD_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP_FROM_PIXELS,
     opcodes::GRAPH90_COPY_BITMAP_PIXELS,
     opcodes::GRAPH90_VALIDATE_BITMAP_FORMAT,

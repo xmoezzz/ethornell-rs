@@ -325,7 +325,7 @@ pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
         (0x90, 0x04) => Some("GraphCreateWorkBitmap"),
         (0x90, 0x05) => Some("GraphCreatePrioritizedWorkBitmap"),
         (0x90, 0x06) => Some("GraphSetCenter"),
-        (0x90, 0x07) => Some("GraphSetDefaultProcedureDuration"),
+        (0x90, 0x07) => Some("GraphSetSyncLoadHold"),
         (0x90, 0x08) => Some("GraphSetDisplayEnabled"),
         (0x90, 0x09) => Some("GraphSetDefaultPriority"),
         (0x90, 0x0a) => Some("GraphSetObjectUpdateRedrawPolicy"),

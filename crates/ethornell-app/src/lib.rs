@@ -715,6 +715,11 @@ struct RuntimeTraceApi {
     /// Physically held descriptors (GetAsyncKeyState), independent of the
     /// native records that Sys80:10 may clear.
     input_physically_held: BTreeSet<i32>,
+    /// sub_402080 dword_565AE4: end of the current synchronous-load window.
+    sync_load_deadline: u64,
+    /// Resources a Graph92:14 preload decoded (DCProcPreloadBmp cache); a
+    /// later Graph90:10 for them always loads synchronously.
+    preloaded_bitmap_keys: BTreeSet<String>,
     /// Object nodes of the pointer scope chain (sub_46D6E0): (scope, object)
     /// in chain order, scope = the object's sort key when it registered.
     pointer_object_nodes: Vec<(u32, i32)>,
@@ -1013,6 +1018,8 @@ impl RuntimeTraceApi {
             last_button_press: None,
             input_physically_held: BTreeSet::new(),
             pointer_object_nodes: Vec::new(),
+            sync_load_deadline: 0,
+            preloaded_bitmap_keys: BTreeSet::new(),
             window_messages: VecDeque::new(),
             input_configuration_enabled: 1,
             input_master_gate: 1,
@@ -1629,6 +1636,80 @@ impl RuntimeTraceApi {
         size
     }
 
+    /// DCProcImageSynth (sub_451070 / sub_450BC0): a resource name made of
+    /// '/'-separated elements `name[,x,y[,mode[,param]]]`. The first element
+    /// becomes the image; every later one is blitted onto it through
+    /// sub_40A530 at (x, y), else at its embedded point, else at (0, 0), with
+    /// mode `m + 0x20` (0x80 for m > 7, 0 when absent) and param <= 256.
+    fn synthesize_graph_image(&mut self, archive_name: &str, resource_name: &str, key: &str) -> bool {
+        struct Element {
+            name: String,
+            position: Option<(i32, i32)>,
+            mode: i32,
+            parameter: i32,
+        }
+        let mut elements = Vec::new();
+        for raw in resource_name.split('/') {
+            let mut fields = raw.split(',');
+            let name = fields.next().unwrap_or_default().trim().to_string();
+            if name.is_empty() {
+                return false;
+            }
+            let mut number = || fields.next().map(|field| field.trim().parse::<i32>().unwrap_or(0));
+            let x = number();
+            let y = number();
+            let mode = number().map_or(0, |mode| if mode as u32 > 7 { 128 } else { mode + 32 });
+            let parameter = number().map_or(0, |value| if value as u32 <= 0x100 { value } else { 0 });
+            elements.push(Element {
+                name,
+                position: x.zip(y),
+                mode,
+                parameter,
+            });
+        }
+        let mut result: Option<(DecodedImage, i32)> = None;
+        for element in elements {
+            if !self.load_graph_image_resource_target(None, archive_name, &element.name) {
+                return false;
+            }
+            let element_key = format!("{archive_name}:{}", element.name);
+            let Some(image) = self.graph_images.get(&element_key).cloned() else {
+                return false;
+            };
+            let format = self.graph_image_formats.get(&element_key).copied().unwrap_or(2);
+            match result.as_mut() {
+                None => result = Some((image, format)),
+                Some((base, base_format)) => {
+                    let (x, y) = element
+                        .position
+                        .or_else(|| {
+                            self.graph_image_auxiliary_pairs
+                                .get(&element_key)
+                                .map(|pair| (pair[0], pair[1]))
+                        })
+                        .unwrap_or((0, 0));
+                    bitmap_blend::blit_mode(
+                        base,
+                        *base_format,
+                        &image,
+                        format,
+                        x,
+                        y,
+                        element.mode,
+                        element.parameter,
+                    );
+                }
+            }
+        }
+        let Some((image, format)) = result else {
+            return false;
+        };
+        self.graph_image_formats.insert(key.to_string(), format);
+        self.graph_image_auxiliary_pairs.remove(key);
+        self.store_graph_image(key.to_string(), image);
+        true
+    }
+
     fn load_graph_image_resource(
         &mut self,
         target_id: i32,
@@ -1646,6 +1727,11 @@ impl RuntimeTraceApi {
         resource_name: &str,
     ) -> bool {
         let key = format!("{archive_name}:{resource_name}");
+        if resource_name.contains('/') && !self.graph_images.contains_key(&key) {
+            if !self.synthesize_graph_image(archive_name, resource_name, &key) {
+                return false;
+            }
+        }
         if self.graph_images.contains_key(&key) {
             if let Some(target_id) = target_id {
                 let dimensions = self
@@ -2597,6 +2683,30 @@ impl RuntimeTraceApi {
             }
         }
         Some(0)
+    }
+
+    /// sub_402080: whether Graph90:10 may load synchronously. The configured
+    /// gate (skip) always allows it; with a Graph90:07 hold the first load
+    /// opens a window during which loads stay synchronous, and the first
+    /// load after the window closes yields once and resets it.
+    fn graph_sync_load_active(&mut self) -> bool {
+        let mut result = ethornell_vm::SysApi::query_configured_input_gate(self) != 0;
+        let hold = self.graph_config.sync_load_hold_ms;
+        let now = self.engine_time_ms;
+        if hold != 0 {
+            if self.sync_load_deadline == 0 {
+                self.sync_load_deadline = now.wrapping_add(hold as u32 as u64);
+                return true;
+            }
+            if result || self.sync_load_deadline > now {
+                return true;
+            }
+            result = false;
+            self.sync_load_deadline = 0;
+        } else if !result {
+            self.sync_load_deadline = 0;
+        }
+        result
     }
 
     /// CDspObj::IsDrawable (sub_41AE30): enabled, draw-enabled, not
@@ -6082,71 +6192,17 @@ impl RuntimeTraceApi {
         // 0x21..0x27 as modes 2..4 / 6..9 with `256 - p`. A format pair a
         // kernel does not implement leaves the destination unchanged.
         // Bitmaps whose format is unknown keep the portable compositor.
-        let inverted = 256 - alpha_parameter;
         let native = match (source_format, destination_format) {
-            (Some(sf), Some(df)) => Some(match mode {
-                0 => bitmap_blend::blit_alpha_over(&mut destination_image, df, &source_image, sf, x, y),
-                // sub_40B320 only acts for parameters below 0x100; a fully
-                // transparent source (256) leaves the destination untouched.
-                1 | 0x20 if alpha_parameter >= 256 => true,
-                1 | 0x20 => bitmap_blend::blit_alpha_over_parameter(
-                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
-                ),
-                2 | 0x21 => bitmap_blend::blit_add(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode == 2 { alpha_parameter } else { inverted },
-                ),
-                3 | 0x22 => bitmap_blend::blit_subtract(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode == 3 { alpha_parameter } else { inverted },
-                ),
-                4 | 0x23 => bitmap_blend::blit_multiply(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode == 4 { alpha_parameter } else { inverted },
-                ),
-                5 | 0xc0 => bitmap_blend::blit_fade(
-                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
-                ),
-                6 | 0x24 => bitmap_blend::blit_screen(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode == 6 { alpha_parameter } else { inverted },
-                ),
-                7 | 0x25 => bitmap_blend::blit_cut_out(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode == 7 { alpha_parameter } else { inverted },
-                ),
-                8 | 0x26 | 9 | 0x27 => bitmap_blend::blit_overlay(
-                    &mut destination_image, df, &source_image, sf, x, y,
-                    if mode <= 9 { alpha_parameter } else { inverted },
-                    matches!(mode, 9 | 0x27),
-                ),
-                0x40 => bitmap_blend::blit_mask_clear(
-                    &mut destination_image, &source_image, sf, x, y, alpha_parameter,
-                ),
-                0x41 => {
-                    bitmap_blend::blit_clear_region(&mut destination_image, &source_image, x, y);
-                    true
-                }
-                0x80 => bitmap_blend::blit_copy(&mut destination_image, df, &source_image, sf, x, y),
-                0xc1 => bitmap_blend::blit_fade_to_white(
-                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
-                ),
-                0xf0 if alpha_parameter == 0 => {
-                    bitmap_blend::blit_copy(&mut destination_image, df, &source_image, sf, x, y)
-                }
-                0xf0 => {
-                    if alpha_parameter < 256 {
-                        bitmap_blend::blit_interpolate(
-                            &mut destination_image, &source_image, x, y, alpha_parameter,
-                        );
-                    }
-                    true
-                }
-                0xff => bitmap_blend::blit_extract_channel(
-                    &mut destination_image, df, &source_image, sf, x, y, alpha_parameter,
-                ),
-                _ => true,
-            }),
+            (Some(sf), Some(df)) => Some(bitmap_blend::blit_mode(
+                &mut destination_image,
+                df,
+                &source_image,
+                sf,
+                x,
+                y,
+                mode,
+                alpha_parameter,
+            )),
             _ => None,
         };
         if native.is_none() {
@@ -9479,6 +9535,49 @@ mod input_tests {
     }
 
     #[test]
+    fn slash_resource_names_are_synthesized_like_dcprocimagesynth() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let image = |rgba: [u8; 4], width: u32| DecodedImage {
+            width,
+            height: 1,
+            rgba: rgba.repeat(width as usize),
+        };
+        api.store_graph_image("a:base".into(), image([10, 20, 30, 255], 3));
+        api.graph_image_formats.insert("a:base".into(), 1);
+        api.store_graph_image("a:top".into(), image([200, 100, 50, 255], 1));
+        api.graph_image_formats.insert("a:top".into(), 2);
+        // Element "top" at (1, 0) with mode 0 + 0x20 and parameter 0: an
+        // opaque ARGB pixel copied over the RGB base.
+        assert!(api.load_graph_image_resource(7, "a", "base/top,1,0,0,0"));
+        let result = api.graph_bitmap_image(7).unwrap();
+        assert_eq!(&result.rgba[0..3], &[10, 20, 30]);
+        assert_eq!(&result.rgba[4..7], &[200, 100, 50]);
+        assert_eq!(&result.rgba[8..11], &[10, 20, 30]);
+        assert_eq!(api.bitmap_formats[&7], 1);
+    }
+
+    #[test]
+    fn synchronous_load_window_follows_sub_402080() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        // Without a hold and without the configured gate every load yields.
+        assert!(!api.graph_sync_load_active());
+        api.graph_config.sync_load_hold_ms = 100;
+        api.engine_time_ms = 1000;
+        // The first load opens the window, later ones stay inside it.
+        assert!(api.graph_sync_load_active());
+        api.engine_time_ms = 1099;
+        assert!(api.graph_sync_load_active());
+        // Once it has passed, one load yields and the window resets.
+        api.engine_time_ms = 1100;
+        assert!(!api.graph_sync_load_active());
+        assert!(api.graph_sync_load_active());
+    }
+
+    #[test]
     fn graph90_51_refuses_attached_or_missing_sprites() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -9768,7 +9867,7 @@ mod input_tests {
         call_graph(&mut api, 0x90, 0x0e, &mut font).unwrap();
 
         assert_eq!(api.graph_config.center, (640, 360));
-        assert_eq!(api.graph_config.default_duration, 250);
+        assert_eq!(api.graph_config.sync_load_hold_ms, 250);
         assert_eq!(api.graph_config.enabled, 1);
         assert_eq!(api.graph_config.display_mode, (1, 0));
         assert_eq!(api.graph_config.renderer_options, (1, 0));
@@ -20595,9 +20694,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::info!(x, y, center_valid, "GraphSetCenter");
             }
             (0x90, 0x07) => {
+                // sub_479560 -> sub_402070 stores dword_565AE0.
                 let value = pop_int_value(stack).unwrap_or_default();
-                self.graph_config.default_duration = value;
-                tracing::info!(value, "GraphSetDefaultDuration");
+                self.graph_config.sync_load_hold_ms = value;
+                tracing::debug!(value, "GraphSetSynchronousLoadHold");
             }
             (0x90, 0x00) => {
                 let full_redraw = pop_int_value(stack).unwrap_or_default() != 0;
@@ -20923,20 +21023,38 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 );
             }
             (0x90, 0x10) => {
+                // sub_4797E0 pops name, archive, bitmap handle (< 0x4000).
                 let name = stack.pop();
                 let archive = stack.pop();
                 let target = stack.pop();
-                tracing::info!(?target, ?archive, ?name, "GraphLoadResource");
+                tracing::debug!(?target, ?archive, ?name, "GraphLoadResource");
                 let target_id = target.as_ref().map(value_to_i32).unwrap_or_default();
+                if !(0..0x4000).contains(&target_id) {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:10 bitmap handle {target_id} is out of range"
+                    )));
+                }
                 let archive_name = archive
                     .as_ref()
                     .and_then(value_to_string)
                     .unwrap_or_default();
                 let resource_name = name.as_ref().and_then(value_to_string).unwrap_or_default();
+                // A preloaded (cached) image and, while sub_402080 holds, a
+                // name without '/' load synchronously; everything else goes
+                // through CProcLoadBitmap and yields until it completes.
+                let key = format!("{archive_name}:{resource_name}");
+                let synchronous = self.preloaded_bitmap_keys.contains(&key)
+                    || (!resource_name.contains('/') && self.graph_sync_load_active());
                 let loaded =
                     self.load_graph_image_resource(target_id, &archive_name, &resource_name);
-                if loaded
-                    && archive_name.eq_ignore_ascii_case("sysgrp.arc")
+                if !loaded {
+                    // Both the synchronous error path and CProcLoad's -1
+                    // tick (+400 is 0) end the engine.
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:10 cannot load {archive_name}:{resource_name}"
+                    )));
+                }
+                if archive_name.eq_ignore_ascii_case("sysgrp.arc")
                     && resource_name.starts_with("SGTitle")
                 {
                     self.ensure_title_atlas_images();
@@ -20947,10 +21065,12 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         self.title_ui_active = true;
                     }
                 }
-                call.complete_procedure(
-                    ethornell_vm::native_call::NativeProcedureClass::LoadBitmap,
-                    if loaded { 0 } else { 1 },
-                );
+                if !synchronous {
+                    call.complete_procedure(
+                        ethornell_vm::native_call::NativeProcedureClass::LoadBitmap,
+                        0,
+                    );
+                }
             }
             (0x90, 0x11) => {
                 let format = stack.pop();

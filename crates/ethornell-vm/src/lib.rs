@@ -5753,6 +5753,9 @@ impl Vm {
             || opcode == native_call::opcodes::SYS81_READ_RESOURCE_BINARY
             || opcode == native_call::opcodes::SYS81_RUN_INSTALLATION_PROCEDURE
             || opcode == native_call::opcodes::GRAPH90_DECODE_BURIKO_MOVIE_FRAME
+            // sub_4797E0 loads cached images and, while sub_402080 holds,
+            // '/'-free names synchronously without a CProcLoadBitmap.
+            || opcode == native_call::opcodes::GRAPH90_LOAD_BITMAP
         {
             // These selectors install a procedure only on a target-confirmed
             // conditional path. Their owning handlers consume the relevant

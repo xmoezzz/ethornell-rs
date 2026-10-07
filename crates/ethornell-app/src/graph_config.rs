@@ -12,7 +12,9 @@ pub(crate) struct RuntimeFontRegistration {
 #[derive(Debug)]
 pub(crate) struct RuntimeGraphConfig {
     pub(crate) center: (i32, i32),
-    pub(crate) default_duration: i32,
+    /// Graph90:07 dword_565AE0: how long (ms) sub_402080 keeps loads
+    /// synchronous after the first one.
+    pub(crate) sync_load_hold_ms: i32,
     pub(crate) enabled: i32,
     pub(crate) display_mode: (i32, i32),
     pub(crate) renderer_options: (i32, i32),
@@ -28,7 +30,7 @@ impl Default for RuntimeGraphConfig {
             // centre through sub_442E70(-1, -1). sub_442E90 only accepts an
             // override that lies inside the current display dimensions.
             center: (-1, -1),
-            default_duration: 0,
+            sync_load_hold_ms: 0,
             enabled: 0,
             display_mode: (0, 0),
             renderer_options: (0, 0),
