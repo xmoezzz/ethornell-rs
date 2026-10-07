@@ -16716,7 +16716,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_OBJECT_PROPERTY_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target forwards source-order object/property/value/extra to sub_4438B0. Generic CDspObj selector 196 (0xC4) writes +0x48, gating Graph91:06 global display offsets. Selector 0x8000 reaches sub_41BEB0 and writes +0x80=value/+0x84=extra, controlling whole-16.16 X/Y rounding in sub_41B370. Selector 0x8100 reaches sub_41BF10 and writes signed +0x24, an additive component of the vtable+0x1C CObjectManager sort key. sub_4438B0 samples that key before/after the property virtual and calls sub_443300 -> sub_4307D0 to remove/reinsert the object when it changes.",
+        notes: "sub_47B340 pops extra, value, property, object; sub_4438B0 calls the class SetProperty (vtable +0x5C) and re-sorts on a changed key; status 255/5/254 are script errors. Ported: CDspObj sub_41B8E0 (0 position, 1 blit mode +0xA8, 2 recursive SetAlpha, 0xC0/0xC1/0xC4, 0x8000/0x8001/0x8100, 0x7FFF0000 auto-update flag, 0x7FFFFFFF user slots), CDspObjSprite sub_4285A0 mode gating for 0x40-0x43/0x60/0x80-0x83/0x8F/0x11 and BackF 0x40000000. Open: Sprite 0x10/0x100 rebuilds, mode-6 consumers, and the BackML/BackRPL/BackRTT/BackSTR/Effector values are stored but not yet used by their renderers.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_OBJECT_ALPHA_MULTIPLIER,
@@ -18124,7 +18124,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_GET_OBJECT_PROPERTY_PARAMETERS,
         returns: "void; target reports invalid object/output or unsupported parameter",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_481A90 converts the first BP argument and invokes the object vtable +96 getter with the requested parameter number.",
+        notes: "sub_481A90 pops parameter, object, BP pointer; the class GetProperty (vtable +0x60) writes 1-5 DWORDs. Ported: CDspObj sub_41BAE0 (0 position, 1 blit mode, 2 alpha, 3 priority, 32 fixed x/y/z, 0x7FFFFFFF user slot indexed by the buffer's first DWORD, -2 sort key, -1 +0x104) and Sprite sub_4288F0 0x41 / 0x10000000 / 0x10000100 for modes 2 and 5; errors are script errors. Open: mode-6 values (sub_429BF0) until Graph90:5D is ported.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_GET_OBJECT_COMPOSITE_POSITION,

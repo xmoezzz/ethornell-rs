@@ -3963,65 +3963,30 @@ impl RuntimeTraceApi {
         let property = popped[2] as u32;
         let target = popped[3];
 
-        // sub_4438B0 samples vtable+0x1C before and after the virtual
-        // property setter and calls sub_443300 when the CObjectManager key
-        // changes (notably property 0x8100 -> CDspObj+0x24).
+        // sub_4438B0: an unknown object is status 255; the virtual setter's
+        // -65535 (unsupported property) becomes 5 and any other failure 254.
+        // sub_47B340 turns every non-zero status into a script error.
+        if !self.graph_handle_exists(target) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "Graph90:38 object #{target} does not exist"
+            )));
+        }
+        // It samples vtable+0x1C before and after the setter and re-sorts the
+        // object (sub_443300) when the key changed (e.g. property 0x8100).
         let sort_key_before = self.graph90_native_sort_key(target);
-
-        if property == 0x4000_0000 {
-            let backf = self
-                .graph_object_properties
-                .get_mut(&target)
-                .and_then(|properties| properties.background.as_mut())
-                .filter(|background| background.class == NativeBackgroundClass::BackF)
-                .and_then(|background| background.backf.as_mut())
-                .ok_or_else(|| {
-                    ethornell_vm::VmError::Runtime(format!(
-                        "Graph90:38 property 0x40000000 is only supported by CDspObjBackF #{target}"
-                    ))
-                })?;
-            // CDspObjBackF::SetParam (sub_41D4D0) forwards value as
-            // +0x168 and extra in EDX as +0x16c. sub_41D510 rejects an
-            // unsigned mode >= 4 only while the previous enable value is
-            // non-zero; constructor state (enable=0) accepts the first write.
-            if backf.mask_control_enabled != 0 && extra as u32 >= 4 {
+        tracing::debug!(target, property = format_args!("{property:#x}"), value, extra, kind = ?self.display_tree.kind(target), mode = ?self.graph90_sprite_mode(target), "Graph90:38 SetObjectProperty");
+        match self.graph90_object_set_property(target, property, value, extra) {
+            Ok(()) => {}
+            Err(5) => {
                 return Err(ethornell_vm::VmError::Runtime(format!(
-                    "Graph90:38 BackF mask-control mode {extra} rejected while enabled"
+                    "Graph90:38 object #{target} does not support property {property:#x}"
                 )));
             }
-            backf.mask_control_enabled = value;
-            backf.mask_control_mode = extra;
-        }
-
-        self.graph_object_properties
-            .entry(target)
-            .or_default()
-            .set_property(property, value, extra);
-
-        // CDspObjSprite::SetProperty 0x41 -> sub_428060 and 0x42 ->
-        // sub_428130 rebuild mode-5 geometry immediately. Properties
-        // 0x80/0x81/0x82/0x8F only update coefficients and are consumed by
-        // the next SetFixedParameter/sub_4299A0 invocation.
-        let transformed_property_rebuild = matches!(property, 0x41 | 0x42)
-            && self
-                .graph_object_properties
-                .get(&target)
-                .and_then(|properties| properties.named_properties.get("target-object-mode"))
-                .is_some_and(|mode| matches!(*mode, 5 | 6));
-
-        // Property 0 calls CDspObj's virtual position setter (+44).
-        if property == 0 {
-            self.graph90_set_position_recursive(target, value, extra);
-        } else {
-            // Blend/alpha and BackF's 0x40000000 mask-control property all
-            // feed GetMaskAlpha/sub_41D540. Rebuilding a non-BackF is a
-            // no-op, so keep this centralized instead of guessing which BP
-            // scripts will combine the setters.
-            self.graph90_refresh_backf_primary(target)
-                .map_err(ethornell_vm::VmError::Runtime)?;
-        }
-        if transformed_property_rebuild {
-            let _ = self.graph90_resync_fixed_sprite_geometry(target);
+            Err(status) => {
+                return Err(ethornell_vm::VmError::Runtime(format!(
+                    "Graph90:38 object #{target} rejected property {property:#x} = ({value}, {extra}) (status {status})"
+                )));
+            }
         }
         let sort_key_after = self.graph90_native_sort_key(target);
         if sort_key_before != sort_key_after
@@ -4034,6 +3999,293 @@ impl RuntimeTraceApi {
             "object property target=#{target} property=0x{property:08X} value={value} extra={extra}"
         );
         Ok(())
+    }
+
+    fn graph90_sprite_mode(&self, object: i32) -> Option<i32> {
+        (self.display_tree.kind(object) == Some(NativeDisplayKind::Sprite)).then(|| {
+            self.graph_object_properties
+                .get(&object)
+                .and_then(|properties| properties.named_properties.get("target-object-mode"))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    fn graph90_background_class(&self, object: i32) -> Option<NativeBackgroundClass> {
+        self.graph_object_properties
+            .get(&object)
+            .and_then(|properties| properties.background)
+            .map(|background| background.class)
+    }
+
+    /// The virtual `SetProperty` (vtable +0x5C) of the object's class. The
+    /// subclass handlers run first and fall back to `CDspObj::SetProperty`
+    /// (sub_41B8E0). `Err(5)` is the target's "unsupported property" result.
+    fn graph90_object_set_property(
+        &mut self,
+        target: i32,
+        property: u32,
+        value: i32,
+        extra: i32,
+    ) -> std::result::Result<(), i32> {
+        if let Some(mode) = self.graph90_sprite_mode(target) {
+            // CDspObjSprite::SetProperty (sub_4285A0); [77] is the mode.
+            let transformed = matches!(mode, 2 | 5 | 6);
+            let store = |api: &mut Self, value: i32, extra: i32| {
+                api.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .properties
+                    .insert(property, (value, extra));
+            };
+            let handled = match property {
+                // 0x40: sub_428020 stores the base offset pair (<<16) for
+                // modes 2/5/6; 0x80/0x82 coefficient pairs likewise.
+                0x40 | 0x80 | 0x82 => {
+                    if transformed {
+                        store(self, value, extra);
+                    }
+                    true
+                }
+                // 0x41: sub_428060 replaces the base rotation and rebuilds.
+                0x41 => {
+                    if transformed {
+                        store(self, value, extra);
+                        if matches!(mode, 5 | 6) {
+                            let _ = self.graph90_resync_fixed_sprite_geometry(target);
+                        }
+                    }
+                    true
+                }
+                // 0x42: sub_428130 base scale (0 means 1; a zero second value
+                // couples Y to X) for modes 2/5/6, then rebuilds.
+                0x42 => {
+                    if transformed {
+                        store(self, value, extra);
+                        if matches!(mode, 5 | 6) {
+                            let _ = self.graph90_resync_fixed_sprite_geometry(target);
+                        }
+                    }
+                    true
+                }
+                // 0x43 (sub_428100) and 0x83 are mode-6 only.
+                0x43 | 0x83 => {
+                    if mode == 6 {
+                        store(self, value, extra);
+                    }
+                    true
+                }
+                // 0x81: modes 2/5 -> [173]/[179], mode 6 -> [176]/[179].
+                0x81 => {
+                    if transformed {
+                        store(self, value, extra);
+                    }
+                    true
+                }
+                // 0x60 (sub_428540) is stored for every mode; 0x8F likewise.
+                0x60 | 0x8f => {
+                    store(self, value, extra);
+                    true
+                }
+                // 0x11: sub_42AB50 fills one of sixteen mode-4 table entries.
+                0x11 => {
+                    let index = (value >> 8) & 0xff;
+                    let kind = ((value as u32) >> 16) as i32;
+                    if index >= 16 || kind > 5 {
+                        return Err(254);
+                    }
+                    self.graph_object_properties
+                        .entry(target)
+                        .or_default()
+                        .properties
+                        .insert(0x1100 | index as u32, (kind, extra));
+                    true
+                }
+                // 0x10 rebuilds the sprite around a new primary bitmap and
+                // 0x100 sets the mode-4 bitmap; scripts never use them.
+                0x10 | 0x100 => {
+                    store(self, value, extra);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                return Ok(());
+            }
+        }
+        match (self.graph90_background_class(target), property) {
+            (Some(NativeBackgroundClass::BackF), 0x4000_0000) => {
+                // CDspObjBackF::SetProperty (sub_41D4D0 -> sub_41D510): a mode
+                // >= 4 is refused only while the control is already enabled.
+                let backf = self
+                    .graph_object_properties
+                    .get_mut(&target)
+                    .and_then(|properties| properties.background.as_mut())
+                    .and_then(|background| background.backf.as_mut())
+                    .ok_or(5)?;
+                if backf.mask_control_enabled != 0 && extra as u32 >= 4 {
+                    return Err(254);
+                }
+                backf.mask_control_enabled = value;
+                backf.mask_control_mode = extra;
+                self.graph90_refresh_backf_primary(target).map_err(|_| 254)?;
+                return Ok(());
+            }
+            // CDspObjBackML (sub_41E060), BackRPL (sub_41ED70: 255 -> +0x164,
+            // 256 alpha bitmap), BackRTT (sub_41F160: 128/257) and BackSTR
+            // (sub_41F9D0: 258) keep their values for the background renderer.
+            (Some(NativeBackgroundClass::BackMl), 0x41 | 0x80 | 0x81 | 0x82 | 0x8f)
+            | (Some(NativeBackgroundClass::BackRpl), 255 | 256)
+            | (Some(NativeBackgroundClass::BackRtt), 128 | 257)
+            | (Some(NativeBackgroundClass::BackStr), 258) => {
+                if property == 258 && (((value as i16) as i32) < 2 || (value >> 16) < 2) {
+                    return Err(254);
+                }
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .properties
+                    .insert(property, (value, extra));
+                return Ok(());
+            }
+            _ => {}
+        }
+        if self.display_tree.kind(target) == Some(NativeDisplayKind::Effector)
+            && matches!(property, 0x80 | 0x81 | 0x82 | 0x8f | 0xff | 0x100)
+        {
+            // CDspObjEffector::SetProperty (sub_4205B0).
+            self.graph_object_properties
+                .entry(target)
+                .or_default()
+                .properties
+                .insert(property, (value, extra));
+            return Ok(());
+        }
+
+        // CDspObj::SetProperty (sub_41B8E0).
+        match property {
+            0 => self.graph90_set_position_recursive(target, value, extra),
+            1 => {
+                let properties = self.graph_object_properties.entry(target).or_default();
+                properties.blend_mode = value;
+                properties.native.blend_mode = value;
+                let _ = self.graph90_refresh_backf_primary(target);
+            }
+            2 => self.set_graph_object_alpha_recursive_raw(target, value),
+            0xc0 => {
+                self.graph_object_properties.entry(target).or_default().native.property_c0_value =
+                    value as u32
+            }
+            0xc1 => {
+                self.graph_object_properties.entry(target).or_default().native.property_c1_value =
+                    value as u32
+            }
+            0xc4 => {
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .global_display_offset_enabled = value as u32
+            }
+            0x8000 => {
+                let native = &mut self.graph_object_properties.entry(target).or_default().native;
+                native.fixed_position_rounding_enabled = value as u32;
+                native.fixed_position_rounding_mode = extra as u32;
+            }
+            0x8001 => {
+                self.graph_object_properties.entry(target).or_default().native.property_8001_value =
+                    value as u32
+            }
+            0x8100 => self.graph_object_properties.entry(target).or_default().native.sort_bias = value,
+            0x7fff_0000 => {
+                self.graph_object_properties.entry(target).or_default().native.auto_update =
+                    value as u32
+            }
+            0x7fff_ffff => {
+                let Some(slot) = usize::try_from(value).ok().filter(|index| *index < 16) else {
+                    return Err(254);
+                };
+                self.graph_object_properties.entry(target).or_default().native.user_slots[slot] =
+                    extra;
+            }
+            _ => return Err(5),
+        }
+        Ok(())
+    }
+
+    /// The virtual `GetProperty` (vtable +0x60) used by Graph91:38. Returns
+    /// the DWORDs the target writes through the caller's pointer; `input`
+    /// is the first DWORD already in that buffer (the 0x7FFFFFFF index).
+    pub(crate) fn graph91_object_get_property(
+        &self,
+        object: i32,
+        parameter: u32,
+        input: i32,
+    ) -> std::result::Result<Vec<i32>, i32> {
+        if !self.graph_handle_exists(object) {
+            return Err(255);
+        }
+        let default_properties = RuntimeGraphObjectProperties::default();
+        let properties = self
+            .graph_object_properties
+            .get(&object)
+            .unwrap_or(&default_properties);
+        let native = &properties.native;
+        if let Some(mode) = self.graph90_sprite_mode(object) {
+            // CDspObjSprite::GetProperty (sub_4288F0).
+            match parameter {
+                0x41 => {
+                    let rotation = properties.properties.get(&0x41).map(|pair| pair.0);
+                    return match mode {
+                        2 | 5 | 6 => Ok(vec![rotation.unwrap_or_else(|| {
+                            self.graph90_sprite_base_rotation(object).unwrap_or(0)
+                        })]),
+                        _ => Err(5),
+                    };
+                }
+                0x1000_0000 => {
+                    return match mode {
+                        5 | 6 => self.graph90_sprite_transform_parameters(object).ok_or(5),
+                        _ => Err(5),
+                    };
+                }
+                0x1000_0100 => {
+                    let (width, height) = properties
+                        .format_resource
+                        .and_then(|bitmap| self.bitmap_dimensions.get(&bitmap).copied())
+                        .map(|(w, h)| (w as i32, h as i32))
+                        .unwrap_or((0, 0));
+                    let (extent_x, extent_y) = if matches!(mode, 2 | 5 | 6) {
+                        self.graph90_sprite_projected_extent(object)
+                            .unwrap_or((width, height))
+                    } else {
+                        (width, height)
+                    };
+                    return Ok(vec![width, height, extent_x, extent_y]);
+                }
+                _ => {}
+            }
+        }
+        // CDspObj::GetProperty (sub_41BAE0).
+        match parameter {
+            0 => Ok(vec![native.position_x, native.position_y]),
+            1 => Ok(vec![native.blend_mode]),
+            2 => Ok(vec![native.alpha_parameter]),
+            3 => Ok(vec![native.priority as i32]),
+            32 => Ok(vec![
+                native.fixed_position_x_16_16,
+                native.fixed_position_y_16_16,
+                native.fixed_position_z_16_16,
+            ]),
+            0x7fff_ffff => usize::try_from(input)
+                .ok()
+                .and_then(|index| native.user_slots.get(index))
+                .map(|value| vec![*value])
+                .ok_or(254),
+            0xffff_fffe => Ok(vec![self.graph90_native_sort_key(object).unwrap_or(0) as i32]),
+            0xffff_ffff => Ok(vec![i32::from_le_bytes(native.unknown_104_to_107)]),
+            _ => Err(5),
+        }
     }
 
     fn apply_graph_layer_color_blend(&mut self, args: &[ethornell_vm::Value]) {
@@ -19006,18 +19258,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         &self,
         object: i32,
         parameter: i32,
-    ) -> std::result::Result<i32, i32> {
-        if !self.graph_handle_exists(object) {
-            return Err(255);
-        }
-        let Some(properties) = self.graph_object_properties.get(&object) else {
-            return Err(5);
-        };
-        properties
-            .properties
-            .get(&(parameter as u32))
-            .map(|&(value, _)| value)
-            .ok_or(5)
+        input: i32,
+    ) -> std::result::Result<Vec<i32>, i32> {
+        self.graph91_object_get_property(object, parameter as u32, input)
     }
 
     fn query_graph91_object_composite_position(&self, object: i32) -> Option<[i32; 2]> {
@@ -20872,7 +21115,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             knob.position_y = base_y.round() as i32;
                             knob.alpha_parameter = target_native.alpha_parameter;
                             knob.priority = target_native.priority;
-                            knob.unknown_a8_to_ab = target_native.unknown_a8_to_ab;
+                            knob.blend_mode = target_native.blend_mode;
                         }
                         self.display_tree.set_local_position(handle, base_x, base_y);
 

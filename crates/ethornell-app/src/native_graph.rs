@@ -1931,6 +1931,65 @@ impl RuntimeTraceApi {
         self.graph90_refresh_native_sort_key(object);
     }
 
+    /// The mode-5 projection inputs and result exactly as
+    /// `graph90_sync_mode5_primary_layer` computes them (constructor args with
+    /// the current fixed position and the 0x40/0x41 property overrides).
+    fn graph90_mode5_projection(
+        &self,
+        object: i32,
+    ) -> Option<(NativeMode5NodeArgs, NativeMode5DynamicState, crate::graph::NativeMode5Geometry)> {
+        let properties = self.graph_object_properties.get(&object)?;
+        let mut args = self.graph90_recorded_source_args(object, 0x5C, 17)?;
+        args[1] = properties.native.fixed_position_x_16_16;
+        args[2] = properties.native.fixed_position_y_16_16;
+        args[3] = properties.native.fixed_position_z_16_16;
+        let mut raw = NativeMode5NodeArgs::from_source_args(&args)?;
+        if let Some((x, y)) = properties.properties.get(&0x40).copied() {
+            raw.anchor_x = x;
+            raw.anchor_y = y;
+        }
+        if let Some((rotation, _)) = properties.properties.get(&0x41).copied() {
+            raw.rotation = rotation;
+        }
+        let mode5 = self.graph90_resolve_projected_sprite_vector(raw);
+        let (_, source) = self.resource_image_region(mode5.resource_id)?;
+        let (screen_width, screen_height) = if self.screen_width > 0 && self.screen_height > 0 {
+            (self.screen_width, self.screen_height)
+        } else {
+            (1280, 720)
+        };
+        let dynamic = self.graph90_mode5_dynamic_state(object);
+        let geometry = mode5.screen_geometry_mode5_exact(
+            source.width,
+            source.height,
+            screen_width as f32,
+            screen_height as f32,
+            self.graph_config.center,
+            properties.native.use_graph_center != 0,
+            dynamic,
+        );
+        Some((mode5, dynamic, geometry))
+    }
+
+    /// Sprite [148] / [151]: the base rotation that Graph91:38 parameter
+    /// 0x41 reports when property 0x41 never replaced it.
+    pub(crate) fn graph90_sprite_base_rotation(&self, object: i32) -> Option<i32> {
+        let args = self.graph90_recorded_source_args(object, 0x5C, 17)?;
+        NativeMode5NodeArgs::from_source_args(&args).map(|args| args.rotation)
+    }
+
+    /// Graph91:38 parameter 0x10000000 for a mode-5 sprite (sub_4296C0).
+    pub(crate) fn graph90_sprite_transform_parameters(&self, object: i32) -> Option<Vec<i32>> {
+        let (mode5, dynamic, _) = self.graph90_mode5_projection(object)?;
+        Some(mode5.mode5_transform_parameters(dynamic).to_vec())
+    }
+
+    /// Sprite [181]/[182]: the projected raster size from sub_4291E0.
+    pub(crate) fn graph90_sprite_projected_extent(&self, object: i32) -> Option<(i32, i32)> {
+        let (_, _, geometry) = self.graph90_mode5_projection(object)?;
+        Some((geometry.width as i32, geometry.height as i32))
+    }
+
     fn graph90_recorded_source_args(
         &self,
         object: i32,

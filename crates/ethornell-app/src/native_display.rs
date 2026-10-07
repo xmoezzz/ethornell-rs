@@ -10,10 +10,12 @@ pub(crate) struct CDspObjLayout32 {
     pub(crate) vftable: u32, // +0x00
     /// Base object enable gate written by CDspObj::SetEnabled.
     pub(crate) enabled: u32, // +0x04
-    pub(crate) unknown_08: u32, // +0x08
+    /// Written by Graph90:38 property 0xC0 (sub_493130); no reader recovered.
+    pub(crate) property_c0_value: u32, // +0x08
     /// Suppression gate tested inversely by CDspObj::IsDrawable.
     pub(crate) suppress_draw: u32, // +0x0c
-    pub(crate) unknown_10: u32, // +0x10
+    /// Written by Graph90:38 property 0xC1 (sub_41ADE0).
+    pub(crate) property_c1_value: u32, // +0x10
     /// Independent draw gate written by the vtable+4 setter.
     pub(crate) draw_enabled: u32, // +0x14
     /// Object sort-class band returned by sub_41B0B0 and packed by
@@ -59,7 +61,9 @@ pub(crate) struct CDspObjLayout32 {
     pub(crate) fixed_position_rounding_enabled: u32, // +0x80
     /// Secondary rounding mode written by Graph property 0x8000 extra arg.
     pub(crate) fixed_position_rounding_mode: u32, // +0x84
-    pub(crate) unknown_88_to_8b: [u8; 0x04],
+    /// Written by Graph90:38 property 0x8001 (sub_41BEF0), read back by the
+    /// unused getter sub_41BF00.
+    pub(crate) property_8001_value: u32, // +0x88
     pub(crate) unknown_8c: u32, // +0x8c
     pub(crate) unknown_90: u32, // +0x90
     pub(crate) unknown_94: u32, // +0x94
@@ -67,7 +71,9 @@ pub(crate) struct CDspObjLayout32 {
     pub(crate) unknown_9c: u32, // +0x9c
     pub(crate) unknown_a0: u32, // +0xa0
     pub(crate) unknown_a4: u32, // +0xa4
-    pub(crate) unknown_a8_to_ab: [u8; 0x04],
+    /// Blit mode used when the object draws (sub_41B600 / sub_41B610);
+    /// Graph90:38 property 1 and Graph91:38 parameter 1.
+    pub(crate) blend_mode: i32, // +0xa8
     /// Target `Graph90:0x32` reaches the `CDspObj` virtual setter at
     /// `sub_41B620`, which writes the native transparency parameter here.
     /// `0` is opaque and `256` is fully transparent.
@@ -78,7 +84,12 @@ pub(crate) struct CDspObjLayout32 {
     pub(crate) alpha_multiplier: i32, // +0xb4
     /// Mode-zero object parameter stored as a signed 16.16 value.
     pub(crate) fixed_parameter_16_16: i32, // +0xb8
-    pub(crate) unknown_bc_to_ff: [u8; 0x44],
+    /// Property 0x7FFF0000 (sub_41C1C0): when set, the object manager
+    /// refreshes the object every frame through sub_41AEE0.
+    pub(crate) auto_update: u32, // +0xbc
+    /// Sixteen script-owned DWORDs: property / parameter 0x7FFFFFFF
+    /// (sub_41C1E0 / sub_41C200).
+    pub(crate) user_slots: [i32; 16], // +0xc0
     /// Gate read by CDspObjSprite::sub_429AF0 before consulting the optional
     /// CObjectManager graph centre. Normal script-visible display objects are
     /// constructed with this set; a few internal helper sprites explicitly
@@ -102,9 +113,9 @@ impl Default for CDspObjLayout32 {
         Self {
             vftable: 0,
             enabled: 1,
-            unknown_08: 0,
+            property_c0_value: 0,
             suppress_draw: 0,
-            unknown_10: 0,
+            property_c1_value: 0,
             draw_enabled: 0,
             sort_class: 0,
             priority: 0,
@@ -132,7 +143,7 @@ impl Default for CDspObjLayout32 {
             fixed_position_updates_integer_position: 1,
             fixed_position_rounding_enabled: 0,
             fixed_position_rounding_mode: 0,
-            unknown_88_to_8b: [0; 0x04],
+            property_8001_value: 0,
             unknown_8c: 0,
             unknown_90: 0,
             unknown_94: 0,
@@ -140,12 +151,14 @@ impl Default for CDspObjLayout32 {
             unknown_9c: 0,
             unknown_a0: 0,
             unknown_a4: 0,
-            unknown_a8_to_ab: [0; 0x04],
+            // CDspObj::CDspObj (sub_41A400) starts with blit mode 0x80.
+            blend_mode: 128,
             alpha_parameter: 0,
             mask_alpha: 0,
             alpha_multiplier: 256,
             fixed_parameter_16_16: 0,
-            unknown_bc_to_ff: [0; 0x44],
+            auto_update: 0,
+            user_slots: [0; 16],
             // Normal graph constructors pass 1 to sub_41C0B0. Special
             // internal Sprite constructors that pass 0 are not allocated by
             // Graph90:50.
@@ -200,7 +213,8 @@ pub(crate) struct BitmapInfoRecordLayout32 {
     pub(crate) unknown_04: u32, // +0x04
     pub(crate) width: u32,      // +0x08
     pub(crate) height: u32,     // +0x0c
-    pub(crate) unknown_10: u32, // +0x10
+    /// Written by Graph90:38 property 0xC1 (sub_41ADE0).
+    pub(crate) property_c1_value: u32, // +0x10
     pub(crate) unknown_14: u32, // +0x14
 }
 

@@ -1120,10 +1120,17 @@ pub trait GraphApi {
         Err(-1)
     }
 
-    /// Query one target CDspObj parameter for Graph91:38. The VM owns the
-    /// writable BP destination pointer. Error 255 means invalid object and 5
-    /// means the concrete subclass does not support the parameter number.
-    fn query_graph91_object_property(&self, _object: i32, _parameter: i32) -> Result<i32, i32> {
+    /// Query one target CDspObj parameter for Graph91:38 (vtable +0x60).
+    /// Returns every DWORD the getter writes through the BP pointer; `input`
+    /// is the DWORD already stored there (parameter 0x7FFFFFFF reads its
+    /// slot index from it). Error 255 means invalid object, 5 an unsupported
+    /// parameter and 254 a rejected value.
+    fn query_graph91_object_property(
+        &self,
+        _object: i32,
+        _parameter: i32,
+        _input: i32,
+    ) -> Result<Vec<i32>, i32> {
         Err(255)
     }
 
@@ -4100,12 +4107,21 @@ impl Vm {
                     let parameter = self.pop_int()?;
                     let object = self.pop_int()?;
                     let destination = self.pop_ptr()?;
-                    if destination != 0 {
-                        if let Ok(value) = api.query_graph91_object_property(object, parameter) {
-                            self.write_int(destination, 2, value as u32)?;
-                            self.clear_shadow_values(destination, 4);
-                        }
+                    let input = self.read_int(destination, 2).unwrap_or(0) as i32;
+                    // sub_481A90 turns every non-zero status into a script
+                    // error (object missing, unsupported or rejected).
+                    let values = api
+                        .query_graph91_object_property(object, parameter, input)
+                        .map_err(|status| {
+                            VmError::Runtime(format!(
+                                "Graph91:38 object #{object} parameter {parameter:#x} failed (status {status})"
+                            ))
+                        })?;
+                    for (index, value) in values.iter().enumerate() {
+                        let address = destination.wrapping_add((index * 4) as u32);
+                        self.write_int(address, 2, *value as u32)?;
                     }
+                    self.clear_shadow_values(destination, values.len() * 4);
                     Value::None
                 } else if (code, id) == (0x91, 0x3D) {
                     // sub_481B50 pops the object and converts the first BP
@@ -12879,13 +12895,18 @@ mod tests {
             self.window_valid_region
         }
 
-        fn query_graph91_object_property(&self, object: i32, parameter: i32) -> Result<i32, i32> {
+        fn query_graph91_object_property(
+            &self,
+            object: i32,
+            parameter: i32,
+            _input: i32,
+        ) -> Result<Vec<i32>, i32> {
             self.graph_object_property
                 .as_ref()
                 .filter(|(expected_object, expected_parameter, _)| {
                     *expected_object == object && *expected_parameter == parameter
                 })
-                .map(|(_, _, result)| result.clone())
+                .map(|(_, _, result)| result.clone().map(|value| vec![value]))
                 .unwrap_or(Err(255))
         }
 

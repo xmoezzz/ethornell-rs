@@ -1046,20 +1046,11 @@ impl NativeMode5NodeArgs {
         }
     }
 
-    /// Exact mode-5 projection recovered from
-    /// sub_4296C0 -> sub_429220 -> sub_429AF0.  The constructor arguments at
-    /// indices 8/9 are the bitmap-origin coordinates consumed by the native
-    /// bottom-up DIB transform (stored as 16.16 by sub_427AA0).
-    pub(crate) fn screen_geometry_mode5_exact(
-        self,
-        image_width: f32,
-        image_height: f32,
-        viewport_width: f32,
-        viewport_height: f32,
-        graph_center: (i32, i32),
-        use_graph_center: bool,
-        dynamic: NativeMode5DynamicState,
-    ) -> NativeMode5Geometry {
+    /// The five values sub_4296C0 derives from the sprite's mode-5 state:
+    /// base offset X/Y (16.16) plus the 0x80 deltas, rotation with the 0x81
+    /// delta through the 0x8F curve, and the two 16.16 scales. Graph91:38
+    /// parameter 0x10000000 returns exactly these.
+    pub(crate) fn mode5_transform_parameters(self, dynamic: NativeMode5DynamicState) -> [i32; 5] {
         #[inline]
         fn mul_progress(delta: i32, progress: i32) -> i32 {
             (((i128::from(delta) * i128::from(progress as u32)) >> 24) as i64) as i32
@@ -1068,18 +1059,7 @@ impl NativeMode5NodeArgs {
         fn mul_fixed_signed(value: i32, scale: u32) -> i32 {
             (((i128::from(value) * i128::from(scale)) >> 16) as i64) as i32
         }
-        #[inline]
-        fn scaled_fraction_16(value: i32, scale: u32) -> f64 {
-            // 0x429535/0x429575 call the target's signed 32x32 -> 64 helper,
-            // SHRD by 16, then AND 0xffff.  Only the fractional word affects
-            // the raster bound rounding.
-            let product = i128::from(value) * i128::from(scale);
-            let shifted = product >> 16;
-            (shifted as i64 as u64 & 0xffff) as f64 / 65_536.0
-        }
-
         let perspective_scale_fixed = self.perspective_scale_fixed();
-        let perspective_scale = perspective_scale_fixed as f64 / 65_536.0;
         let progress = dynamic.progress_8_24.clamp(0, 0x0100_0000);
 
         // sub_4296C0.  The base offset pair is stored at Sprite+0x248/0x24C
@@ -1127,6 +1107,53 @@ impl NativeMode5NodeArgs {
                 mul_fixed_signed(py, by as u32) as u32,
             )
         };
+
+        [
+            offset_x_16_16,
+            offset_y_16_16,
+            rotation,
+            scale_x_fixed as i32,
+            scale_y_fixed as i32,
+        ]
+    }
+
+    /// Exact mode-5 projection recovered from
+    /// sub_4296C0 -> sub_429220 -> sub_429AF0.  The constructor arguments at
+    /// indices 8/9 are the bitmap-origin coordinates consumed by the native
+    /// bottom-up DIB transform (stored as 16.16 by sub_427AA0).
+    pub(crate) fn screen_geometry_mode5_exact(
+        self,
+        image_width: f32,
+        image_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        graph_center: (i32, i32),
+        use_graph_center: bool,
+        dynamic: NativeMode5DynamicState,
+    ) -> NativeMode5Geometry {
+        #[inline]
+        fn mul_progress(delta: i32, progress: i32) -> i32 {
+            (((i128::from(delta) * i128::from(progress as u32)) >> 24) as i64) as i32
+        }
+        #[inline]
+        fn mul_fixed_signed(value: i32, scale: u32) -> i32 {
+            (((i128::from(value) * i128::from(scale)) >> 16) as i64) as i32
+        }
+        #[inline]
+        fn scaled_fraction_16(value: i32, scale: u32) -> f64 {
+            // 0x429535/0x429575 call the target's signed 32x32 -> 64 helper,
+            // SHRD by 16, then AND 0xffff.  Only the fractional word affects
+            // the raster bound rounding.
+            let product = i128::from(value) * i128::from(scale);
+            let shifted = product >> 16;
+            (shifted as i64 as u64 & 0xffff) as f64 / 65_536.0
+        }
+
+        let perspective_scale_fixed = self.perspective_scale_fixed();
+        let perspective_scale = perspective_scale_fixed as f64 / 65_536.0;
+        let [offset_x_16_16, offset_y_16_16, rotation, scale_x_fixed, scale_y_fixed] =
+            self.mode5_transform_parameters(dynamic);
+        let (scale_x_fixed, scale_y_fixed) = (scale_x_fixed as u32, scale_y_fixed as u32);
 
         // sub_429220.  BGI uses bottom-up DIB coordinates and deliberately
         // mixes floor for X with ceil for Y. Preserve that asymmetry.
