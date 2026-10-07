@@ -16634,6 +16634,40 @@ mod tests {
     }
 
     #[test]
+    fn freeing_the_last_module_or_loading_a_missing_one_is_fatal() {
+        let mut vm = Vm::new();
+        vm.start(&empty_loaded_program("root._bp".into()));
+        // Only the main module is left: sub_488CD0 reports a script error.
+        assert!(
+            vm.dispatch_program_thread_opcode(
+                &mut TraceApi,
+                native_call::opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
+                false,
+            )
+            .is_err()
+        );
+        // With no record at all the handler pushes 0x80000001.
+        assert_eq!(
+            vm.dispatch_program_thread_opcode(
+                &mut TraceApi,
+                native_call::opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
+                false,
+            )
+            .unwrap(),
+            Some(Value::Int(i32::MIN + 1))
+        );
+        vm.stack.extend([Value::Str("none.arc".into()), Value::Str("none._bp".into())]);
+        assert!(
+            vm.dispatch_program_thread_opcode(
+                &mut TraceApi,
+                native_call::opcodes::SYS_LOAD_PROGRAM_MODULE,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn configured_secondary_root_participates_in_resource_search() {
         let mut vm = Vm::new();
         vm.secondary_resource_root = Some("/Volumes/TayutamaData/".into());

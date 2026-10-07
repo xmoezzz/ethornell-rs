@@ -15300,7 +15300,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: LOAD_PROGRAM_MODULE_PARAMETERS,
         returns: "integer code-region base offset",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_488C00/sub_444CE0 appends decoded BP code to the current CThread and returns the previous code-used end; it does not return an object handle.",
+        notes: "sub_488C00 pops file then archive, decodes the module (sub_465AB0; a read/decode failure is fatal) and sub_444CE0 appends its code to the current CThread when it fits the code region (fatal otherwise). The value pushed is the code offset where the module starts (the previous code-used end). The target's disk-swap retry dialog for a missing archive is not reproduced; the portable runtime fails at once.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
@@ -15308,7 +15308,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: FREE_PROGRAM_ABI_SLOT_PARAMETERS,
         returns: "remaining module count",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_444D80 removes the tail module record and rolls back CThread code-used state. The handler performs no native argument pop despite the legacy ABI descriptor count.",
+        notes: "sub_488CD0 pops nothing. sub_444D80 unlinks the newest module record, rolls back the code-used end and pushes the remaining module count (the main program counts); with no record it pushes 0x80000001, and a remaining count of 0 is a fatal error.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_LOAD_PROGRAM_THREAD,
@@ -20880,6 +20880,8 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_WAIT_TIMING_EX,
     opcodes::GRAPH90_BLIT_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP,
+    opcodes::SYS_LOAD_PROGRAM_MODULE,
+    opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21141,8 +21143,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_FILE_BYTES,
     opcodes::SYS_READ_FILE_RANGE,
     opcodes::SYS_SET_VALIDATED_FILE_ROOT,
-    opcodes::SYS_LOAD_PROGRAM_MODULE,
-    opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
     opcodes::SYS_LOAD_PROGRAM_THREAD,
     opcodes::SYS_DELETE_FILE,
     opcodes::SYS_FILE_EXISTS,

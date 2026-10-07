@@ -19,9 +19,12 @@ impl Vm {
                 // image to the current CThread's module chain.
                 let file = self.pop_string_lossy()?;
                 let archive = self.pop_string_lossy()?;
-                let mut program = api
-                    .load_program(&archive, &file)
-                    .unwrap_or_else(|| super::empty_loaded_program(format!("{archive}:{file}")));
+                // sub_465AB0 failing to read/decode the module is fatal.
+                let Some(mut program) = api.load_program(&archive, &file) else {
+                    return Err(VmError::Runtime(format!(
+                        "LoadProgramModule: cannot load {archive}:{file}"
+                    )));
+                };
                 self.assign_program_instance(&mut program);
                 // sub_444CE0 refuses an image that does not fit the code
                 // region; sub_488C00 turns that into a fatal error.
@@ -36,10 +39,17 @@ impl Vm {
                 Value::Int(self.append_target_loaded_program(program) as i32)
             }
             opcodes::SYS_FREE_LAST_PROGRAM_MODULE => {
-                // The exact handler does not pop the legacy descriptor slot.
+                // sub_488CD0 pops nothing. sub_444D80 returns the module count
+                // left (0x80000001 without any record); a count of 0 is a
+                // fatal error after the record is gone.
                 let (remaining, freed) = self.free_last_target_program(trace_events);
                 if let Some(program) = freed {
                     api.free_program(Value::Program(Arc::new(program)));
+                }
+                if remaining == 0 {
+                    return Err(VmError::Runtime(
+                        "FreeLastProgramModule removed the last module of the thread".into(),
+                    ));
                 }
                 Value::Int(remaining)
             }
