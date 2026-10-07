@@ -23,31 +23,31 @@ pub struct CThreadLayout32 {
     pub operand_allocator: u32,     // +0x14, allocator role not fully closed
     pub operand_ring: u32,          // +0x18
     pub code_region_size: u32,      // +0x1c
-    pub code_region_base: u32,      // +0x20
-    pub code_region_free_top: u32,  // +0x24
+    pub code_region_base: u32,      // +0x20, reserved-low (sub_444C30 limit = +0x20 + +0x24)
+    pub code_region_free_top: u32,  // +0x24, free limit; lowered by sub_445340 reservations
     pub code_allocator: u32,        // +0x28
     pub code_memory: u32,           // +0x2c
     pub loaded_modules: u32,        // +0x30
     pub loaded_module_count: u32,   // +0x34
     pub code_used_end: u32,         // +0x38
     pub frame_region_size: u32,     // +0x3c
-    pub frame_region_base: u32,     // +0x40
+    pub frame_region_base: u32,     // +0x40, reserved-low (sub_444C40 limit = +0x40 + +0x44)
     pub frame_region_free_top: u32, // +0x44
     pub frame_allocator: u32,       // +0x48
     pub frame_memory: u32,          // +0x4c
-    pub offset_heap: u32,           // +0x50
+    pub offset_heap: u32,           // +0x50, 0x20-byte helper object (sub_430310); virtual heap used by BP 0x70/0x71
     pub return_stack: u32,          // +0x54
     pub current_procedure: u32,     // +0x58
-    pub message_value: u32,         // +0x5c, sentinel value
-    pub message_next: u32,          // +0x60, sentinel next/head
-    pub retain_on_termination: i32, // +0x64
+    pub message_value: u32,         // +0x5c, key slot of the queue pseudo-node (sub_4452C0)
+    pub message_next: u32,          // +0x60, FIFO head (sub_4452C0 appends, sub_445300 pops)
+    pub reservation_count: i32,     // +0x64, live sub_445340 reservations (sub_445480 decrements)
     pub code_allocations: u32,      // +0x68
     pub frame_allocations: u32,     // +0x6c
     pub status_flags: i32,          // +0x70
     pub operand_index: u32,         // +0x74
-    pub current_opcode_ip: u32,     // +0x78
-    pub instruction_ip: u32,        // +0x7c
-    pub frame_base: u32,            // +0x80
+    pub current_opcode_ip: u32,     // +0x78, ip of the opcode byte just fetched (sub_445010)
+    pub instruction_ip: u32,        // +0x7c, fetch cursor
+    pub frame_base: u32,            // +0x80, data-region stack pointer (sub_445110/4450F0)
     pub deadline_tick: u32,         // +0x84
 }
 
@@ -996,5 +996,27 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::CThread;
+
+    #[test]
+    fn main_thread_defaults_match_sub_48c990() {
+        let thread = CThread::default();
+        assert_eq!(thread.code_region_size(), 0x80000);
+        assert_eq!(thread.data_region_size(), 0x40000);
+        assert_eq!(thread.native.operand_capacity, 4096);
+    }
+
+    #[test]
+    fn child_thread_sizes_follow_the_creation_arguments() {
+        let mut thread = CThread::default();
+        thread.set_region_sizes(65536, 32768, 1024);
+        assert_eq!(thread.code_region_size(), 65536);
+        assert_eq!(thread.data_region_size(), 32768);
+        assert_eq!(thread.native.operand_capacity, 1024);
     }
 }

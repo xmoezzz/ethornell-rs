@@ -2799,6 +2799,14 @@ impl Vm {
             } => {
                 let previous = self.mem_ptr;
                 let next = self.pop_int()? as u32;
+                // sub_4738A0: the new frame pointer must stay below the data
+                // region limit.
+                if next >= self.thread.data_region_size() {
+                    return Err(VmError::Runtime(format!(
+                        "store_base: SP 0x{next:08X} outside the {}-byte data region",
+                        self.thread.data_region_size()
+                    )));
+                }
                 if next > previous {
                     let size = (next - previous) as usize;
                     let ptr = 0x1200_0000u32 | previous;
@@ -6758,6 +6766,15 @@ impl Vm {
             .and_then(|program| program.instructions.get(next_pc))
             .map(|instruction| instruction.offset as u32)
             .unwrap_or_default();
+        // sub_473A70 rejects a call whose frame pointer already reached the
+        // data region limit.
+        if self.mem_ptr >= self.thread.data_region_size() {
+            return Err(VmError::Runtime(format!(
+                "call: SP 0x{:08X} outside the {}-byte data region",
+                self.mem_ptr,
+                self.thread.data_region_size()
+            )));
+        }
         self.write_int(0x1200_0000 | self.mem_ptr, 2, return_offset)?;
         self.mem_ptr = self.mem_ptr.saturating_add(4);
         Ok(())

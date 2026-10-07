@@ -4,9 +4,14 @@
 //! Unlike [`crate::native_thread::CThread`], which records audit handles next
 //! to a `Vec<Value>` operand stack, this type owns the real byte regions and
 //! the real ring buffer, so every observable quirk of the original (wrapping
-//! pops, the reservation arithmetic, error codes) is reproduced. It is not yet
-//! driven by the interpreter; `docs`-level notes in `src/README.md` describe
-//! the integration plan.
+//! pops, the reservation arithmetic, error codes) is reproduced.
+//!
+//! The interpreter keeps `Value`-typed operands and a sparse BP memory map, so
+//! it does not store its state in this type. Instead the target's limits are
+//! enforced on the live thread (`native_thread::CThread`): region sizes from
+//! `0x80:0x44`, code-region capacity with LIFO module accounting, data-region
+//! limit on `store_base`/`call`. This type remains the executable reference
+//! those checks were validated against.
 
 use std::collections::VecDeque;
 
