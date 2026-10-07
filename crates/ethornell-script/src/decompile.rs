@@ -435,7 +435,8 @@ impl DecompileState {
             "memcpy" | "memclr" | "memset" | "memory_equal" | "memrepeat" | "memfind"
             | "strfind" | "strreplace" | "strlen" | "streq" | "strcpy" | "strconcat"
             | "getchar" | "tolower" | "sprintf" | "malloc" | "free" | "addmemboundary"
-            | "confirm" | "message_box" | "assert" | "dumpmem" => {
+            | "confirm" | "message_box" | "show_number" | "dumpmem" | "atan2" | "vec3_length"
+            | "quote_string" | "modal_list" | "clipboard_set" | "engine_state" => {
                 self.emit_builtin(offset, name);
             }
             "sys1" | "sys2" | "grp1" | "grp2" | "grp3" | "snd1" | "usr1" | "usr2" => {
@@ -489,14 +490,25 @@ impl DecompileState {
 
     fn emit_builtin(&mut self, offset: u64, name: &str) {
         let arity = match name {
-            "strlen" | "getchar" | "tolower" | "malloc" | "free" | "confirm" | "assert" => 1,
-            "memclr" | "streq" | "strcpy" | "strfind" | "message_box" | "dumpmem" => 2,
-            "memcpy" | "memset" | "memory_equal" | "strconcat" | "sprintf" => 3,
+            "strlen" | "getchar" | "tolower" | "malloc" | "free" | "message_box"
+            | "show_number" | "clipboard_set" | "engine_state" => 1,
+            "memclr" | "streq" | "strcpy" | "strfind" | "confirm" | "modal_list" | "atan2" => 2,
+            "memcpy" | "memset" | "memory_equal" | "strconcat" | "sprintf" | "quote_string"
+            | "addmemboundary" | "dumpmem" | "vec3_length" => 3,
             "memrepeat" | "memfind" | "strreplace" => 4,
-            "addmemboundary" => 3,
             _ => 0,
         };
         let mut args = self.pop_args(arity);
+        if name == "getchar" {
+            // Pushes the character, a double-byte flag and a delimiter flag.
+            let call = format!("getchar({})", args.join(", "));
+            let (ch, dbcs, delim) = (self.next_temp(), self.next_temp(), self.next_temp());
+            self.emit(offset, format!("({ch}, {dbcs}, {delim}) = {call};"));
+            self.push(ch);
+            self.push(dbcs);
+            self.push(delim);
+            return;
+        }
         if matches!(
             name,
             "memory_equal"
@@ -504,9 +516,16 @@ impl DecompileState {
                 | "strfind"
                 | "strlen"
                 | "streq"
-                | "getchar"
                 | "malloc"
+                | "free"
                 | "confirm"
+                | "strreplace"
+                | "atan2"
+                | "vec3_length"
+                | "addmemboundary"
+                | "engine_state"
+                | "clipboard_set"
+                | "modal_list"
         ) {
             let temp = self.next_temp();
             self.emit(offset, format!("{temp} = {name}({});", args.join(", ")));

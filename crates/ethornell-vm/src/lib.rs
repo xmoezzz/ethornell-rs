@@ -18,7 +18,6 @@ mod debug;
 mod extended_opcodes;
 mod input;
 pub mod native_call;
-pub mod target_thread;
 pub mod native_input;
 pub mod native_motion;
 pub mod native_ownership;
@@ -32,6 +31,7 @@ mod scenario;
 mod scheduler;
 mod system80_state;
 mod system81_state;
+pub mod target_thread;
 mod time;
 mod user_data;
 
@@ -2258,6 +2258,64 @@ impl ReadFlagBits {
     }
 }
 
+/// Split Shift-JIS bytes into target characters (`sub_495990`: a lead byte
+/// consumes the following byte too).
+fn sjis_units(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let lead = matches!(bytes[i], 0x81..=0x9f | 0xe0..=0xfc);
+        let width = if lead { 2 } else { 1 }.min(bytes.len() - i);
+        units.push(&bytes[i..i + width]);
+        i += width;
+    }
+    units
+}
+
+/// `sub_4959B0`: character-wise search that never backtracks. After a
+/// mismatch the current character is not retried as a match start, so e.g.
+/// `aab` is not found in `aaab`. Returns the byte offset of the match.
+fn target_find_mbs(needle: &[u8], haystack: &[u8]) -> Option<usize> {
+    let needle = sjis_units(needle);
+    if needle.is_empty() {
+        return None;
+    }
+    let mut matched = 0usize;
+    let mut start = 0usize;
+    let mut position = 0usize;
+    for unit in sjis_units(haystack) {
+        if unit == needle[matched] {
+            if matched == 0 {
+                start = position;
+            }
+            matched += 1;
+            if matched >= needle.len() {
+                return Some(start);
+            }
+        } else {
+            matched = 0;
+        }
+        position += unit.len();
+    }
+    None
+}
+
+/// `sub_495A80` as used by BP opcode 0x67: returns the rewritten bytes and
+/// the replacement count.
+fn target_strreplace(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, i32) {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    let mut count = 0i32;
+    while let Some(at) = target_find_mbs(needle, rest) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(replacement);
+        rest = &rest[at + needle.len()..];
+        count += 1;
+    }
+    out.extend_from_slice(rest);
+    (out, count)
+}
+
 impl Vm {
     pub fn new() -> Self {
         Self {
@@ -3089,14 +3147,15 @@ impl Vm {
                         if right == 0 {
                             -1
                         } else {
-                            left / right
+                            // x86 idiv traps on MIN / -1; never panic the host.
+                            left.wrapping_div(right)
                         }
                     }
                     "mod" => {
                         if right == 0 {
                             -1
                         } else {
-                            left % right
+                            left.wrapping_rem(right)
                         }
                     }
                     "and" => left & right,
@@ -3293,11 +3352,20 @@ impl Vm {
             BpOpcode::Known {
                 name: "strreplace", ..
             } => {
+                // sub_474520 pops replacement, needle, haystack, destination,
+                // runs sub_495A80 and pushes the number of replacements.
                 let replacement = self.pop_string_lossy()?;
                 let needle = self.pop_string_lossy()?;
                 let haystack = self.pop_string_lossy()?;
                 let dst = self.pop_ptr()?;
-                self.write_c_string(dst, &haystack.replace(&needle, &replacement))?;
+                let (replaced, count) = target_strreplace(
+                    &encoding_rs::SHIFT_JIS.encode(&haystack).0,
+                    &encoding_rs::SHIFT_JIS.encode(&needle).0,
+                    &encoding_rs::SHIFT_JIS.encode(&replacement).0,
+                );
+                let (text, _, _) = encoding_rs::SHIFT_JIS.decode(&replaced);
+                self.write_c_string(dst, &text)?;
+                self.push_value(Value::Int(count));
             }
             BpOpcode::Known { name: "strlen", .. } => {
                 let text = self.pop_string_lossy()?;
@@ -3405,7 +3473,12 @@ impl Vm {
             BpOpcode::Known {
                 name: "confirm", ..
             } => {
-                let _message = self.pop_string_lossy().unwrap_or_default();
+                // sub_474FF0: default-button flag first, then the text; the
+                // Yes/No box result (Yes == IDYES) is pushed. A windowless
+                // runtime has no one to ask, so it answers Yes.
+                let _default_yes = self.pop_int()?;
+                let message = self.pop_string_lossy().unwrap_or_default();
+                tracing::warn!(%message, "BP confirm answered Yes without a dialog");
                 self.push_value(Value::Int(1));
             }
             BpOpcode::Known {
@@ -3417,17 +3490,28 @@ impl Vm {
                     .unwrap_or_else(|_| "<message>".into());
                 tracing::warn!(%message, "BP message_box");
             }
-            BpOpcode::Known { name: "assert", .. } => {
+            BpOpcode::Known {
+                name: "show_number",
+                ..
+            } => {
+                // sub_4750A0 only displays "Number : %d ( $%.8x )"; it never
+                // asserts and never terminates the script.
                 let value = self.pop_int()?;
-                if value == 0 {
-                    return Err(VmError::Runtime("BP assert failed".into()));
-                }
+                tracing::warn!(value, "BP show_number: Number : {value} ( ${value:08x} )");
             }
             BpOpcode::Known {
                 name: "dumpmem", ..
             } => {
-                let _size = self.pop_int().unwrap_or_default();
-                let _ptr = self.pop_ptr().unwrap_or_default();
+                // sub_475130 pops byte count, data pointer, title pointer.
+                let size = self.pop_int()?;
+                let _data = self.pop_value()?;
+                let title = self.pop_string_lossy().unwrap_or_default();
+                if !(1..=0x400).contains(&size) {
+                    return Err(VmError::Runtime(format!(
+                        "dumpmem size {size} outside 1..=1024"
+                    )));
+                }
+                tracing::warn!(%title, size, "BP dumpmem");
             }
             BpOpcode::Known {
                 name: "modal_list", ..
@@ -12244,6 +12328,28 @@ impl SoundApi for TraceApi {
 
 #[cfg(test)]
 mod tests {
+    use super::{target_find_mbs, target_strreplace};
+
+    #[test]
+    fn strreplace_search_is_character_wise_and_never_backtracks() {
+        // sub_4959B0 does not retry the mismatching character as a start.
+        assert_eq!(target_find_mbs(b"aab", b"aaab"), None);
+        assert_eq!(target_find_mbs(b"ab", b"xxab"), Some(2));
+        assert_eq!(target_find_mbs(b"", b"abc"), None);
+        // A trail byte equal to an ASCII needle byte is not a match start.
+        let sjis = encoding_rs::SHIFT_JIS.encode("ア\u{3042}").0.into_owned();
+        assert_eq!(target_find_mbs(&sjis[2..], &sjis), Some(2));
+    }
+
+    #[test]
+    fn strreplace_counts_replacements_and_keeps_the_tail() {
+        assert_eq!(
+            target_strreplace(b"a-b-c", b"-", b"++"),
+            (b"a++b++c".to_vec(), 2)
+        );
+        assert_eq!(target_strreplace(b"abc", b"x", b"y"), (b"abc".to_vec(), 0));
+    }
+
     use super::{
         ADDRESS_MASK, AUX_MEMORY_SEGMENT_SIZE, GraphApi, GraphIconRecord, LOCAL_MEMORY_BASE,
         MAX_MEMORY_SIZE, NativeCallFrame, NativeOpcode, ResourceLoadOrigin, SoundApi, SysApi,
@@ -12793,6 +12899,61 @@ mod tests {
             raw,
             warning: None,
         }
+    }
+
+    fn run_stack_program(instructions: Vec<BpInstruction>) -> (crate::VmRunReport, Vm) {
+        let program = BpProgram {
+            script_name: Some("debug-opcode-test".into()),
+            functions: Vec::new(),
+            strings: Vec::new(),
+            instructions,
+            labels: Default::default(),
+            warnings: Vec::new(),
+        };
+        let mut api = SchedulingApi::default();
+        let mut vm = Vm::new();
+        let report = vm.run(&program, &mut api, &VmRunOptions::default());
+        (report, vm)
+    }
+
+    fn push_dword(offset: u64, value: u32) -> BpInstruction {
+        test_instruction(
+            offset,
+            0x02,
+            "push_dword",
+            vec![0x02],
+            vec![BpOperand::U32(value)],
+        )
+    }
+
+    #[test]
+    fn show_number_never_fails_and_pops_one_value() {
+        // 0x7A (sub_4750A0) only displays the number.
+        let (report, vm) = run_stack_program(vec![
+            push_dword(0, 0),
+            test_instruction(5, 0x7a, "show_number", vec![0x7a], Vec::new()),
+            test_instruction(6, 0x17, "ret", vec![0x17], Vec::new()),
+        ]);
+        assert_eq!(report.stop_reason, VmStopReason::Completed);
+        assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn confirm_pops_flag_and_text_and_pushes_the_answer() {
+        let (report, vm) = run_stack_program(vec![
+            test_instruction(
+                0,
+                0x05,
+                "push_string",
+                vec![0x05],
+                vec![BpOperand::String("ok?".into())],
+            ),
+            push_dword(4, 0),
+            test_instruction(9, 0x78, "confirm", vec![0x78], Vec::new()),
+            test_instruction(10, 0x17, "ret", vec![0x17], Vec::new()),
+        ]);
+        assert_eq!(report.stop_reason, VmStopReason::Completed);
+        assert_eq!(vm.stack, [Value::Int(1)]);
     }
 
     fn install_wait_timing_ex(vm: &mut Vm, duration_ms: i32, input_enabled: i32, input_scope: i32) {

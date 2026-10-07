@@ -272,11 +272,9 @@ impl StackEffectState {
             "not" | "bool_zero" | "sin" | "cos" => {}
             "ternary" | "muldiv" => self.pop(2),
             name => {
-                if let Some((argc, returns)) = builtin_stack_effect(name) {
-                    self.pop(argc);
-                    if returns {
-                        self.push(1);
-                    }
+                if let Some((pops, pushes)) = builtin_stack_effect(name) {
+                    self.pop(pops);
+                    self.push(pushes);
                 }
             }
         }
@@ -291,18 +289,27 @@ impl StackEffectState {
     }
 }
 
-fn builtin_stack_effect(name: &str) -> Option<(usize, bool)> {
+/// `(pops, pushes)` of the builtin BP opcodes, from the target handlers
+/// (0x473F20..0x4755AF). `sprintf` reports its fixed part only; the argument
+/// count depends on the format string.
+fn builtin_stack_effect(name: &str) -> Option<(usize, usize)> {
     Some(match name {
-        "strlen" | "getchar" | "tolower" | "malloc" | "confirm" => (1, true),
-        "free" | "assert" => (1, false),
-        "memclr" | "strcpy" | "message_box" | "dumpmem" => (2, false),
-        "streq" => (2, true),
-        "memory_equal" => (3, true),
-        "strfind" => (2, true),
-        "memcpy" | "memset" | "strconcat" | "sprintf" | "addmemboundary" => (3, false),
-        "memrepeat" => (4, false),
-        "memfind" => (4, true),
-        "strreplace" => (4, false),
+        "atan2" | "strfind" | "streq" => (2, 1),
+        "vec3_length" | "memory_equal" => (3, 1),
+        "qword_add" | "qword_sub" | "qword_mul" | "qword_div" | "qword_mod" => (3, 0),
+        "memcpy" | "memset" | "strconcat" | "quote_string" => (3, 0),
+        "memclr" | "strcpy" => (2, 0),
+        "memrepeat" => (4, 0),
+        "memfind" | "strreplace" => (4, 1),
+        "strlen" | "malloc" | "free" | "engine_state" | "clipboard_set" => (1, 1),
+        "getchar" => (1, 3),
+        "tolower" | "set_memory_mode" | "message_box" | "show_number" => (1, 0),
+        "sprintf" => (2, 0),
+        "addmemboundary" => (3, 1),
+        "confirm" | "modal_list" => (2, 1),
+        "dumpmem" => (3, 0),
+        "resource_transform" => (7, 0),
+        "resource_blend" => (5, 0),
         _ => return None,
     })
 }
