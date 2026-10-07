@@ -16516,7 +16516,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_QUERY_BITMAP_INFO_PARAMETERS,
         returns: "boolean found",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_479C00/sub_407F20 write [pixels, row_stride, width, height, format, bytes_per_pixel], then the public wrapper clears pixels at +0. The portable registry reproduces ordinary bitmap records; external-DIB orientation remapping remains partial.",
+        notes: "sub_479C00 pops bitmap then the record pointer; sub_407F20 writes [pixels, row_stride, width, height, format, bytes_per_pixel] only for an existing bitmap, the wrapper then always clears field 0 and pushes the found flag. For GDI DIB-section bitmaps the stride comes from GetObjectA (bmWidthBytes), which equals width * 4 for the 4-byte formats, and the pointer it rewrites is cleared, so no visible difference remains.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_VALIDATE_BITMAP_FORMAT,
@@ -20882,6 +20882,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CREATE_BITMAP,
     opcodes::SYS_LOAD_PROGRAM_MODULE,
     opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
+    opcodes::GRAPH90_QUERY_BITMAP_INFO,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21007,7 +21008,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_LOAD_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP_FROM_PIXELS,
     opcodes::GRAPH90_COPY_BITMAP_PIXELS,
-    opcodes::GRAPH90_QUERY_BITMAP_INFO,
     opcodes::GRAPH90_VALIDATE_BITMAP_FORMAT,
     opcodes::GRAPH90_SYNTHESIZE_BITMAP,
     opcodes::GRAPH90_COMPOSITE_BITMAPS,
