@@ -16884,7 +16884,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_RELEASE_SPRITE_OBJECT_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target rejects sprites still owned by active control procedures before releasing the CDspObjSprite slot.",
+        notes: "sub_47C110 drops the object's input registration (sub_496300), then raises a script error when the sprite is locked by an input processor (+0x130, DCIndProc), still attached to a parent (+0x11C), or is not a live sprite; otherwise sub_43E610 unlinks and destroys the CDspObjSprite and frees its slot.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
@@ -20883,6 +20883,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_LOAD_PROGRAM_MODULE,
     opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
     opcodes::GRAPH90_QUERY_BITMAP_INFO,
+    opcodes::GRAPH90_RELEASE_SPRITE_OBJECT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21040,7 +21041,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BLIT_SOURCES,
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
-    opcodes::GRAPH90_RELEASE_SPRITE_OBJECT,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP,

@@ -37,6 +37,11 @@ pub(crate) struct RuntimeGraphInputObject {
 }
 
 impl RuntimeGraphInputObject {
+    /// Whether the processor is still registered (Graph90:B9 not yet called).
+    pub(crate) fn is_live(&self) -> bool {
+        self.active
+    }
+
     pub(crate) fn new(layer: i32) -> Self {
         Self::new_with_variant(layer, false)
     }

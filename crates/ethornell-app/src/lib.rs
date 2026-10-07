@@ -9397,6 +9397,23 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_51_refuses_attached_or_missing_sprites() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() else {
+            panic!("sprite creation did not return a handle");
+        };
+        // Attached as a child (+0x11C parent): sub_47C110 reports an error.
+        api.graph_native_owners.insert(sprite, 0x7000_0001);
+        assert!(call_graph(&mut api, 0x90, 0x51, &mut vec![Value::Int(sprite)]).is_err());
+        api.graph_native_owners.remove(&sprite);
+        call_graph(&mut api, 0x90, 0x51, &mut vec![Value::Int(sprite)]).unwrap();
+        // The slot is gone: releasing it again is an error too.
+        assert!(call_graph(&mut api, 0x90, 0x51, &mut vec![Value::Int(sprite)]).is_err());
+    }
+
+    #[test]
     fn graph90_11_accepts_slot_zero_maps_format_seven_and_rejects_bad_arguments() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();

@@ -2687,14 +2687,39 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::Int(handle)
             }
             (0x90, 0x51) => {
+                // sub_47C110: drop the object's input registration
+                // (sub_496300), then refuse a sprite still locked by an input
+                // processor (+0x130, sub_41AD50) or attached as a child
+                // (+0x11C parent, sub_41ACE0), and finally release the slot
+                // (sub_43E610); every refusal is a script error.
                 let handle = pop_int_value(stack).unwrap_or_default();
+                self.graph_object_input_tables.remove(&handle);
+                if self
+                    .graph_input_objects
+                    .values()
+                    .any(|processor| processor.is_live() && processor.layer == handle)
+                {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:51 sprite #{handle} is still used by an input processor"
+                    ))));
+                }
+                if self.graph_native_owners.contains_key(&handle) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:51 sprite #{handle} is still attached to a parent object"
+                    ))));
+                }
                 let released = self.graph90_release_object(
                     handle,
                     GRAPH90_SPRITE_TAG,
                     512,
                     GRAPH90_CLASS_SPRITE,
                 );
-                tracing::info!(handle, released, "GraphReleaseSpriteObject");
+                if !released {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:51 #{handle} is not a sprite object"
+                    ))));
+                }
+                tracing::debug!(handle, "GraphReleaseSpriteObject");
                 ethornell_vm::Value::None
             }
             (0x90, 0x53) => {
