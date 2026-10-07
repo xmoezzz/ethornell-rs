@@ -16476,7 +16476,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target creates a bitmap with explicit dimensions and format.",
+        notes: "sub_4799B0 pops format, height, width, handle; sub_407DA0 frees the slot, accepts formats 0..=6 (7 becomes 1) and allocates width*bpp*height bytes with _aligned_malloc. Handle >= 0x4000, a bad format or a failed allocation is a script error; handle 0 is an ordinary slot. The target leaves the pixels uninitialised; the portable bitmap starts zeroed. Formats 4 and 6 also create the displacement/vector maps.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_RELEASE_BITMAP,
@@ -20879,6 +20879,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SOUND_QUERY_CHANNEL_COUNT,
     opcodes::SYS_WAIT_TIMING_EX,
     opcodes::GRAPH90_BLIT_BITMAP,
+    opcodes::GRAPH90_CREATE_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21002,7 +21003,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_RASTER_FORMAT_MODE,
     opcodes::GRAPH90_REGISTER_FONT,
     opcodes::GRAPH90_LOAD_BITMAP,
-    opcodes::GRAPH90_CREATE_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP_FROM_PIXELS,
     opcodes::GRAPH90_COPY_BITMAP_PIXELS,
     opcodes::GRAPH90_QUERY_BITMAP_INFO,

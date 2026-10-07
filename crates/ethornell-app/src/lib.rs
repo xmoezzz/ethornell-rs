@@ -9145,6 +9145,25 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_11_accepts_slot_zero_maps_format_seven_and_rejects_bad_arguments() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(0), Value::Int(4), Value::Int(2), Value::Int(7)];
+        call_graph(&mut api, 0x90, 0x11, &mut create).unwrap();
+        assert_eq!(api.bitmap_dimensions[&0], (4, 2));
+        assert_eq!(api.bitmap_formats[&0], 1);
+        for args in [
+            [0x4000, 4, 2, 2],
+            [1, 4, 2, 8],
+            [1, -1, 2, 2],
+        ] {
+            let mut stack = args.iter().copied().map(Value::Int).collect::<Vec<_>>();
+            assert!(call_graph(&mut api, 0x90, 0x11, &mut stack).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn bitmap_pixel_bridge_uses_target_dib_byte_order_per_format() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -20349,7 +20368,22 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let width = width_arg.as_ref().map(value_to_i32).unwrap_or_default();
                 let height = height_arg.as_ref().map(value_to_i32).unwrap_or_default();
                 let format_id = format.as_ref().map(value_to_i32).unwrap_or_default();
-                if bitmap_id > 0 && width > 0 && height > 0 {
+                // sub_4799B0 -> sub_407DA0: handle < 0x4000 (sub_497B60),
+                // format 0..=6 with 7 meaning 1, and a successful allocation
+                // of width * bpp * height bytes; any failure is a script
+                // error. Handle 0 is an ordinary slot.
+                if !(0..0x4000).contains(&bitmap_id) {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:11 bitmap handle {bitmap_id} is out of range"
+                    )));
+                }
+                let format_id = if format_id == 7 { 1 } else { format_id };
+                if !(0..=6).contains(&format_id) || width < 0 || height < 0 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:11 cannot create bitmap {bitmap_id} ({width}x{height}, format {format_id})"
+                    )));
+                }
+                {
                     self.recreate_native_bitmap(bitmap_id, width as u32, height as u32, format_id);
                     match format_id {
                         4 => self.effects.create_displacement_map(
