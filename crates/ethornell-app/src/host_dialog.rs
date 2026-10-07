@@ -396,25 +396,23 @@ fn show_message_platform(
     kind: MessageDialogKind,
     title: &str,
     text: &str,
-    topmost: bool,
+    default_first: bool,
 ) -> Option<bool> {
-    let buttons = match kind {
-        MessageDialogKind::Information => r#"buttons {"OK"} default button "OK""#,
-        MessageDialogKind::YesNo => {
-            r#"buttons {"No", "Yes"} default button "Yes" cancel button "No""#
-        }
-        MessageDialogKind::OkCancel => {
-            r#"buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel""#
-        }
-        MessageDialogKind::RetryCancel => {
-            r#"buttons {"Quit", "Retry"} default button "Retry" cancel button "Quit""#
-        }
+    let (first, second) = match kind {
+        MessageDialogKind::Information => ("OK", ""),
+        MessageDialogKind::YesNo => ("Yes", "No"),
+        MessageDialogKind::OkCancel => ("OK", "Cancel"),
+        MessageDialogKind::RetryCancel => ("Retry", "Quit"),
     };
-    let activate = if topmost {
-        "tell application \"System Events\" to activate\n"
+    let default = if default_first || second.is_empty() { first } else { second };
+    let buttons = if second.is_empty() {
+        format!(r#"buttons {{"{first}"}} default button "{first}""#)
     } else {
-        ""
+        format!(
+            r#"buttons {{"{second}", "{first}"}} default button "{default}" cancel button "{second}""#
+        )
     };
+    let activate = "tell application \"System Events\" to activate\n";
     let script = format!(
         "on run argv\nset dialogTitle to item 1 of argv\nset dialogText to item 2 of argv\n{activate}display dialog dialogText with title dialogTitle {buttons}\nreturn \"1\"\nend run"
     );
@@ -434,8 +432,12 @@ fn show_message_platform(
     kind: MessageDialogKind,
     title: &str,
     text: &str,
-    topmost: bool,
+    default_first: bool,
 ) -> Option<bool> {
+    let icon = match kind {
+        MessageDialogKind::YesNo => "Question",
+        _ => "Information",
+    };
     let buttons = match kind {
         MessageDialogKind::Information => "OK",
         MessageDialogKind::YesNo => "YesNo",
@@ -445,8 +447,9 @@ fn show_message_platform(
     let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 $buttons = [System.Enum]::Parse([System.Windows.Forms.MessageBoxButtons], $env:BGI_DIALOG_BUTTONS)
-$icon = [System.Windows.Forms.MessageBoxIcon]::Information
-$result = [System.Windows.Forms.MessageBox]::Show($env:BGI_DIALOG_TEXT, $env:BGI_DIALOG_TITLE, $buttons, $icon)
+$icon = [System.Enum]::Parse([System.Windows.Forms.MessageBoxIcon], $env:BGI_DIALOG_ICON)
+$default = [System.Enum]::Parse([System.Windows.Forms.MessageBoxDefaultButton], $env:BGI_DIALOG_DEFAULT)
+$result = [System.Windows.Forms.MessageBox]::Show($env:BGI_DIALOG_TEXT, $env:BGI_DIALOG_TITLE, $buttons, $icon, $default)
 if ($result -eq [System.Windows.Forms.DialogResult]::OK -or $result -eq [System.Windows.Forms.DialogResult]::Yes -or $result -eq [System.Windows.Forms.DialogResult]::Retry) { exit 0 }
 exit 1
 "#;
@@ -459,7 +462,11 @@ exit 1
                 text.chars().take(30_000).collect::<String>(),
             )
             .env("BGI_DIALOG_BUTTONS", buttons)
-            .env("BGI_DIALOG_TOPMOST", if topmost { "1" } else { "0" })
+            .env("BGI_DIALOG_ICON", icon)
+            .env(
+                "BGI_DIALOG_DEFAULT",
+                if default_first { "Button1" } else { "Button2" },
+            )
             .status();
         if let Ok(status) = status {
             return Some(status.success());
@@ -473,9 +480,12 @@ fn show_message_platform(
     kind: MessageDialogKind,
     title: &str,
     text: &str,
-    _topmost: bool,
+    default_first: bool,
 ) -> Option<bool> {
     let mut zenity = Command::new("zenity");
+    if !default_first && kind != MessageDialogKind::Information {
+        zenity.arg("--default-cancel");
+    }
     match kind {
         MessageDialogKind::Information => {
             zenity.arg("--info");
@@ -520,13 +530,16 @@ fn show_message_platform(
     Some(status.success())
 }
 
+/// MessageBoxA as used by sub_46BC80. `default_first` keeps the first
+/// button (OK / Yes) as the default; otherwise MB_DEFBUTTON2 makes the second
+/// (Cancel / No) the default.
 pub(crate) fn show_message(
     kind: MessageDialogKind,
     title: &str,
     text: &str,
-    topmost: bool,
+    default_first: bool,
 ) -> Option<bool> {
-    show_message_platform(kind, title, text, topmost)
+    show_message_platform(kind, title, text, default_first)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

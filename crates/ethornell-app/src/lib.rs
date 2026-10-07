@@ -2685,6 +2685,15 @@ impl RuntimeTraceApi {
         Some(0)
     }
 
+    /// sub_46DA20: clear fields 0/1/2/4 of every input record (down flag,
+    /// first-held latch, event count, long-press deadline).
+    pub(crate) fn clear_native_input_records(&mut self) {
+        self.input_event_counts.clear();
+        self.input_down_descriptors.clear();
+        self.input_down_reported.clear();
+        self.input_descriptor_deadlines.clear();
+    }
+
     /// sub_402080: whether Graph90:10 may load synchronously. The configured
     /// gate (skip) always allows it; with a Graph90:07 hold the first load
     /// opens a window during which loads stay synchronous, and the first
@@ -16102,6 +16111,9 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
     );
     if acknowledges_blocking_message && api.native_user.acknowledge_blocking_message() {
         tracing::info!(?event, "blocking native message acknowledged");
+        // sub_46BC80 clears the input records once MessageBoxA returns, so
+        // the acknowledging press never reaches the scripts.
+        api.clear_native_input_records();
         return;
     }
     if api.input_requires_focus && !api.window_focused {
@@ -18556,10 +18568,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn reset_input_configuration(&mut self, value: i32) {
         self.input_configuration_enabled = value;
-        self.input_event_counts.clear();
-        self.input_down_descriptors.clear();
-        self.input_down_reported.clear();
-        self.input_descriptor_deadlines.clear();
+        self.clear_native_input_records();
         // sub_46DA20 clears record fields 0/1/2/4 only: the +0x0C accumulator,
         // the Sys81:10 values and the Sys80:16 poll flag are untouched.
         tracing::debug!(

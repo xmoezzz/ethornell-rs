@@ -19382,7 +19382,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: USER_SHOW_MESSAGE_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_478C10 opens an informational MB_OK message box using the configured title. The portable host uses native macOS, Windows, or Linux dialog bridges and preserves the configured title.",
+        notes: "sub_478C10 -> sub_46BC80 shows an MB_OK|MB_ICONINFORMATION box captioned by UserB0:83 (default 'Ethornell - BURIKO General Interpreter ( Version : 1.622 - Compatibility : 1.72 )'); the engine clock is frozen while it is open and the input records are cleared afterwards (sub_46DA20). The portable host shows a native dialog or an in-window blocking message.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::USER_SHOW_YES_NO_MESSAGE,
@@ -19390,7 +19390,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: USER_SHOW_YES_NO_MESSAGE_PARAMETERS,
         returns: "boolean yes",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_478C40 opens MB_YESNO|MB_ICONQUESTION and returns whether IDYES was selected. The portable host maps its native Yes/No response to the same Boolean contract.",
+        notes: "sub_478C40 pops the default-button flag and text; MB_YESNO|MB_ICONQUESTION, with MB_DEFBUTTON2 (No) when the flag is 0; pushes IDYES; input records are cleared afterwards.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::USER_SHOW_TYPED_MESSAGE,
@@ -19398,7 +19398,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: USER_SHOW_TYPED_MESSAGE_PARAMETERS,
         returns: "boolean accepted",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_478CA0 selects one of two native MessageBoxA modes and maps the button result to Boolean. The portable host maps typed Yes/No or OK/Cancel dialogs to the same result contract.",
+        notes: "sub_478CA0 pops default-button flag, mode, text; mode 1 is MB_OKCANCEL|MB_ICONINFORMATION (pushes IDOK), otherwise MB_YESNO|MB_ICONQUESTION (pushes IDYES); a zero flag adds MB_DEFBUTTON2; input records are cleared afterwards.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::USER_SET_MESSAGE_TITLE,
@@ -19406,7 +19406,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: USER_SET_MESSAGE_TITLE_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_478D50 -> sub_46BC30 stores the process-global message-box title.",
+        notes: "sub_478D50 -> sub_46BC30 copies the caption into dword_5666E4; a null pointer clears it so sub_46BC80 falls back to the built-in caption.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::USER_SHOW_INPUT_DIALOG,
@@ -20900,6 +20900,10 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_LOAD_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP_REGION,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP,
+    opcodes::USER_SHOW_MESSAGE,
+    opcodes::USER_SHOW_YES_NO_MESSAGE,
+    opcodes::USER_SHOW_TYPED_MESSAGE,
+    opcodes::USER_SET_MESSAGE_TITLE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21302,7 +21306,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::USER_GET_EDIT_TEXT,
     opcodes::USER_SET_EDIT_HIDE_ON_ENTER,
     opcodes::USER_SET_EDIT_PRINTABLE_INPUT,
-    opcodes::USER_SET_MESSAGE_TITLE,
     opcodes::USER_SHOW_INPUT_DIALOG,
     opcodes::USER_SHOW_MULTI_FIELD_DIALOG,
     opcodes::USER_SHOW_SELECTION_DIALOG,
@@ -21323,9 +21326,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_REQUIRE_RESOURCE_FILE,
     opcodes::SYS_CONFIGURE_REMOVABLE_ARCHIVE,
     opcodes::SYS_QUERY_LAUNCHER_MODE,
-    opcodes::USER_SHOW_MESSAGE,
-    opcodes::USER_SHOW_YES_NO_MESSAGE,
-    opcodes::USER_SHOW_TYPED_MESSAGE,
     opcodes::USER_SET_DESKTOP_WALLPAPER,
 ];
 

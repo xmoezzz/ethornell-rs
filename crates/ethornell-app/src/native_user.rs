@@ -379,7 +379,8 @@ impl NativeScreenShakeState {
 #[derive(Debug)]
 pub(super) struct NativeUserState {
     pub(super) text: String,
-    message_box_title: String,
+    /// dword_5666E4 (UserB0:83); `None` uses the built-in caption.
+    message_box_title: Option<String>,
     pub(super) cursor_object: Option<(i32, i32, i32)>,
     debug_windows: [Option<NativeDebugWindow>; MAX_DEBUG_WINDOWS],
     edit: NativeEditControl,
@@ -402,7 +403,7 @@ impl Default for NativeUserState {
     fn default() -> Self {
         Self {
             text: String::new(),
-            message_box_title: String::new(),
+            message_box_title: None,
             cursor_object: None,
             debug_windows: std::array::from_fn(|_| None),
             edit: NativeEditControl::default(),
@@ -424,6 +425,14 @@ impl Default for NativeUserState {
 }
 
 impl NativeUserState {
+    /// sub_46BC80: the configured caption or aEthornellBurik_0.
+    pub(super) fn message_box_caption(&self) -> String {
+        self.message_box_title.clone().unwrap_or_else(|| {
+            "Ethornell - BURIKO General Interpreter ( Version : 1.622 - Compatibility : 1.72 )"
+                .to_string()
+        })
+    }
+
     fn begin_blocking_message(&mut self, title: String, message: String) {
         self.blocking_message = Some((title, message));
     }
@@ -1187,7 +1196,7 @@ impl RuntimeTraceApi {
             }
             0x80 => {
                 let message = pop_string_value(stack).unwrap_or_default();
-                let title = self.native_user.message_box_title.clone();
+                let title = self.native_user.message_box_caption();
                 tracing::info!(title = %title, message = %message, "UserMessage");
                 self.native_user
                     .record_dialog(0x80, &[ethornell_vm::Value::Str(message.clone())]);
@@ -1196,8 +1205,10 @@ impl RuntimeTraceApi {
                         host_dialog::MessageDialogKind::Information,
                         &title,
                         &message,
-                        false,
+                        true,
                     );
+                    // sub_46BC80 clears the input records after MessageBoxA.
+                    self.clear_native_input_records();
                 } else {
                     self.native_user.begin_blocking_message(title, message);
                     self.frame_yield_requested = true;
@@ -1205,11 +1216,12 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             0x81 => {
-                let topmost = pop_int_value(stack).unwrap_or_default();
+                // sub_478C40: a zero first pop selects MB_DEFBUTTON2 (No).
+                let default_yes = pop_int_value(stack).unwrap_or_default();
                 let message = pop_string_value(stack).unwrap_or_default();
                 let args = [
                     ethornell_vm::Value::Str(message.clone()),
-                    ethornell_vm::Value::Int(topmost),
+                    ethornell_vm::Value::Int(default_yes),
                 ];
                 let scripted = self.native_user.record_dialog(0x81, &args);
                 let selected = if scripted != 0 {
@@ -1217,22 +1229,24 @@ impl RuntimeTraceApi {
                 } else {
                     host_dialog::show_message(
                         host_dialog::MessageDialogKind::YesNo,
-                        &self.native_user.message_box_title,
+                        &self.native_user.message_box_caption(),
                         &message,
-                        topmost != 0,
+                        default_yes != 0,
                     )
                     .unwrap_or(false)
                 };
+                self.clear_native_input_records();
                 ethornell_vm::Value::Int(i32::from(selected))
             }
             0x82 => {
-                let topmost = pop_int_value(stack).unwrap_or_default();
+                // sub_478CA0: default-button flag, mode (1 = OK/Cancel), text.
+                let default_first = pop_int_value(stack).unwrap_or_default();
                 let kind = pop_int_value(stack).unwrap_or_default();
                 let message = pop_string_value(stack).unwrap_or_default();
                 let args = [
                     ethornell_vm::Value::Str(message.clone()),
                     ethornell_vm::Value::Int(kind),
-                    ethornell_vm::Value::Int(topmost),
+                    ethornell_vm::Value::Int(default_first),
                 ];
                 let scripted = self.native_user.record_dialog(0x82, &args);
                 let selected = if scripted != 0 {
@@ -1249,16 +1263,22 @@ impl RuntimeTraceApi {
                     };
                     host_dialog::show_message(
                         dialog_kind,
-                        &self.native_user.message_box_title,
+                        &self.native_user.message_box_caption(),
                         &message,
-                        topmost != 0,
+                        default_first != 0,
                     )
                     .unwrap_or(false)
                 };
+                self.clear_native_input_records();
                 ethornell_vm::Value::Int(i32::from(selected))
             }
             0x83 => {
-                self.native_user.message_box_title = pop_string_value(stack).unwrap_or_default();
+                // sub_46BC30 copies the string, or clears the caption for a
+                // null pointer so the built-in one applies again.
+                self.native_user.message_box_title = match stack.pop() {
+                    Some(ethornell_vm::Value::Int(0) | ethornell_vm::Value::Ptr(0)) | None => None,
+                    Some(value) => Some(value_to_string(&value).unwrap_or_default()),
+                };
                 ethornell_vm::Value::None
             }
             0x84 | 0x85 | 0x86 | 0x87 | 0x8C | 0x8F => {
