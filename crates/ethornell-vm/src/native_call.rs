@@ -16588,7 +16588,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_BITMAP_REGION_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_47A590/sub_4033A0 allocate detached destination storage with the requested dimensions and source format, then copy through sub_40A530 using offset (-x,-y), mode 128 and parameter 0.",
+        notes: "sub_47A590 pops height, width, y, x, source, destination; sub_4033A0 fails (script error) on a missing source, a zero width/height or an allocation failure, otherwise recreates the destination in the source's format and copies it at (-x, -y) with mode 0x80 (raw row copy, including format 4/6 sample maps). Pixels outside the source are uninitialised in the target and zero here.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_OBJECT_CONTROL,
@@ -20898,6 +20898,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_QUERY_INPUT_CLASS_LEVEL,
     opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
     opcodes::GRAPH90_LOAD_BITMAP,
+    opcodes::GRAPH90_CREATE_BITMAP_REGION,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21029,7 +21030,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SCALE_BITMAP_REGION,
     opcodes::GRAPH90_TRANSFORM_BITMAP,
     opcodes::GRAPH90_BLIT_BITMAP_REGION,
-    opcodes::GRAPH90_CREATE_BITMAP_REGION,
     opcodes::GRAPH90_START_OBJECT_CONTROL,
     opcodes::GRAPH90_START_OBJECT_CONTROL_EX,
     opcodes::GRAPH90_START_NODE_CONTROL,
