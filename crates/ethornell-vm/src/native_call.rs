@@ -15036,7 +15036,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_CONFIGURATION_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x00487FF0 stores dword_506A44 through sub_46D970, then sub_46DA20 clears every six-DWORD input-state record.",
+        notes: "sub_487FF0 stores dword_506A44 (input enabled) and sub_46DA20 clears fields 0/1/2/4 of every six-DWORD input record; the +0x0C accumulator, Sys81:10 values and the Sys80:16 poll flag are kept.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_KEY_DOWN,
@@ -15044,7 +15044,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: KEY_STATE_PARAMETERS,
         returns: "zero or one",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x00488010 calls sub_46D560 and returns bit 15. The helper applies logical mouse-button swapping and active-window gating before GetAsyncKeyState.",
+        notes: "sub_488010 returns bit 15 of sub_46D560: the physical held state with Sys80:1E mapping mode 1 (left reads left or right, right reads nothing) and the active-window gate unless Sys81:14 enabled background polling. No input event is consumed.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SUM_INPUT_DESCRIPTOR_STATE,
@@ -15052,7 +15052,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_DESCRIPTOR_LIST_PARAMETERS,
         returns: "sum of current descriptor count/state fields",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x00488040 traverses a descriptor chain and sums dword_518CA4[6*descriptor] through sub_46DC70.",
+        notes: "sub_488040 walks a zero-terminated DWORD array of descriptors and sums each record's non-consuming +0x0C accumulator (sub_46DC70).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
@@ -15060,7 +15060,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: MOUSE_BUTTON_MAPPING_PARAMETERS,
         returns: "boolean accepted",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x004882F0 calls sub_48EE50. Only modes 0 and 1 are stored; sub_46D560 uses mode 1 to swap logical descriptors 1 and 2.",
+        notes: "sub_48EE50 stores modes 0 and 1 in dword_56691C and pushes 1, otherwise pushes 0; mode 1 makes the WndProc treat the right button as the left one and changes Sys80:11.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_ALLOC,
@@ -15348,7 +15348,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "monotonic input/window-message serial",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x00488080 calls sub_46E5C0, which returns dword_56683C. sub_46E5B0 increments that global from the window/input message path.",
+        notes: "sub_488080 returns dword_56683C, which the WndProc increments (sub_46E5B0) for key press edges, mouse button presses, wheel and close messages; mouse moves and releases do not change it.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_INPUT_MASTER_GATE,
@@ -15356,7 +15356,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_GATE_PARAMETER,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x004880A0 pops one i32 and writes dword_506A48 through sub_46D980.",
+        notes: "sub_4880A0 stores dword_506A48, the master gate sub_46DE30 requires.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_INPUT_LATCHED_STATE,
@@ -15364,7 +15364,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_GATE_PARAMETER,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x004880C0 pops one i32 and writes dword_566828 through sub_46D990.",
+        notes: "sub_4880C0 stores dword_566828, the latched result sub_46DE30 starts from.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SAMPLE_CONFIGURED_INPUT,
@@ -15372,7 +15372,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x004880E0 calls sub_46D9A0, arms the one-shot configured-input poll flag and samples every registered descriptor without writing a BP result.",
+        notes: "sub_46D9A0 arms dword_56682C and drains every configured-gate descriptor once through sub_46DB40.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_CONFIGURED_INPUT_GATE,
@@ -15380,7 +15380,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "configured input event/status",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x004880F0 returns sub_46DE30, which combines the active-window state, both configuration globals and sampled key/input state.",
+        notes: "sub_46DE30: inside an active window with input enabled, a held configured-gate descriptor (or, while the Sys80:16 poll is armed, a drained event) latches the gate; the poll disarms once nothing is held; the result needs the master gate.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_REGISTER_INPUT_SCOPE,
@@ -15388,7 +15388,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_SCOPE_PARAMETER,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x00488110 registers the packed scope through sub_46D6C0 and sub_46D720, then performs one stateful sub_46DF00 query. Only its return is discarded; the query drains event count and first-held latch state.",
+        notes: "sub_488110 adds the packed scope to the keyboard and pointer chains (sub_46D6C0/sub_46D720) and performs one stateful sub_46DF00 query whose result is discarded.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_AND_UNREGISTER_INPUT_SCOPE,
@@ -15396,7 +15396,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: INPUT_SCOPE_PARAMETER,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x00488150 queries the packed scope and removes it from both target lists through sub_46D7A0/sub_46D7B0.",
+        notes: "sub_488150 performs one stateful sub_46DF00 query, then removes one matching node from each chain (sub_46D7A0/sub_46D7B0).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_INPUT_EVENT_BITS,
@@ -15404,7 +15404,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: QUERY_INPUT_EVENT_BITS_PARAMETERS,
         returns: "current input-event bitmap",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Reports real input events only. Input configuration registers must not synthesize a non-zero result.",
+        notes: "sub_46DF00((scope<<16)|0xFFFF): keyboard classes when the scope passes sub_46D810, pointer descriptors 1/2/4/5/6 when sub_46D830's chain walk accepts it (plain scopes plus Knob and Sprite-target object nodes). Open: DCIPIcon item sprites and CProcSelect windows are not yet object nodes of the pointer chain.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_REGISTER_INPUT_CLASS_DESCRIPTORS,
@@ -15412,7 +15412,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: REGISTER_INPUT_CLASS_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target-confirmed: handler 0x004881C0 passes the class mask and a zero-terminated descriptor array to sub_46DFA0. The target rejects unknown masks and lists with 16 or more nonzero entries.",
+        notes: "sub_4881C0 replaces one mutable class list (0x40..0x8000, 0x40000000, 0x80000000) with a zero-terminated descriptor array of at most 15 entries; other masks or longer lists are script errors.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_INPUT_CLASS_LEVEL,
@@ -15420,7 +15420,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: QUERY_INPUT_CLASS_LEVEL_PARAMETERS,
         returns: "current input-class level/count",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Level query is independent from the edge-triggered event bitmap returned by Sys80_1A.",
+        notes: "sub_46E070 sums the non-consuming +0x0C accumulators of every descriptor in the selected class lists (pointer and keyboard classes up to 0x40000000).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_SCOPED_INPUT_EVENT,
@@ -15428,7 +15428,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: QUERY_SCOPED_INPUT_EVENT_PARAMETERS,
         returns: "drained event count with 0x80000000 first-down flag",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target handler 0x00488290 packs scope as (scope << 16) | 0xFFFF, validates descriptors 1/2 through sub_46D830 and all others through sub_46D810, then drains sub_46DB40(input_descriptor).",
+        notes: "sub_488290 checks descriptors 1/2 against the pointer chain (sub_46D830) and others against sub_46D810, then drains sub_46DB40. Open: DCIPIcon item sprites are not yet pointer-chain object nodes.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_CONFIGURE_CURSOR_MOTION,
@@ -20884,6 +20884,19 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
     opcodes::GRAPH90_QUERY_BITMAP_INFO,
     opcodes::GRAPH90_RELEASE_SPRITE_OBJECT,
+    opcodes::SYS_RESET_INPUT_CONFIGURATION,
+    opcodes::SYS_QUERY_KEY_DOWN,
+    opcodes::SYS_SUM_INPUT_DESCRIPTOR_STATE,
+    opcodes::SYS_INPUT_MESSAGE_SERIAL,
+    opcodes::SYS_SET_INPUT_MASTER_GATE,
+    opcodes::SYS_SET_INPUT_LATCHED_STATE,
+    opcodes::SYS_SAMPLE_CONFIGURED_INPUT,
+    opcodes::SYS_QUERY_CONFIGURED_INPUT_GATE,
+    opcodes::SYS_REGISTER_INPUT_SCOPE,
+    opcodes::SYS_QUERY_AND_UNREGISTER_INPUT_SCOPE,
+    opcodes::SYS_REGISTER_INPUT_CLASS_DESCRIPTORS,
+    opcodes::SYS_QUERY_INPUT_CLASS_LEVEL,
+    opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21128,10 +21141,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_WAIT_EXCLUSION_SECTION,
     opcodes::SYS_READ_CURSOR_POINT,
     opcodes::SYS_QUERY_WINDOW_MINIMIZE_LATCH,
-    opcodes::SYS_RESET_INPUT_CONFIGURATION,
-    opcodes::SYS_QUERY_KEY_DOWN,
-    opcodes::SYS_SUM_INPUT_DESCRIPTOR_STATE,
-    opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
     opcodes::SYS_COUNT_FILES,
     opcodes::SYS_ENUMERATE_FILES,
     opcodes::SYS_ENUMERATE_DIRECTORIES,
@@ -21149,16 +21158,7 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_FILE_SIZE,
     opcodes::SYS_GET_CONFIGURED_ROOT,
     opcodes::SYS_SET_PRIMARY_ROOT,
-    opcodes::SYS_INPUT_MESSAGE_SERIAL,
-    opcodes::SYS_SET_INPUT_MASTER_GATE,
-    opcodes::SYS_SET_INPUT_LATCHED_STATE,
-    opcodes::SYS_SAMPLE_CONFIGURED_INPUT,
-    opcodes::SYS_QUERY_CONFIGURED_INPUT_GATE,
-    opcodes::SYS_REGISTER_INPUT_SCOPE,
-    opcodes::SYS_QUERY_AND_UNREGISTER_INPUT_SCOPE,
     opcodes::SYS_QUERY_INPUT_EVENT_BITS,
-    opcodes::SYS_REGISTER_INPUT_CLASS_DESCRIPTORS,
-    opcodes::SYS_QUERY_INPUT_CLASS_LEVEL,
     opcodes::SYS_QUERY_SCOPED_INPUT_EVENT,
     opcodes::SYS_CONFIGURE_CURSOR_MOTION,
     opcodes::SYS_INVOKE_THREAD_CALLBACK,

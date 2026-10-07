@@ -2693,7 +2693,9 @@ impl RuntimeTraceApi {
                 // (+0x11C parent, sub_41ACE0), and finally release the slot
                 // (sub_43E610); every refusal is a script error.
                 let handle = pop_int_value(stack).unwrap_or_default();
-                self.graph_object_input_tables.remove(&handle);
+                if self.graph_sprite_targets.unregister_sprite(handle) {
+                    self.unregister_pointer_object_node(handle);
+                }
                 if self
                     .graph_input_objects
                     .values()
@@ -4082,6 +4084,9 @@ impl RuntimeTraceApi {
             (0x90, 0xF8) => {
                 // sub_496270 unregisters every Sprite input region and resets
                 // the monotonic target-number counter to zero.
+                for (_, sprite) in self.graph_sprite_targets.entries() {
+                    self.unregister_pointer_object_node(sprite);
+                }
                 self.graph_sprite_targets.clear();
                 ethornell_vm::Value::None
             }
@@ -4093,6 +4098,8 @@ impl RuntimeTraceApi {
                     ))));
                 }
                 let target_number = self.graph_sprite_targets.register(sprite);
+                // sub_4962A0 also adds the sprite to the pointer chain.
+                self.register_pointer_object_node(sprite);
                 tracing::debug!(sprite, target_number, "GraphRegisterSpriteTarget");
                 ethornell_vm::Value::None
             }
@@ -4103,6 +4110,7 @@ impl RuntimeTraceApi {
                         "Graph90:FB Sprite handle #{sprite} is not registered"
                     ))));
                 }
+                self.unregister_pointer_object_node(sprite);
                 tracing::debug!(sprite, "GraphUnregisterSpriteTarget");
                 ethornell_vm::Value::None
             }

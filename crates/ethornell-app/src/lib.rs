@@ -715,6 +715,9 @@ struct RuntimeTraceApi {
     /// Physically held descriptors (GetAsyncKeyState), independent of the
     /// native records that Sys80:10 may clear.
     input_physically_held: BTreeSet<i32>,
+    /// Object nodes of the pointer scope chain (sub_46D6E0): (scope, object)
+    /// in chain order, scope = the object's sort key when it registered.
+    pointer_object_nodes: Vec<(u32, i32)>,
     window_messages: VecDeque<RuntimeWindowMessage>,
     input_configuration_enabled: i32,
     input_master_gate: i32,
@@ -1009,6 +1012,7 @@ impl RuntimeTraceApi {
             input_descriptor_deadlines: BTreeMap::new(),
             last_button_press: None,
             input_physically_held: BTreeSet::new(),
+            pointer_object_nodes: Vec::new(),
             window_messages: VecDeque::new(),
             input_configuration_enabled: 1,
             input_master_gate: 1,
@@ -2593,6 +2597,41 @@ impl RuntimeTraceApi {
             }
         }
         Some(0)
+    }
+
+    /// CDspObj::IsDrawable (sub_41AE30): enabled, draw-enabled, not
+    /// suppressed, mask alpha below 256 and a non-zero alpha multiplier.
+    fn graph_object_is_drawable(&self, object: i32) -> bool {
+        let properties = self.graph_object_properties.get(&object);
+        self.graph_object_enabled.get(&object).copied().unwrap_or(true)
+            && self.graph_object_draw_enabled.get(&object).copied().unwrap_or(true)
+            && !properties.is_some_and(|p| p.native.suppress_draw != 0)
+            && properties.is_none_or(|p| p.mask_alpha < 256 && p.alpha_multiplier != 0)
+    }
+
+    /// sub_46D6E0: add an object node to the pointer chain with the object's
+    /// current sort key, before the first node whose scope is not greater.
+    pub(crate) fn register_pointer_object_node(&mut self, object: i32) {
+        let scope = self.graph90_native_sort_key(object).unwrap_or(0) as u32;
+        let index = self
+            .pointer_object_nodes
+            .iter()
+            .position(|(existing, _)| *existing <= scope)
+            .unwrap_or(self.pointer_object_nodes.len());
+        self.pointer_object_nodes.insert(index, (scope, object));
+    }
+
+    /// sub_46D7C0: remove the first node of `object`.
+    pub(crate) fn unregister_pointer_object_node(&mut self, object: i32) -> bool {
+        let Some(index) = self
+            .pointer_object_nodes
+            .iter()
+            .position(|(_, existing)| *existing == object)
+        else {
+            return false;
+        };
+        self.pointer_object_nodes.remove(index);
+        true
     }
 
     /// Commit/re-evaluate an existing portable graph object without destroying it.
@@ -8098,14 +8137,8 @@ fn query_runtime_input_event_bits(
     // sub_46D810/sub_46D830 before collecting keyboard/class or pointer
     // events. Treating an already-packed CProcDspMsg scope as automatically
     // registered lets messages observe input owned by another processor.
-    let keyboard_registered = api
-        .registered_keyboard_input_scopes
-        .top_scope()
-        .is_none_or(|top| packed as u32 >= top);
-    let pointer_registered = api
-        .registered_pointer_input_scopes
-        .top_scope()
-        .is_some_and(|top| packed as u32 == top);
+    let keyboard_registered = native_keyboard_scope_eligible(api, packed);
+    let pointer_registered = native_pointer_scope_eligible(api, packed);
     let is_pointer = api.pending_input_descriptor == Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
     let mut result = 0_i32;
     if keyboard_registered && api.input_configuration_enabled != 0 {
@@ -11980,6 +12013,55 @@ mod input_tests {
     }
 
     #[test]
+    fn pointer_object_nodes_block_lower_scopes_only_under_the_cursor() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.input_configuration_enabled = 1;
+        let object = 605;
+        api.graph_layers.insert(
+            object,
+            RuntimeGraphLayer {
+                hit_id: object,
+                owner_object: None,
+                key: "occluder".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 2176,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.graph_object_layers.insert(object, [object].into_iter().collect());
+        let packed = 0x0007_ffff;
+        api.registered_pointer_input_scopes.register(packed);
+        api.pointer_object_nodes.push((0x0008_0000, object));
+        api.mouse_pos = Some((110.0, 210.0));
+        assert!(!super::native_pointer_scope_eligible(&api, packed));
+        api.mouse_pos = Some((10.0, 10.0));
+        assert!(super::native_pointer_scope_eligible(&api, packed));
+        // A hidden object does not take part in the chain.
+        api.mouse_pos = Some((110.0, 210.0));
+        api.graph_object_draw_enabled.insert(object, false);
+        assert!(super::native_pointer_scope_eligible(&api, packed));
+        // Input disabled (dword_506A44 = 0) disables the pointer test.
+        api.input_configuration_enabled = 0;
+        assert!(!super::native_pointer_scope_eligible(&api, packed));
+    }
+
+    #[test]
     fn knob_mouse_capture_drag_changed_and_active_handle_follow_target_manager() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -15845,6 +15927,8 @@ fn native_input_activation_serial(api: &RuntimeTraceApi, mask: i32) -> u64 {
     total
 }
 
+/// sub_46D810: keyboard input reaches `packed` when input is enabled
+/// (dword_506A44) and `packed` is at or above the chain head (unsigned).
 fn native_keyboard_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
     api.input_configuration_enabled != 0
         && api
@@ -15853,8 +15937,52 @@ fn native_keyboard_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
             .is_none_or(|top| packed as u32 >= top)
 }
 
+/// sub_46D830: walk the pointer chain from the highest scope down. A plain
+/// scope node covers the whole plane; an object node (sub_46D6E0) only
+/// counts while its object is drawable, the cursor is on screen and over the
+/// object. A covering node above `packed` blocks the pointer, the first node
+/// at or below it must be `packed` itself and cover the cursor.
 fn native_pointer_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
-    api.registered_pointer_input_scopes.top_scope() == Some(packed as u32)
+    if api.input_configuration_enabled == 0 {
+        return false;
+    }
+    let packed = packed as u32;
+    let on_screen = api.mouse_pos.is_some_and(|(x, y)| {
+        x >= 0.0 && y >= 0.0 && x < api.screen_width.max(1) as f32 && y < api.screen_height.max(1) as f32
+    });
+    let mut nodes = api
+        .pointer_object_nodes
+        .iter()
+        .map(|&(scope, object)| (scope, Some(object)))
+        .chain(
+            api.registered_pointer_input_scopes
+                .scopes_with_counts()
+                .flat_map(|(scope, count)| std::iter::repeat_n((scope, None), count as usize)),
+        )
+        .collect::<Vec<_>>();
+    nodes.sort_by(|a, b| b.0.cmp(&a.0));
+    for (scope, object) in nodes {
+        let covers = match object {
+            Some(object) => {
+                if !on_screen || !api.graph_object_is_drawable(object) {
+                    continue;
+                }
+                api.graph_object_pointer_hit(object).is_some_and(|hit| hit != 0)
+            }
+            None => true,
+        };
+        if scope <= packed {
+            if scope != packed {
+                return false;
+            }
+            if covers {
+                return true;
+            }
+        } else if covers {
+            return false;
+        }
+    }
+    false
 }
 
 fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent) {
@@ -18484,11 +18612,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     fn query_scoped_input_event(&mut self, input_descriptor: i32, scope: i32) -> i32 {
         let packed = scope.wrapping_shl(16) | 0xffff;
         let registered = if matches!(input_descriptor, 1 | 2) {
-            self.registered_pointer_input_scopes.top_scope() == Some(packed as u32)
+            native_pointer_scope_eligible(self, packed)
         } else {
-            self.registered_keyboard_input_scopes
-                .top_scope()
-                .is_none_or(|top| packed as u32 >= top)
+            native_keyboard_scope_eligible(self, packed)
         };
         if !registered {
             return 0;
@@ -21366,11 +21492,18 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 } else {
                     tracing::info!(target, handle, "GraphCreateKnobObject");
                 }
+                // sub_4636A0 registers the Knob in the pointer chain.
+                if handle != 0 {
+                    self.register_pointer_object_node(handle);
+                }
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0xd1) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let removed = self.graph_knob_states.remove(&handle);
+                if removed.is_some() {
+                    self.unregister_pointer_object_node(handle);
+                }
                 if let Some(state) = removed {
                     // CDspObjKnob owns only a raw control pointer to `target`;
                     // destroying the Knob does not detach/reparent that object.

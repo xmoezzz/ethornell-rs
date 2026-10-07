@@ -29,6 +29,10 @@ impl NativeInputScopeRegistry {
         self.counts.contains_key(&(*packed_scope as u32))
     }
 
+    pub(crate) fn scopes_with_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.counts.iter().map(|(&scope, &count)| (scope, count))
+    }
+
     pub(crate) fn top_scope(&self) -> Option<u32> {
         self.counts.last_key_value().map(|(&scope, _)| scope)
     }
