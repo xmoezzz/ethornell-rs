@@ -797,6 +797,15 @@ impl RuntimeTraceApi {
     fn new_with_native_root(manager: ResourceManager, native_root: PathBuf) -> Self {
         let (game_id, source) = configured_game_id(&manager);
         tracing::info!(%game_id, source, "configured native game identifier");
+        // system.arc:ipl._bp ends the interpreter at once when a file named
+        // after the game identifier exists in the game directory, which looks
+        // like a window that opens and closes. Say so instead of exiting silently.
+        if native_root.join(&game_id).is_file() {
+            tracing::warn!(
+                path = %native_root.join(&game_id).display(),
+                "a file named after the game id exists; ipl._bp terminates immediately when it is present"
+            );
+        }
         Self {
             manager,
             native_root,
