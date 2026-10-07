@@ -25,7 +25,7 @@ impl Vm {
                 let mut call = self.scheduler_call_frame(opcode)?;
                 let message_id = call.pop_i32("message_id")?;
                 call.require_consumed()?;
-                let registered_after_serial = api.input_message_serial();
+                let registered_after_serial = api.window_message_sequence();
                 self.install_cprocedure(
                     InstalledCProcedure::wait_window_message(
                         self.thread.thread_id(),

@@ -8,6 +8,9 @@ pub enum HeadlessInputEvent {
     MouseWheel { delta_y: f32 },
     KeyPress { key: String },
     KeyRelease { key: String },
+    /// Right (2), middle (4) and X1/X2 (5/6) buttons as target descriptors.
+    ButtonPress { button: i32, x: f32, y: f32 },
+    ButtonRelease { button: i32, x: f32, y: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +22,7 @@ enum HeadlessInputAction {
     Click { x: f32, y: f32 },
     MouseWheel { delta_y: f32 },
     KeyPress { key: String },
+    ButtonClick { button: i32, x: f32, y: f32 },
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +72,18 @@ impl HeadlessInputScript {
                     x: parse_f32(x, token)?,
                     y: parse_f32(y, token)?,
                 },
+                [name @ ("rclick" | "mclick" | "x1click" | "x2click"), x, y] => {
+                    HeadlessInputAction::ButtonClick {
+                        button: match *name {
+                            "rclick" => 2,
+                            "mclick" => 4,
+                            "x1click" => 5,
+                            _ => 6,
+                        },
+                        x: parse_f32(x, token)?,
+                        y: parse_f32(y, token)?,
+                    }
+                }
                 ["wheel", delta_y] => HeadlessInputAction::MouseWheel {
                     delta_y: parse_f32(delta_y, token)?,
                 },
@@ -118,6 +134,10 @@ impl HeadlessInputScript {
                 HeadlessInputAction::KeyPress { key } => {
                     self.queued_release = Some(HeadlessInputEvent::KeyRelease { key: key.clone() });
                     return Some(HeadlessInputEvent::KeyPress { key });
+                }
+                HeadlessInputAction::ButtonClick { button, x, y } => {
+                    self.queued_release = Some(HeadlessInputEvent::ButtonRelease { button, x, y });
+                    return Some(HeadlessInputEvent::ButtonPress { button, x, y });
                 }
             }
         }

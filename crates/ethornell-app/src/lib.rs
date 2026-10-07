@@ -700,6 +700,21 @@ struct RuntimeTraceApi {
     pending_input_state: Option<i32>,
     pending_input_descriptor: Option<i32>,
     input_message_serial: i32,
+    /// Ordering stamp of host window messages (WaitWndMsg registration
+    /// point). Independent of the target input serial dword_56683C.
+    window_message_sequence: i32,
+    /// Sys81:10 per-descriptor value (input record +0x14, sub_46DA40). When
+    /// non-zero, WM_KEYDOWN resets the record first so key repeats count.
+    input_repeat_flags: [i32; 256],
+    /// Sys81:14 dword_5667EC: sub_46D560 reports held keys while inactive.
+    background_key_polling: i32,
+    /// Native per-descriptor +0x10 deadline (now + 500 ms on press).
+    input_descriptor_deadlines: BTreeMap<i32, u64>,
+    /// WM_*BUTTONDBLCLK detection: last press (button, time ms, x, y).
+    last_button_press: Option<(i32, u64, f32, f32)>,
+    /// Physically held descriptors (GetAsyncKeyState), independent of the
+    /// native records that Sys80:10 may clear.
+    input_physically_held: BTreeSet<i32>,
     window_messages: VecDeque<RuntimeWindowMessage>,
     input_configuration_enabled: i32,
     input_master_gate: i32,
@@ -988,6 +1003,12 @@ impl RuntimeTraceApi {
             pending_input_state: None,
             pending_input_descriptor: None,
             input_message_serial: 0,
+            window_message_sequence: 0,
+            input_repeat_flags: [0; 256],
+            background_key_polling: 0,
+            input_descriptor_deadlines: BTreeMap::new(),
+            last_button_press: None,
+            input_physically_held: BTreeSet::new(),
             window_messages: VecDeque::new(),
             input_configuration_enabled: 1,
             input_master_gate: 1,
@@ -8475,11 +8496,39 @@ mod input_tests {
         api.call_coverage.insert((0x80, 0x13), 99);
 
         assert_eq!(SysApi::input_message_serial(&mut api), 0);
+        // WM_MOUSEMOVE and button releases do not reach sub_46E5B0.
         super::apply_runtime_input_event(
             &mut api,
             super::RuntimeInputEvent::MouseMove { x: 10.0, y: 20.0 },
         );
+        assert_eq!(SysApi::input_message_serial(&mut api), 0);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::ButtonPress { button: 2, x: 10.0, y: 20.0 },
+        );
         assert_eq!(SysApi::input_message_serial(&mut api), 1);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::ButtonRelease { button: 2, x: 10.0, y: 20.0 },
+        );
+        assert_eq!(SysApi::input_message_serial(&mut api), 1);
+        assert_eq!(SysApi::poll_queued_event(&mut api), Some([3, 2, 0]));
+        // A held key does not count its auto-repeat unless Sys81:10 set the
+        // record's flag.
+        for _ in 0..2 {
+            super::apply_runtime_input_event(
+                &mut api,
+                super::RuntimeInputEvent::KeyPress { descriptor: 13 },
+            );
+        }
+        assert_eq!(SysApi::input_message_serial(&mut api), 2);
+        SysApi::swap_input_repeat_flag(&mut api, 13, 1);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress { descriptor: 13 },
+        );
+        assert_eq!(SysApi::input_message_serial(&mut api), 3);
+        assert!(SysApi::query_key_held(&mut api, 13));
     }
 
     #[test]
@@ -11980,6 +12029,9 @@ mod input_tests {
             super::RuntimeInputEvent::MousePress { x: 110.0, y: 210.0 },
         );
         assert_eq!(api.graph_active_input_handle, handle);
+        // WM_LBUTTONDOWN queues the input event (sub_496540(3, 1, 0)) before
+        // the Knob capture queues its own event.
+        assert_eq!(SysApi::poll_queued_event(&mut api), Some([3, 1, 0]));
         assert_eq!(
             SysApi::poll_queued_event(&mut api),
             Some([0x1000, handle, 0])
@@ -12026,6 +12078,7 @@ mod input_tests {
             &mut api,
             super::RuntimeInputEvent::MousePress { x: 210.0, y: 210.0 },
         );
+        assert_eq!(SysApi::poll_queued_event(&mut api), Some([3, 1, 0]));
         assert_eq!(
             SysApi::poll_queued_event(&mut api),
             Some([0x1000, handle, 0])
@@ -15438,6 +15491,9 @@ enum RuntimeInputEvent {
     MouseWheel { delta_y: f32 },
     KeyPress { descriptor: i32 },
     KeyRelease { descriptor: i32 },
+    /// Right (2), middle (4) and X1/X2 (5/6) buttons, as target descriptors.
+    ButtonPress { button: i32, x: f32, y: f32 },
+    ButtonRelease { button: i32, x: f32, y: f32 },
 }
 
 fn queue_runtime_input_event(queue: &mut VecDeque<RuntimeInputEvent>, event: RuntimeInputEvent) {
@@ -15651,8 +15707,9 @@ fn push_runtime_window_message(
     lparam: i32,
     wparam: i32,
 ) {
+    api.window_message_sequence = api.window_message_sequence.wrapping_add(1);
     api.window_messages.push_back(RuntimeWindowMessage {
-        serial: api.input_message_serial,
+        serial: api.window_message_sequence,
         message_id,
         lparam,
         wparam,
@@ -15698,21 +15755,68 @@ fn drain_native_input_descriptor(api: &mut RuntimeTraceApi, descriptor: i32) -> 
     count | held
 }
 
-fn note_native_input_press(api: &mut RuntimeTraceApi, descriptor: i32) {
-    if !api.input_down_descriptors.insert(descriptor) {
-        return;
+/// sub_46DA80: a press on one input record. Mouse descriptors (1, 2, 4, 5,
+/// 6) clear the first-held latch and count every press; other descriptors
+/// count only an up-to-down edge. Returns whether the record was up.
+fn note_native_input_press(api: &mut RuntimeTraceApi, descriptor: i32) -> bool {
+    api.input_physically_held.insert(descriptor);
+    let was_up = api.input_down_descriptors.insert(descriptor);
+    let mouse = matches!(descriptor, 1 | 2 | 4 | 5 | 6);
+    if mouse {
+        api.input_down_reported.remove(&descriptor);
     }
-    let count = api.input_event_counts.entry(descriptor).or_default();
-    *count = count.saturating_add(1).min(i32::MAX as u32);
+    if mouse || was_up {
+        let count = api.input_event_counts.entry(descriptor).or_default();
+        *count = count.saturating_add(1).min(i32::MAX as u32);
+        let accumulator = api
+            .input_descriptor_accumulators
+            .entry(descriptor)
+            .or_default();
+        *accumulator = accumulator.saturating_add(1).min(i32::MAX as u32);
+        let deadline = api.engine_time_ms.saturating_add(500);
+        api.input_descriptor_deadlines.insert(descriptor, deadline);
+    }
+    was_up
+}
+
+/// sub_46DB20: increments only the non-consuming accumulator (a press that a
+/// captured Knob owns).
+fn note_native_input_accumulator(api: &mut RuntimeTraceApi, descriptor: i32) {
     let accumulator = api
         .input_descriptor_accumulators
         .entry(descriptor)
         .or_default();
     *accumulator = accumulator.saturating_add(1).min(i32::MAX as u32);
-    api.input_down_reported.remove(&descriptor);
+}
+
+/// The WndProc side effects of a newly delivered press: the input serial
+/// (sub_46E5B0) and the `[3, descriptor, 0]` system event (sub_496540).
+fn note_native_input_message(api: &mut RuntimeTraceApi, descriptor: i32) {
+    api.input_message_serial = api.input_message_serial.wrapping_add(1);
+    api.queued_system_events.push_back([3, descriptor, 0]);
+}
+
+/// Double-click detection standing in for WM_LBUTTONDBLCLK /
+/// WM_RBUTTONDBLCLK (500 ms, 4 px): the WndProc queues event 128 / 129.
+fn note_native_double_click(api: &mut RuntimeTraceApi, button: i32, x: f32, y: f32) {
+    let now = api.engine_time_ms;
+    let double = api.last_button_press.is_some_and(|(last, at, lx, ly)| {
+        last == button
+            && now.saturating_sub(at) <= 500
+            && (x - lx).abs() <= 4.0
+            && (y - ly).abs() <= 4.0
+    });
+    if double {
+        api.last_button_press = None;
+        api.queued_system_events
+            .push_back([if button == 1 { 128 } else { 129 }, 0, 0]);
+    } else {
+        api.last_button_press = Some((button, now, x, y));
+    }
 }
 
 fn note_native_input_release(api: &mut RuntimeTraceApi, descriptor: i32) {
+    api.input_physically_held.remove(&descriptor);
     api.input_down_descriptors.remove(&descriptor);
     api.input_down_reported.remove(&descriptor);
 }
@@ -15770,7 +15874,21 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
         return;
     }
     api.note_cursor_activity();
-    api.input_message_serial = api.input_message_serial.wrapping_add(1);
+    // Mapping mode 1 (Sys80:1E, sub_48EE70) turns the right button into the
+    // left one: WndProc re-sends WM_RBUTTONDOWN/UP as WM_LBUTTONDOWN/UP.
+    let event = match event {
+        RuntimeInputEvent::ButtonPress { button: 2, x, y }
+            if api.native_system.mouse_button_mapping_mode() == 1 =>
+        {
+            RuntimeInputEvent::MousePress { x, y }
+        }
+        RuntimeInputEvent::ButtonRelease { button: 2, x, y }
+            if api.native_system.mouse_button_mapping_mode() == 1 =>
+        {
+            RuntimeInputEvent::MouseRelease { x, y }
+        }
+        other => other,
+    };
     match event {
         RuntimeInputEvent::MouseMove { x, y } => {
             let point = (x, y);
@@ -15780,6 +15898,8 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             push_runtime_window_message(api, 0x0200, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::MousePress { x, y } => {
+            note_native_double_click(api, 1, x, y);
+            note_native_input_message(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
             note_native_input_press(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
             let point = Some((x, y));
             api.mouse_pos = point;
@@ -15837,6 +15957,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
                 } else {
                     INPUT_DESCRIPTOR_MOUSE_WHEEL_UP
                 };
+                note_native_input_message(api, descriptor);
                 note_native_input_press(api, descriptor);
                 note_native_input_release(api, descriptor);
                 api.pending_input_state = Some(0x1000_0006);
@@ -15847,11 +15968,56 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             }
         }
         RuntimeInputEvent::KeyPress { descriptor } => {
-            note_native_input_press(api, descriptor);
-            api.pending_input_state = Some(0x1000_0002);
-            api.pending_input_descriptor = Some(descriptor);
-            api.pending_input_consumed = false;
+            // WM_KEYDOWN: a non-zero Sys81:10 value resets the record first
+            // (sub_46DB00) so an auto-repeat counts as a new press.
+            if usize::try_from(descriptor)
+                .ok()
+                .and_then(|index| api.input_repeat_flags.get(index))
+                .is_some_and(|flag| *flag != 0)
+            {
+                note_native_input_release(api, descriptor);
+            }
+            if note_native_input_press(api, descriptor) {
+                note_native_input_message(api, descriptor);
+                // sub_4617B0 / sub_461440: a registered fullscreen hotkey
+                // toggles the display mode on the press edge.
+                if api.native_system.fullscreen_hotkeys_enabled
+                    && api.native_system.fullscreen_hotkeys.contains(&descriptor)
+                {
+                    let fullscreen = api.window_mode == 0;
+                    api.window_mode = i32::from(fullscreen);
+                    api.pending_fullscreen = Some(fullscreen);
+                }
+                api.pending_input_state = Some(0x1000_0002);
+                api.pending_input_descriptor = Some(descriptor);
+                api.pending_input_consumed = false;
+            }
             push_runtime_window_message(api, 0x0100, 0, descriptor);
+        }
+        RuntimeInputEvent::ButtonPress { button, x, y } => {
+            // WM_RBUTTONDOWN / WM_MBUTTONDOWN / WM_XBUTTONDOWN.
+            api.mouse_pos = Some((x, y));
+            if button == 2 {
+                note_native_double_click(api, 2, x, y);
+            }
+            note_native_input_message(api, button);
+            note_native_input_press(api, button);
+            let message = match button {
+                2 => 0x0204,
+                4 => 0x0207,
+                _ => 0x020B,
+            };
+            push_runtime_window_message(api, message, pack_window_message_point(x, y), button);
+        }
+        RuntimeInputEvent::ButtonRelease { button, x, y } => {
+            api.mouse_pos = Some((x, y));
+            note_native_input_release(api, button);
+            let message = match button {
+                2 => 0x0205,
+                4 => 0x0208,
+                _ => 0x020C,
+            };
+            push_runtime_window_message(api, message, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::KeyRelease { descriptor } => {
             note_native_input_release(api, descriptor);
@@ -15882,6 +16048,12 @@ fn apply_headless_input_event(api: &mut RuntimeTraceApi, event: HeadlessInputEve
                 return;
             };
             RuntimeInputEvent::KeyRelease { descriptor }
+        }
+        HeadlessInputEvent::ButtonPress { button, x, y } => {
+            RuntimeInputEvent::ButtonPress { button, x, y }
+        }
+        HeadlessInputEvent::ButtonRelease { button, x, y } => {
+            RuntimeInputEvent::ButtonRelease { button, x, y }
         }
     };
     tracing::info!(event = ?runtime_event, "scripted runtime input");
@@ -18088,6 +18260,39 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         self.input_message_serial
     }
 
+    fn window_message_sequence(&mut self) -> i32 {
+        self.window_message_sequence
+    }
+
+    fn query_key_held(&mut self, descriptor: i32) -> bool {
+        // sub_46D560: mapping mode 1 reads logical left as left OR right and
+        // logical right as nothing; an inactive window reports nothing unless
+        // Sys81:14 enabled background polling.
+        if !self.window_focused && self.background_key_polling == 0 {
+            return false;
+        }
+        let held = |descriptor: i32| self.input_physically_held.contains(&descriptor);
+        match (self.native_system.mouse_button_mapping_mode(), descriptor) {
+            (1, 1) => held(1) || held(2),
+            (1, 2) => false,
+            _ => held(descriptor),
+        }
+    }
+
+    fn swap_input_repeat_flag(&mut self, descriptor: i32, value: i32) -> i32 {
+        match usize::try_from(descriptor)
+            .ok()
+            .and_then(|index| self.input_repeat_flags.get_mut(index))
+        {
+            Some(slot) => std::mem::replace(slot, value),
+            None => 0,
+        }
+    }
+
+    fn set_background_key_polling(&mut self, enabled: i32) {
+        self.background_key_polling = enabled;
+    }
+
     fn poll_window_message(
         &mut self,
         message_id: i32,
@@ -18119,7 +18324,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         self.input_event_counts.clear();
         self.input_down_descriptors.clear();
         self.input_down_reported.clear();
-        self.input_poll_active = false;
+        self.input_descriptor_deadlines.clear();
+        // sub_46DA20 clears record fields 0/1/2/4 only: the +0x0C accumulator,
+        // the Sys81:10 values and the Sys80:16 poll flag are untouched.
         tracing::debug!(
             value,
             "native input configuration and transient descriptor state reset"

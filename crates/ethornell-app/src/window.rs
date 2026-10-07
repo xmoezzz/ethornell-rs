@@ -189,18 +189,7 @@ impl ApplicationHandler for WindowApp {
                     && !modeless_consumed
                     && let Some(descriptor) = input_descriptor_for_keycode(code)
                 {
-                    if let Some(runtime) = runtime.as_mut() {
-                        if runtime.api.native_system.fullscreen_hotkeys_enabled
-                            && runtime
-                                .api
-                                .native_system
-                                .fullscreen_hotkeys
-                                .contains(&descriptor)
-                        {
-                            let fullscreen = runtime.api.window_mode == 0;
-                            runtime.api.window_mode = i32::from(fullscreen);
-                            runtime.api.pending_fullscreen = Some(fullscreen);
-                        }
+                    if runtime.is_some() {
                         queue_runtime_input_event(
                             pending_input_events,
                             RuntimeInputEvent::KeyPress { descriptor },
@@ -286,6 +275,41 @@ impl ApplicationHandler for WindowApp {
                             "mouse release ignored before a cursor position was observed"
                         );
                     }
+                }
+            }
+            WindowEvent::PointerButton {
+                state,
+                button:
+                    ButtonSource::Mouse(
+                        button @ (MouseButton::Right
+                        | MouseButton::Middle
+                        | MouseButton::Back
+                        | MouseButton::Forward),
+                    ),
+                position,
+                ..
+            } => {
+                // WndProc descriptors: right 2, middle 4, XBUTTON1 5, XBUTTON2 6.
+                let descriptor = match button {
+                    MouseButton::Right => 2,
+                    MouseButton::Middle => 4,
+                    MouseButton::Back => 5,
+                    _ => 6,
+                };
+                *cursor_surface_pos = Some((position.x as f32, position.y as f32));
+                let cursor_game_pos =
+                    renderer.surface_to_game_point(position.x as f32, position.y as f32);
+                if let Some(runtime) = runtime.as_mut()
+                    && let Some((x, y)) = cursor_game_pos.or(runtime.api.mouse_pos)
+                {
+                    queue_runtime_input_event(
+                        pending_input_events,
+                        if state == ElementState::Pressed {
+                            RuntimeInputEvent::ButtonPress { button: descriptor, x, y }
+                        } else {
+                            RuntimeInputEvent::ButtonRelease { button: descriptor, x, y }
+                        },
+                    );
                 }
             }
             WindowEvent::RedrawRequested => {

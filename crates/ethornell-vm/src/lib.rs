@@ -747,6 +747,28 @@ pub trait SysApi {
     /// target destructor does not perform a final input query.
     fn unregister_message_input_scope(&mut self, _input_scope: i32) {}
 
+    /// Stamp of the newest host window message; WaitWndMsg only accepts
+    /// messages delivered after the stamp it registered with.
+    fn window_message_sequence(&mut self) -> i32 {
+        self.input_message_serial()
+    }
+
+    /// sub_46D560 (Sys80:11): whether the logical descriptor is physically
+    /// held, after the Sys80:1E mapping and the active-window gate. It does
+    /// not consume any input event.
+    fn query_key_held(&mut self, _descriptor: i32) -> bool {
+        false
+    }
+
+    /// Sys81:10 (sub_46DA40): replace input record +0x14 of one descriptor
+    /// and return the previous value.
+    fn swap_input_repeat_flag(&mut self, _descriptor: i32, _value: i32) -> i32 {
+        0
+    }
+
+    /// Sys81:14 (sub_46D540): dword_5667EC, background key polling.
+    fn set_background_key_polling(&mut self, _enabled: i32) {}
+
     fn read_input_state(&mut self, _descriptor: i32) -> i32 {
         0
     }
@@ -8510,9 +8532,13 @@ impl Vm {
             (0x81, 0x10) => {
                 let replacement = self.pop_int()?;
                 let index = self.pop_int()?;
+                // sub_497B40 rejects a descriptor >= 0x100 with a fatal error.
                 if !(0..256).contains(&index) {
-                    Value::Int(0)
+                    return Err(VmError::Runtime(format!(
+                        "Sys81:10 input descriptor {index} is out of range"
+                    )));
                 } else {
+                    api.swap_input_repeat_flag(index, replacement);
                     let mut state = self
                         .system81_shared
                         .lock()
@@ -8534,6 +8560,7 @@ impl Vm {
             }
             (0x81, 0x14) => {
                 let enabled = self.pop_int()?;
+                api.set_background_key_polling(enabled);
                 self.system81_shared
                     .lock()
                     .expect("system81 state poisoned")
@@ -9590,7 +9617,7 @@ impl Vm {
             (0x80, 0x0f) => Value::Int(i32::from(api.window_active())),
             (0x80, 0x11) => {
                 let descriptor = self.pop_int()?;
-                Value::Int(i32::from(api.read_input_state(descriptor) != 0))
+                Value::Int(i32::from(api.query_key_held(descriptor)))
             }
             (0x80, 0x12) => {
                 // Target 0x00488040 treats the argument as a contiguous,

@@ -86,6 +86,17 @@ impl Vm {
                 let class_mask = call.pop_i32("class_mask")?;
                 call.require_consumed()?;
                 let descriptors = self.read_zero_terminated_input_descriptors(descriptor_ptr)?;
+                // sub_46DFA0 accepts only these mutable class lists; anything
+                // else is a script error in sub_4881C0.
+                const MUTABLE_CLASSES: [u32; 10] = [
+                    0x40, 0x80, 0x100, 0x200, 0x1000, 0x2000, 0x4000, 0x8000, 0x4000_0000,
+                    0x8000_0000,
+                ];
+                if !MUTABLE_CLASSES.contains(&(class_mask as u32)) {
+                    return Err(VmError::Runtime(format!(
+                        "Sys80_1B input class {class_mask:#x} cannot be redefined"
+                    )));
+                }
                 api.register_input_class_descriptors(class_mask, &descriptors);
                 Ok(Some(Value::None))
             }

@@ -3,7 +3,6 @@ use ethornell_vm::SysApi;
 
 #[derive(Default)]
 pub(super) struct NativeSystemState {
-    input_mapping_mode: i32,
     pub(super) main_loop_wait_override: i32,
     pub(super) drag_drop_enabled: bool,
     pub(super) fullscreen_hotkeys_enabled: bool,
@@ -21,6 +20,13 @@ pub(super) struct NativeSystemState {
     pub(super) restart_error_message: String,
 }
 
+impl NativeSystemState {
+    /// Sys80:1E mouse-button mapping mode (dword_56691C, sub_48EE70).
+    pub(super) fn mouse_button_mapping_mode(&self) -> i32 {
+        self.cursor_button_mode
+    }
+}
+
 impl RuntimeTraceApi {
     pub(super) fn dispatch_native_system(
         &mut self,
@@ -35,10 +41,6 @@ impl RuntimeTraceApi {
         let value = match id {
             // sub_49A240 is the WM_ACTIVATE/minimize latch.
             0x0E => ethornell_vm::Value::Int(i32::from(self.pending_window_minimize)),
-            0x10 => {
-                self.native_system.input_mapping_mode = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::None
-            }
             0x1D => {
                 let input_descriptor = pop_int_value(stack).unwrap_or_default();
                 let scope = pop_int_value(stack).unwrap_or_default();
