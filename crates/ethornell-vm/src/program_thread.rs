@@ -1,4 +1,4 @@
-use crate::{NativeOpcode, SysApi, Value, Vm, VmResult, native_call::opcodes};
+use crate::{NativeOpcode, SysApi, Value, Vm, VmError, VmResult, native_call::opcodes};
 use std::sync::Arc;
 
 impl Vm {
@@ -23,6 +23,16 @@ impl Vm {
                     .load_program(&archive, &file)
                     .unwrap_or_else(|| super::empty_loaded_program(format!("{archive}:{file}")));
                 self.assign_program_instance(&mut program);
+                // sub_444CE0 refuses an image that does not fit the code
+                // region; sub_488C00 turns that into a fatal error.
+                let size = Self::program_target_code_size(&program);
+                let used = self.module_chain_code_used();
+                if u64::from(size) + u64::from(used) > u64::from(self.thread.code_region_size()) {
+                    return Err(VmError::Runtime(format!(
+                        "cannot load {archive}:{file}: {size} bytes do not fit the code region ({used} of {} used)",
+                        self.thread.code_region_size()
+                    )));
+                }
                 Value::Int(self.append_target_loaded_program(program) as i32)
             }
             opcodes::SYS_FREE_LAST_PROGRAM_MODULE => {
@@ -46,6 +56,18 @@ impl Vm {
                     .load_program_ex(&archive, &file, &parameters)
                     .unwrap_or_else(|| super::empty_loaded_program(format!("{archive}:{file}")));
                 self.assign_program_instance(&mut program);
+                let region = |value: &Value| u32::try_from(value.as_i32()).unwrap_or(0);
+                let (data_bytes, code_bytes, slots) = (
+                    region(&parameters[0]),
+                    region(&parameters[1]),
+                    region(&parameters[2]),
+                );
+                let size = Self::program_target_code_size(&program);
+                if size > code_bytes {
+                    return Err(VmError::Runtime(format!(
+                        "cannot load {archive}:{file}: {size} bytes do not fit a {code_bytes}-byte code region"
+                    )));
+                }
                 let thread_id = self
                     .start_async_program_with_args(
                         Value::Program(Arc::new(program)),
@@ -53,6 +75,7 @@ impl Vm {
                         trace_events,
                     )
                     .unwrap_or(0);
+                self.set_newest_async_thread_regions(code_bytes, data_bytes, slots);
                 Value::Int(thread_id)
             }
             opcodes::SYS_CURRENT_THREAD_ID => Value::Int(self.thread.thread_id()),

@@ -14,6 +14,14 @@ pub(crate) struct AsyncProgramTask {
 }
 
 impl Vm {
+    /// Apply the region sizes `0x80:0x44` passed to the child thread that
+    /// `start_async_program_with_args` just created.
+    pub(crate) fn set_newest_async_thread_regions(&mut self, code: u32, data: u32, slots: u32) {
+        if let Some(task) = self.async_tasks.last_mut() {
+            task.vm.thread.set_region_sizes(code, data, slots);
+        }
+    }
+
     pub(crate) fn async_program_is_active(&self, program: Value) -> i32 {
         if matches!(program, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = program.as_i32();

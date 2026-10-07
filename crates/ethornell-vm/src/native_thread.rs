@@ -287,7 +287,11 @@ pub(crate) struct CThread {
 impl Default for CThread {
     fn default() -> Self {
         let mut native = CThreadLayout32::default();
+        // The main program thread is created by sub_48C990 with 4096 operand
+        // slots, a 0x80000-byte code region and a 0x40000-byte data region.
         native.operand_capacity = 4096;
+        native.code_region_size = 0x80000;
+        native.frame_region_size = 0x40000;
         native.status_flags = 0;
         Self {
             native,
@@ -311,6 +315,21 @@ impl CThread {
         self.native.code_used_end = 0;
         self.native.code_region_free_top = 0;
         self.native.frame_region_free_top = 0;
+    }
+
+    /// Region sizes a child thread is created with (`sub_4447C0`).
+    pub(crate) fn set_region_sizes(&mut self, code_bytes: u32, data_bytes: u32, operand_slots: u32) {
+        self.native.code_region_size = code_bytes;
+        self.native.frame_region_size = data_bytes;
+        self.native.operand_capacity = operand_slots;
+    }
+
+    pub(crate) fn code_region_size(&self) -> u32 {
+        self.native.code_region_size
+    }
+
+    pub(crate) fn data_region_size(&self) -> u32 {
+        self.native.frame_region_size
     }
 
     pub(crate) fn thread_id(&self) -> i32 {

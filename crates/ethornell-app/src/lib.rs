@@ -7885,6 +7885,7 @@ mod input_tests {
             ],
             labels: std::collections::HashMap::new(),
             warnings: Vec::new(),
+            module_size: 0,
         };
 
         assert_eq!(
@@ -15537,6 +15538,7 @@ fn empty_bp_program(name: String) -> ethornell_script::BpProgram {
         }],
         labels,
         warnings: vec!["generated empty program after runtime load failure".into()],
+        module_size: 0,
     }
 }
 

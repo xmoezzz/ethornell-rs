@@ -80,6 +80,10 @@ pub struct BpProgram {
     pub instructions: Vec<BpInstruction>,
     pub labels: HashMap<u32, usize>,
     pub warnings: Vec<String>,
+    /// Code length from the BP header (`a2[1]` of sub_465AB0): the number of
+    /// bytes the module occupies in a thread's code region, including data
+    /// that follows the last instruction. Zero when unknown.
+    pub module_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -782,6 +786,7 @@ pub fn disassemble_bp(buf: &[u8]) -> Vec<BpInstruction> {
 
 pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
     let range = detect_code_range(buf);
+    let module_size = declared_module_size(buf);
     let mut cursor = Cursor::new(&buf[range.start..range.end]);
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
@@ -926,7 +931,21 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
         instructions,
         labels,
         warnings,
+        module_size,
     }
+}
+
+/// Header `instr_size` of a BP image (`a2[1]` in sub_465AB0); zero for images
+/// without a consistent header.
+fn declared_module_size(buf: &[u8]) -> u32 {
+    if buf.len() >= 8 {
+        let header_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let instr_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        if header_size >= 8 && header_size + instr_size == buf.len() {
+            return instr_size as u32;
+        }
+    }
+    0
 }
 
 fn detect_code_range(buf: &[u8]) -> CodeRange {

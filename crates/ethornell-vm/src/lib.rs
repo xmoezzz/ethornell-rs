@@ -2053,6 +2053,7 @@ fn placeholder_loaded_program(
         }],
         labels,
         warnings: vec![warning.into()],
+        module_size: 0,
     }
 }
 
@@ -2722,6 +2723,7 @@ impl Vm {
             instructions: vec![instruction.clone()],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         });
         self.current_program = self.programs.len() - 1;
         self.pc = 0;
@@ -2906,6 +2908,14 @@ impl Vm {
             }
             BpOpcode::Known { name: "jmp", .. } => {
                 let dest = self.pop_int()? as u32;
+                if dest == 0 {
+                    // sub_473910 rejects a zero target before the range check.
+                    return Err(VmError::Runtime(format!(
+                        "jmp to null target at 0x{:08X} in {}",
+                        instruction.offset,
+                        self.program_name(program_index)
+                    )));
+                }
                 next_pc = self.jump_target_index(program_index, dest)?;
             }
             BpOpcode::Known { name: "jc", .. } => {
@@ -2977,16 +2987,12 @@ impl Vm {
                     offset,
                 } => {
                     if offset == 0 {
-                        if trace_events {
-                            tracing::info!(
-                                pc = self.pc,
-                                offset = format_args!("0x{:08X}", instruction.offset),
-                                dest_program = dest_program_index,
-                                "VM null function call ignored"
-                            );
-                        }
-                        self.pc = next_pc;
-                        return Ok(());
+                        // sub_473910: a zero jump/call target is a fatal error.
+                        return Err(VmError::Runtime(format!(
+                            "call to null target at 0x{:08X} in {}",
+                            instruction.offset,
+                            self.program_name(program_index)
+                        )));
                     }
                     if trace_events {
                         tracing::info!(
@@ -3037,15 +3043,11 @@ impl Vm {
                 value => {
                     let dest = value.as_i32() as u32;
                     if dest == 0 {
-                        if trace_events {
-                            tracing::info!(
-                                pc = self.pc,
-                                offset = format_args!("0x{:08X}", instruction.offset),
-                                "VM null call ignored"
-                            );
-                        }
-                        self.pc = next_pc;
-                        return Ok(());
+                        return Err(VmError::Runtime(format!(
+                            "call to null target at 0x{:08X} in {}",
+                            instruction.offset,
+                            self.program_name(program_index)
+                        )));
                     }
                     let (dest_program_index, parser_offset) =
                         self.resolve_indirect_call_target(program_index, dest);
@@ -6294,6 +6296,9 @@ impl Vm {
     }
 
     fn program_target_code_size(program: &BpProgram) -> u32 {
+        if program.module_size != 0 {
+            return program.module_size;
+        }
         let start = Self::program_parser_code_start(program);
         program
             .instructions
@@ -6321,6 +6326,26 @@ impl Vm {
             })
             .max()
             .unwrap_or_default()
+    }
+
+    /// `CThread+0x38` (`code_used`): the initial module plus every module
+    /// appended by `0x80:0x40`, in the strict LIFO chain sub_444CE0 keeps.
+    /// Programs started by other means (for example `0xFF script_load`) do not
+    /// occupy the thread's code region.
+    pub(crate) fn module_chain_code_used(&self) -> u32 {
+        let initial = if self.target_loaded_programs.contains(&0) {
+            0
+        } else {
+            self.programs
+                .first()
+                .map(Self::program_target_code_size)
+                .unwrap_or_default()
+        };
+        self.target_loaded_programs
+            .iter()
+            .filter_map(|index| self.programs.get(*index))
+            .map(Self::program_target_code_size)
+            .fold(initial, u32::saturating_add)
     }
 
     fn sync_thread_program_region(&mut self) {
@@ -12909,6 +12934,7 @@ mod tests {
             instructions,
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -12954,6 +12980,32 @@ mod tests {
         ]);
         assert_eq!(report.stop_reason, VmStopReason::Completed);
         assert_eq!(vm.stack, [Value::Int(1)]);
+    }
+
+    #[test]
+    fn call_and_jmp_reject_a_null_target_like_the_target() {
+        for opcode in [(0x16u8, "call"), (0x14, "jmp")] {
+            let (report, _vm) = run_stack_program(vec![
+                push_dword(0, 0),
+                test_instruction(5, opcode.0, opcode.1, vec![opcode.0], Vec::new()),
+                test_instruction(6, 0x17, "ret", vec![0x17], Vec::new()),
+            ]);
+            assert!(
+                !matches!(report.stop_reason, VmStopReason::Completed),
+                "{} to 0 must not complete",
+                opcode.1
+            );
+        }
+    }
+
+    #[test]
+    fn ret_with_an_empty_data_stack_ends_the_program() {
+        let (report, vm) = run_stack_program(vec![
+            test_instruction(0, 0x17, "ret", vec![0x17], Vec::new()),
+            push_dword(1, 7),
+        ]);
+        assert_eq!(report.stop_reason, VmStopReason::Completed);
+        assert!(vm.stack.is_empty());
     }
 
     fn install_wait_timing_ex(vm: &mut Vm, duration_ms: i32, input_enabled: i32, input_scope: i32) {
@@ -13028,6 +13080,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut vm = Vm::new();
         let mut api = SchedulingApi::default();
@@ -13065,6 +13118,7 @@ mod tests {
             )],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let options = VmRunOptions {
             max_steps: 100,
@@ -13102,6 +13156,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let options = VmRunOptions {
             max_steps: 100,
@@ -13144,6 +13199,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let options = VmRunOptions {
             max_steps: 100,
@@ -13189,6 +13245,7 @@ mod tests {
             ],
             labels: [(0x10, 0)].into_iter().collect(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut vm = Vm::new();
         let mut api = SchedulingApi::default();
@@ -13248,6 +13305,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -13764,6 +13822,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             window_valid_region: Some([11, 22, 333, 444]),
@@ -13802,6 +13861,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -13843,6 +13903,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -13909,6 +13970,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -13950,6 +14012,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             bitmap_pixel: Some([0x11, 0x22, 0x33, 0x44]),
@@ -14070,6 +14133,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             movie_position: Some(12_345),
@@ -14111,6 +14175,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -14156,6 +14221,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             graph_input_object: Some(i32::from(object)),
@@ -14204,6 +14270,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             graph_input_object: Some(i32::from(object)),
@@ -14262,6 +14329,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -14295,6 +14363,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -14431,6 +14500,7 @@ mod tests {
             ],
             labels: std::iter::once((0x10, 0)).collect(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let main = BpProgram {
             script_name: Some("mediation-main".into()),
@@ -14517,6 +14587,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = MediationApi { program: mediation };
         let mut vm = Vm::new();
@@ -14954,6 +15025,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -14994,6 +15066,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi {
             bgm_state: Some((0, 9)),
@@ -15056,6 +15129,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -15099,6 +15173,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -15151,6 +15226,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -15217,6 +15293,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let options = VmRunOptions {
             max_steps: 100,
@@ -15264,6 +15341,7 @@ mod tests {
             ],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut api = SchedulingApi::default();
         let mut vm = Vm::new();
@@ -15682,6 +15760,7 @@ mod tests {
             )],
             labels: Default::default(),
             warnings: Vec::new(),
+            module_size: 0,
         };
         let mut vm = Vm::new();
         vm.start(&program);
