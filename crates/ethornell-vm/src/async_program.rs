@@ -52,8 +52,7 @@ impl Vm {
         vm.memory[..shared_end].copy_from_slice(&self.memory[..shared_end]);
         vm.mem_values = self
             .mem_values
-            .iter()
-            .filter(|(addr, _)| **addr < LOCAL_MEMORY_BASE)
+            .range(..LOCAL_MEMORY_BASE)
             .map(|(addr, value)| (*addr, value.clone()))
             .collect();
         vm.heap_ptr = self.heap_ptr;
@@ -527,13 +526,14 @@ impl Vm {
                 shared.bytes.resize(range.end, 0);
             }
             shared.bytes[range.clone()].copy_from_slice(&self.memory[range.clone()]);
+            let value_range = range.start as u32..range.end as u32;
             shared
                 .values
-                .retain(|addr, _| !range.contains(&(*addr as usize)));
+                .extract_if(value_range.clone(), |_, _| true)
+                .for_each(drop);
             shared.values.extend(
                 self.mem_values
-                    .iter()
-                    .filter(|(addr, _)| range.contains(&(**addr as usize)))
+                    .range(value_range)
                     .map(|(addr, value)| (*addr, value.clone())),
             );
             shared
@@ -551,10 +551,11 @@ impl Vm {
         if self.shared_heap_generation == shared.generation {
             return;
         }
-        let ranges = shared
+        let first = shared
             .journal
+            .partition_point(|entry| entry.generation <= self.shared_heap_generation);
+        let ranges = shared.journal[first..]
             .iter()
-            .filter(|entry| entry.generation > self.shared_heap_generation)
             .map(|entry| entry.range.clone())
             .collect::<Vec<_>>();
         for range in ranges {
@@ -562,13 +563,14 @@ impl Vm {
                 self.memory.resize(range.end, 0);
             }
             self.memory[range.clone()].copy_from_slice(&shared.bytes[range.clone()]);
+            let value_range = range.start as u32..range.end as u32;
             self.mem_values
-                .retain(|addr, _| !range.contains(&(*addr as usize)));
+                .extract_if(value_range.clone(), |_, _| true)
+                .for_each(drop);
             self.mem_values.extend(
                 shared
                     .values
-                    .iter()
-                    .filter(|(addr, _)| range.contains(&(**addr as usize)))
+                    .range(value_range)
                     .map(|(addr, value)| (*addr, value.clone())),
             );
         }
@@ -652,18 +654,17 @@ fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
     }
     destination.memory[..shared_end].copy_from_slice(&source.memory[..shared_end]);
 
-    let mut shared_values = std::collections::HashMap::new();
-    for (addr, value) in std::mem::take(&mut source.mem_values) {
-        if addr < LOCAL_MEMORY_BASE {
-            shared_values.insert(addr, value);
-        } else {
-            source.mem_values.insert(addr, value);
-        }
-    }
+    // Leave thread-local and heap shadows in place. Only the global segment
+    // moves with the active thread; heap shadows use the dirty-range journal.
     destination
         .mem_values
-        .retain(|addr, _| *addr >= LOCAL_MEMORY_BASE);
-    destination.mem_values.extend(shared_values);
+        .extract_if(..LOCAL_MEMORY_BASE, |_, _| true)
+        .for_each(drop);
+    destination.mem_values.extend(
+        source
+            .mem_values
+            .extract_if(..LOCAL_MEMORY_BASE, |_, _| true),
+    );
 
     std::mem::swap(&mut source.heap_ptr, &mut destination.heap_ptr);
     std::mem::swap(
@@ -824,6 +825,64 @@ fn read_u32(memory: &[u8], addr: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_transfer_replaces_globals_but_preserves_local_and_heap_values() {
+        let mut root = Vm::new();
+        let mut task = Vm::new();
+        for (vm, label) in [(&mut root, "root"), (&mut task, "task")] {
+            for addr in [
+                LOCAL_MEMORY_BASE - 1,
+                LOCAL_MEMORY_BASE,
+                crate::HEAP_MEMORY_BASE as u32,
+            ] {
+                vm.mem_values.insert(addr, Value::Str(label.into()));
+            }
+        }
+        task.mem_values.insert(4, Value::Str("stale".into()));
+
+        transfer_async_shared_state(&mut root, &mut task);
+        assert!(!root.mem_values.contains_key(&(LOCAL_MEMORY_BASE - 1)));
+        assert!(!task.mem_values.contains_key(&4));
+        assert_eq!(
+            task.mem_values[&(LOCAL_MEMORY_BASE - 1)],
+            Value::Str("root".into())
+        );
+        for addr in [LOCAL_MEMORY_BASE, crate::HEAP_MEMORY_BASE as u32] {
+            assert_eq!(root.mem_values[&addr], Value::Str("root".into()));
+            assert_eq!(task.mem_values[&addr], Value::Str("task".into()));
+        }
+        transfer_async_shared_state(&mut task, &mut root);
+        assert_eq!(
+            root.mem_values[&(LOCAL_MEMORY_BASE - 1)],
+            Value::Str("root".into())
+        );
+    }
+
+    #[test]
+    fn heap_sync_applies_all_ranges_in_each_unseen_generation() {
+        let mut root = Vm::new();
+        let mut task = Vm::new();
+        task.shared_heap = Arc::clone(&root.shared_heap);
+        let ptr = root.alloc_heap(32);
+        root.write_value(ptr, 2, &Value::Str("first".into()))
+            .unwrap();
+        root.write_value(ptr + 16, 2, &Value::Str("second".into()))
+            .unwrap();
+        root.flush_shared_heap();
+        task.sync_shared_heap();
+        assert_eq!(task.mem_values, root.mem_values);
+
+        root.write_c_string_raw(ptr, "raw").unwrap();
+        root.write_value(ptr + 16, 2, &Value::Str("updated".into()))
+            .unwrap();
+        root.flush_shared_heap();
+        task.sync_shared_heap();
+        assert_eq!(task.read_c_string(ptr).unwrap(), "raw");
+        assert_eq!(task.mem_values, root.mem_values);
+        task.sync_shared_heap();
+        assert_eq!(task.mem_values, root.mem_values);
+    }
 
     #[test]
     fn async_state_transfer_keeps_heap_ownership_with_the_active_thread() {

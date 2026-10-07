@@ -654,7 +654,7 @@ impl RuntimeTraceApi {
         {
             handle
         } else {
-            self.graph_active_input_handle = 0;
+            self.finish_graph_knob_drag();
             0
         }
     }

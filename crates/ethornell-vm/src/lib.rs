@@ -597,6 +597,8 @@ pub trait SysApi {
 
     fn configure_screen_size(&mut self, _width: i32, _height: i32) {}
 
+    fn register_display_mode(&mut self, _index: usize, _width: i32, _height: i32) {}
+
     fn set_window_monitor_adapter_mode(&mut self, mode: i32) -> bool {
         (0..=1).contains(&mode)
     }
@@ -2075,7 +2077,9 @@ pub struct Vm {
     target_loaded_programs: Vec<usize>,
     pub current_program: usize,
     pub memory: Vec<u8>,
-    pub mem_values: HashMap<u32, Value>,
+    // Native writes and thread transfers operate on address ranges. Keep the
+    // shadow values ordered so a small write does not scan every scene record.
+    pub mem_values: BTreeMap<u32, Value>,
     pub mem_ptr: u32,
     pub heap_ptr: u32,
     heap_allocations: BTreeMap<u32, u32>,
@@ -2157,7 +2161,7 @@ pub struct Vm {
 #[derive(Debug, Default)]
 struct SharedHeapState {
     bytes: Vec<u8>,
-    values: HashMap<u32, Value>,
+    values: BTreeMap<u32, Value>,
     generation: u64,
     journal: Vec<SharedHeapJournalEntry>,
 }
@@ -8797,6 +8801,7 @@ impl Vm {
                     2
                 } else {
                     self.display_mode_slots[index as usize] = Some((first, second));
+                    api.register_display_mode(index as usize, first, second);
                     0
                 };
                 Value::Int(status)

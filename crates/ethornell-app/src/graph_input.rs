@@ -163,6 +163,16 @@ impl RuntimeGraphInputObject {
         self.current_selections.get(&group).copied() == Some(index)
     }
 
+    /// Root+0x0C/+0x10 enable sampling the owning Window's input scope.
+    /// With both clear, only the separate live-item Virtual scope is sampled.
+    /// amachoco.exe sub_451720 copies these to DCIPIcon+0x40/+0x44;
+    /// sub_44F2E0 skips the Window query when both are zero. In particular,
+    /// an icon toolbar's empty rectangle must not consume dialogue clicks.
+    pub(crate) fn samples_window_pointer_input(&self) -> bool {
+        self.descriptor.pointer_processing_enabled
+            && (self.descriptor.flags[0] != 0 || self.descriptor.flags[1] != 0)
+    }
+
     /// Graph91:BB reaches sub_44B460 -> sub_42C060 -> CDspObj::SetEnabled on
     /// the materialized child Sprite. Unmentioned items keep the constructor
     /// default enabled=1.
