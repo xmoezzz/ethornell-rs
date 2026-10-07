@@ -10819,7 +10819,6 @@ impl Vm {
             // in the target graph object.
             (0x90, 0x89) => &[1],
             (0x90, 0x90) => &[4],
-            (0x90, 0x56) => &[0, 3],
             // sub_4844F0/sub_484650 consume the text pointer at these exact
             // stack positions. sub_484C40 has two independent text inputs.
             (0x91, 0x91) => &[3],

@@ -2042,6 +2042,37 @@ impl RuntimeTraceApi {
         }
     }
 
+    /// The argument checks every Graph90 sprite-configure handler runs before
+    /// its helper: priority < 0x10000 (sub_497BB0), alpha <= 0x100
+    /// (sub_497DB0), a known blit mode (sub_497C40) and bitmap handles below
+    /// 0x4000 (sub_497B60). Each failure is a script error.
+    pub(super) fn graph90_validate_sprite_arguments(
+        selector: u16,
+        priority: i32,
+        alpha: i32,
+        blend_mode: i32,
+        bitmaps: &[i32],
+    ) -> std::result::Result<(), ethornell_vm::VmError> {
+        let fail = |what: String| {
+            Err(ethornell_vm::VmError::Runtime(format!("Graph90:{selector:02X} {what}")))
+        };
+        if priority as u32 >= 0x1_0000 {
+            return fail(format!("priority {priority} is out of range"));
+        }
+        if alpha as u32 > 0x100 {
+            return fail(format!("alpha {alpha} exceeds 256"));
+        }
+        if !matches!(blend_mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xC0 | 0xC1 | 0xF0 | 0xFF) {
+            return fail(format!("blend mode {blend_mode:#x} is invalid"));
+        }
+        for bitmap in bitmaps {
+            if *bitmap as u32 >= 0x4000 {
+                return fail(format!("bitmap handle {bitmap} is out of range"));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn graph90_set_common_state(
         &mut self,
         object: i32,
@@ -2050,20 +2081,16 @@ impl RuntimeTraceApi {
         alpha_parameter: Option<i32>,
         priority: Option<i32>,
     ) {
+        // The configure helpers (e.g. sub_426F50) call vtable+44 SetPosition
+        // (sub_41B1B0 -> sub_41B1D0, propagating to member children), then
+        // sub_41B600 (blit mode +0xA8), SetAlpha and SetPriority.
         if let Some((x, y)) = position {
-            {
-                let properties = self.graph_object_properties.entry(object).or_default();
-                properties.native.position_x = x;
-                properties.native.position_y = y;
-            }
-            self.display_tree
-                .set_local_position(object, x as f32, y as f32);
+            self.graph90_set_position_recursive(object, x, y);
         }
         if let Some(blend_mode) = blend_mode {
-            self.graph_object_properties
-                .entry(object)
-                .or_default()
-                .blend_mode = blend_mode;
+            let properties = self.graph_object_properties.entry(object).or_default();
+            properties.blend_mode = blend_mode;
+            properties.native.blend_mode = blend_mode;
         }
         if let Some(alpha_parameter) = alpha_parameter {
             self.set_graph_object_alpha_recursive(object, alpha_parameter);
@@ -2790,15 +2817,32 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             (0x90, 0x56) => {
+                // sub_47C2D0 pops priority, alpha, blend mode, bitmap, y, x,
+                // sprite; sub_43E690 refuses a missing sprite or bitmap.
                 let args = Self::graph90_source_args(stack, 7);
-                if args.len() == 7
-                    && self.graph90_object_matches(
-                        args[0],
-                        GRAPH90_SPRITE_TAG,
-                        512,
-                        GRAPH90_CLASS_SPRITE,
-                    )
-                    && self.resource_image_region(args[3]).is_some()
+                if args.len() != 7 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:56 expected seven arguments".into(),
+                    )));
+                }
+                if let Err(error) =
+                    Self::graph90_validate_sprite_arguments(id, args[6], args[5], args[4], &[args[3]])
+                {
+                    return Some(Err(error));
+                }
+                if !self.graph90_object_matches(args[0], GRAPH90_SPRITE_TAG, 512, GRAPH90_CLASS_SPRITE)
+                {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:56 #{} is not a sprite object",
+                        args[0]
+                    ))));
+                }
+                if self.resource_image_region(args[3]).is_none() {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:56 bitmap {} does not exist",
+                        args[3]
+                    ))));
+                }
                 {
                     self.graph90_begin_sprite_configuration(args[0], 0);
                     self.graph90_set_common_state(

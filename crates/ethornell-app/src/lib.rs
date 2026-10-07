@@ -8976,7 +8976,7 @@ mod input_tests {
         let mut api = super::RuntimeTraceApi::new(manager);
         api.scenario_bootstrapped = true;
 
-        for (bitmap, byte) in [(30_101, 0x44u8), (30_102, 0x99u8)] {
+        for (bitmap, byte) in [(3_101, 0x44u8), (3_102, 0x99u8)] {
             api.store_runtime_bitmap(
                 bitmap,
                 DecodedImage {
@@ -8995,7 +8995,7 @@ mod input_tests {
             Value::Int(sprite),
             Value::Int(0),
             Value::Int(0),
-            Value::Int(30_101),
+            Value::Int(3_101),
             Value::Int(1),
             Value::Int(0),
             Value::Int(2176),
@@ -9022,7 +9022,7 @@ mod input_tests {
         assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&false));
         assert!(!api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
 
-        let mut replace = vec![Value::Int(sprite), Value::Int(30_102)];
+        let mut replace = vec![Value::Int(sprite), Value::Int(3_102)];
         call_graph(&mut api, 0x90, 0x57, &mut replace).unwrap();
         assert!(
             api.graph_layers[&sprite].enabled,
@@ -9045,7 +9045,7 @@ mod input_tests {
         // RuntimeGraphLayer::enabled.
         let mut object_hide = vec![Value::Int(sprite), Value::Int(0)];
         call_graph(&mut api, 0x90, 0x31, &mut object_hide).unwrap();
-        let mut replace_hidden = vec![Value::Int(sprite), Value::Int(30_101)];
+        let mut replace_hidden = vec![Value::Int(sprite), Value::Int(3_101)];
         call_graph(&mut api, 0x90, 0x57, &mut replace_hidden).unwrap();
         assert!(api.graph_layers[&sprite].enabled);
         assert!(!api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
@@ -11031,6 +11031,10 @@ mod input_tests {
             api.graph_object_properties[&sprite].format_resource,
             Some(bitmap)
         );
+        // The draw gate starts cleared (sub_41A400); Graph90:54 opens it.
+        assert!(api.graph_draw_items().is_empty());
+        let mut draw = vec![Value::Int(sprite), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x54, &mut draw).unwrap();
         assert_eq!(api.graph_draw_items().len(), 1);
     }
 
@@ -11149,6 +11153,10 @@ mod input_tests {
             Value::Int(1840),
         ];
         call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        // CDspObj::CDspObj (sub_41A400) clears the draw gate; scripts enable
+        // it with Graph90:54 after configuring.
+        let mut draw = vec![Value::Int(sprite), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x54, &mut draw).unwrap();
 
         let items = api.graph_draw_items();
         assert_eq!(items.len(), 1);

@@ -16916,7 +16916,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C2D0/sub_462370 -> sub_43E690/sub_426F50 configures sprite mode 0 with one bitmap and common display state. sub_427410 rebuilds the mode first and writes Sprite+0x244=-1 before sub_426F50 invokes virtual SetAlpha, so the supplied alpha_parameter always becomes base CDspObj transparency rather than being routed through a stale mode-1 transition selector. Title fade-in calls use alpha_parameter=256 as an already-invisible initial state before their later control animates transparency toward zero.",
+        notes: "sub_47C2D0 pops priority (< 0x10000), alpha (<= 0x100), blit mode (sub_497C40 list), bitmap (< 0x4000), y, x, sprite; sub_43E690 refuses a missing sprite or bitmap (script errors), sub_427410 drops the previous mode's data and binds the bitmap as mode 0, then SetPosition (recursive), blit mode +0xA8, SetAlpha (recursive) and SetPriority.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
@@ -20899,6 +20899,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_SET_MOUSE_BUTTON_MAPPING_MODE,
     opcodes::GRAPH90_LOAD_BITMAP,
     opcodes::GRAPH90_CREATE_BITMAP_REGION,
+    opcodes::GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21056,7 +21057,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
-    opcodes::GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP,
     opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SCALED_BITMAP,
