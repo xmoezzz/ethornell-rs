@@ -5791,8 +5791,17 @@ impl Vm {
                 // sub_431AF0 sets CProcedure+0x10 after every non-empty drain;
                 // CProcWaitTimingEx's code-1 handler additionally sets +0x28.
                 let cancelled = !callbacks.is_empty();
+                // sub_43D430: sub_46DF00((scope << 16) | 0xFFFF) filtered by
+                // dword_507690 | 0x80000181.
+                let aux_mask = self
+                    .system81_shared
+                    .lock()
+                    .expect("system81 state poisoned")
+                    .message_auxiliary_input_mask as u32;
                 let input_interrupted = procedure.input_enabled()
-                    && api.query_input_event_bits(procedure.input_scope()) != 0;
+                    && (api.query_input_event_bits(procedure.input_scope()) as u32
+                        & (aux_mask | 0x8000_0181))
+                        != 0;
                 let now_tick = self.timing.tick_count().max(0) as u32;
                 let deadline_reached = now_tick >= procedure.native.base.deadline_tick;
                 if !cancelled && !callback_completed && !input_interrupted && !deadline_reached {
