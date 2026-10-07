@@ -1,9 +1,10 @@
 use super::{NATIVE_DISPLAY_Z, RuntimeTraceApi, value_to_i32};
 use crate::display_tree::NativeDisplayKind;
 use crate::graph::{RuntimeGraphLayer, RuntimeUserControl};
+use crate::ruby_registry::RubyRegistry;
 use crate::text_anim::{
-    ParsedMessageMarkup, RuntimeRubySpan, RuntimeTextStyleSpan, normalize_message_text,
-    parse_message_markup_styled,
+    ParsedMessageMarkup, RuntimeLinkSpan, RuntimeRubySpan, RuntimeTextStyleSpan,
+    RuntimeTimelineMark, normalize_message_text, parse_message_markup_with,
 };
 use std::collections::BTreeMap;
 
@@ -778,15 +779,10 @@ impl RuntimeTraceApi {
             node.line_height = self.text_state.line_height.max(node.size);
             node.formatted_layout = true;
         }
-        let parsed = parse_and_wrap_styled_message(&text, &self.text_state);
+        let parsed = self.parse_message_with_registry(&text, &self.text_state.clone());
         self.text_runtime
             .set_glyph_delay_ms(self.graph_defaults.text_animation.glyph_delay_ms);
-        self.text_runtime.start_styled_message(
-            parsed.text,
-            parsed.ruby_spans,
-            parsed.style_spans,
-            target,
-        );
+        self.text_runtime.start_styled_message(parsed, target);
         self.apply_text_to_node(target, String::new());
         tracing::info!(target, text = %normalize_message_text(&text), "ScenarioMessage");
         self.trace_graph(format!(
@@ -825,13 +821,36 @@ impl RuntimeTraceApi {
         }
     }
 
+    /// Parse and wrap one message against the process-wide ruby registry.
+    ///
+    /// The target's layout (`sub_435290`) resets the `<l>` fragment table at
+    /// its start and refills it as it runs, so every parse replaces the
+    /// records `92:9E` drains.
+    fn parse_message_with_registry(
+        &mut self,
+        text: &str,
+        state: &TextState,
+    ) -> ParsedMessageMarkup {
+        // `92:9F` stores dword_507650; -1 leaves link glyphs uncoloured.
+        let link_color = (self.system92_text_render_override != -1)
+            .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
+        let parsed = parse_and_wrap_with_registry(
+            text,
+            state,
+            &mut self.graph_defaults.ruby_registry,
+            link_color,
+        );
+        self.system92_text_fragment_records = link_fragment_records(&parsed, state);
+        parsed
+    }
+
     pub(crate) fn start_native_message(
         &mut self,
         text: String,
         target_surface: Option<i32>,
     ) -> i32 {
         let state = self.window_text_state(target_surface);
-        let parsed = parse_and_wrap_styled_message(&text, &state);
+        let parsed = self.parse_message_with_registry(&text, &state);
         // The target wrapper installs CProcDspMsg even for an empty or
         // control-only string. In particular, a lone 0x0A is a zero-delay
         // layout control, not a synthetic one-glyph message.
@@ -854,12 +873,8 @@ impl RuntimeTraceApi {
         }
         self.text_runtime
             .set_glyph_delay_ms(self.graph_defaults.text_animation.glyph_delay_ms);
-        self.text_runtime.start_styled_message(
-            parsed.text.clone(),
-            parsed.ruby_spans,
-            parsed.style_spans,
-            target,
-        );
+        let message_text = parsed.text.clone();
+        self.text_runtime.start_styled_message(parsed, target);
         // Graph90:9B is owned by CProcDspMsg (+0x44/+0x48).  Do not also
         // delay the glyph runtime: doing so applies the native procedure
         // wait twice and incorrectly postpones typewriter reveal.
@@ -869,7 +884,7 @@ impl RuntimeTraceApi {
         // text-surface reset.  Treating a control-only Graph92:90 invocation
         // as a new visible string makes the completed sentence disappear as
         // soon as the following newline/wait record starts.
-        let has_visible_glyph = parsed.text.chars().any(|ch| ch != '\n');
+        let has_visible_glyph = message_text.chars().any(|ch| ch != '\n');
         let initial_visible_text = self.text_runtime.current_visible_text();
         if let Some(node) = self.text_nodes.get_mut(&target) {
             if has_visible_glyph {
@@ -879,10 +894,10 @@ impl RuntimeTraceApi {
         }
         self.native_message_active = true;
         let duration_ms = self.text_runtime.duration_ms();
-        tracing::info!(target, duration_ms, text = %parsed.text, "NativeMessage");
+        tracing::info!(target, duration_ms, text = %message_text, "NativeMessage");
         self.trace_graph(format!(
             "native message node #{target} duration={duration_ms}ms {:?}",
-            parsed.text
+            message_text
         ));
         duration_ms
     }
@@ -967,7 +982,7 @@ impl RuntimeTraceApi {
         self.ensure_message_window_layer();
         self.ensure_message_control_layers();
         let target = self.ensure_message_text_node();
-        let parsed = parse_and_wrap_styled_message(text, &self.text_state);
+        let parsed = self.parse_message_with_registry(text, &self.text_state.clone());
         self.apply_text_to_node(target, parsed.text);
         if let Some(node) = self.text_nodes.get_mut(&target) {
             node.line_height = self.text_state.line_height.max(node.size);
@@ -995,6 +1010,15 @@ impl RuntimeTraceApi {
             self.apply_text_to_node(target, text);
             self.apply_visible_ruby_to_node(target);
             self.apply_visible_styles_to_node(target);
+        }
+        self.post_message_timeline_events();
+    }
+
+    /// `<ev N>` records enqueue host event `0x30000001` (`sub_496540`), which
+    /// scripts read back through the system event queue (`80:A0`).
+    fn post_message_timeline_events(&mut self) {
+        for event in self.text_runtime.take_fired_events() {
+            self.queued_system_events.push_back(event);
         }
     }
 
@@ -1125,6 +1149,7 @@ impl RuntimeTraceApi {
             self.apply_visible_styles_to_node(target);
             self.trace_graph(format!("message node #{target} reveal all"));
         }
+        self.post_message_timeline_events();
     }
 
     fn ensure_message_text_node(&mut self) -> i32 {
@@ -1578,7 +1603,19 @@ pub(crate) fn parse_and_wrap_message(
 }
 
 pub(crate) fn parse_and_wrap_styled_message(text: &str, state: &TextState) -> ParsedMessageMarkup {
-    let parsed = parse_message_markup_styled(text);
+    parse_and_wrap_with_registry(text, state, &mut RubyRegistry::default(), None)
+}
+
+/// Parse message markup against the process-wide ruby registry, then wrap.
+/// Every character index the parser produced is remapped through the wrap so
+/// ruby, style, link and timeline records stay attached to their glyphs.
+pub(crate) fn parse_and_wrap_with_registry(
+    text: &str,
+    state: &TextState,
+    registry: &mut RubyRegistry,
+    link_color: Option<u32>,
+) -> ParsedMessageMarkup {
+    let parsed = parse_message_markup_with(text, registry, link_color);
     let (wrapped, map) = wrap_text_to_state_with_map(&parsed.text, &parsed.ruby_spans, state);
     let ruby_spans = parsed
         .ruby_spans
@@ -1604,11 +1641,74 @@ pub(crate) fn parse_and_wrap_styled_message(text: &str, state: &TextState) -> Pa
             })
         })
         .collect();
+    let link_spans = parsed
+        .link_spans
+        .into_iter()
+        .filter_map(|span| {
+            Some(RuntimeLinkSpan {
+                start_char: *map.get(span.start_char)?,
+                end_char: *map.get(span.end_char)?,
+                text: span.text,
+            })
+        })
+        .collect();
+    let remap = |at_char: usize| map.get(at_char).copied().unwrap_or(wrapped.chars().count());
+    let timeline = parsed
+        .timeline
+        .into_iter()
+        .map(|mark| match mark {
+            RuntimeTimelineMark::SetTime { at_char, units } => RuntimeTimelineMark::SetTime {
+                at_char: remap(at_char),
+                units,
+            },
+            RuntimeTimelineMark::Event {
+                at_char,
+                ordinal,
+                id,
+            } => RuntimeTimelineMark::Event {
+                at_char: remap(at_char),
+                ordinal,
+                id,
+            },
+        })
+        .collect();
     ParsedMessageMarkup {
         text: wrapped,
         ruby_spans,
         style_spans,
+        link_spans,
+        timeline,
     }
+}
+
+/// Fragment records for `92:9E`. Position is estimated from the portable wrap
+/// model (row and per-character advance); the target records the exact cursor.
+fn link_fragment_records(
+    parsed: &ParsedMessageMarkup,
+    state: &TextState,
+) -> Vec<ethornell_vm::System92TextFragmentRecord> {
+    let chars = parsed.text.chars().collect::<Vec<_>>();
+    parsed
+        .link_spans
+        .iter()
+        .map(|span| {
+            let before = &chars[..span.start_char.min(chars.len())];
+            let row = before.iter().filter(|&&ch| ch == '\n').count();
+            let line_start = before
+                .iter()
+                .rposition(|&ch| ch == '\n')
+                .map_or(0, |index| index + 1);
+            let advance: f32 = before[line_start..]
+                .iter()
+                .map(|&ch| wrap_char_units(ch) * state.font_size)
+                .sum();
+            ethornell_vm::System92TextFragmentRecord {
+                text: span.text.clone(),
+                x: (state.x + advance).round() as i32,
+                y: (state.y + row as f32 * state.line_height).round() as i32,
+            }
+        })
+        .collect()
 }
 
 fn wrap_text_to_state_with_map(
@@ -1762,8 +1862,11 @@ fn value_to_text_string(value: &ethornell_vm::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TextState, parse_and_wrap_message, parse_and_wrap_styled_message, wrap_text_to_state,
+        TextState, link_fragment_records, parse_and_wrap_message, parse_and_wrap_styled_message,
+        parse_and_wrap_with_registry, wrap_text_to_state,
     };
+    use crate::ruby_registry::RubyRegistry;
+    use crate::text_anim::RuntimeTimelineMark;
 
     fn narrow_text_state() -> TextState {
         TextState {
@@ -1817,5 +1920,63 @@ mod tests {
             (7, 10)
         );
         assert!(parsed.style_spans[0].style.bold);
+    }
+
+    #[test]
+    fn registry_ruby_wraps_as_one_fragment_like_a_tag_ruby() {
+        let mut registry = RubyRegistry::default();
+        registry.register("辛壬", "しんじん", false);
+        let parsed = parse_and_wrap_with_registry(
+            "甲乙丙丁戊己庚辛壬癸",
+            &narrow_text_state(),
+            &mut registry,
+            None,
+        );
+        assert_eq!(parsed.text, "甲乙丙丁戊己庚\n辛壬癸");
+        assert_eq!(parsed.ruby_spans.len(), 1);
+        assert_eq!(
+            (
+                parsed.ruby_spans[0].start_char,
+                parsed.ruby_spans[0].end_char
+            ),
+            (8, 10)
+        );
+    }
+
+    #[test]
+    fn wrapping_remaps_link_and_timeline_records_across_inserted_newlines() {
+        let parsed = parse_and_wrap_with_registry(
+            "甲乙丙丁戊己庚<t 3><l>辛壬</l><ev 5>癸",
+            &narrow_text_state(),
+            &mut RubyRegistry::default(),
+            None,
+        );
+        assert_eq!(parsed.text, "甲乙丙丁戊己庚辛\n壬癸");
+        assert_eq!(
+            (
+                parsed.link_spans[0].start_char,
+                parsed.link_spans[0].end_char
+            ),
+            (7, 10)
+        );
+        assert_eq!(
+            parsed.timeline,
+            vec![
+                RuntimeTimelineMark::SetTime {
+                    at_char: 7,
+                    units: 3
+                },
+                RuntimeTimelineMark::Event {
+                    at_char: 10,
+                    ordinal: 0,
+                    id: 5
+                },
+            ]
+        );
+        let records = link_fragment_records(&parsed, &narrow_text_state());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "辛壬");
+        // Seven full-width glyphs at 15 px on the first row.
+        assert_eq!((records[0].x, records[0].y), (105, 0));
     }
 }

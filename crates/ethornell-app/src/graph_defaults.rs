@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use crate::ruby_registry::RubyRegistry;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SurfaceTextState {
@@ -205,7 +205,9 @@ pub(crate) struct GraphRuntimeDefaults {
     pub(crate) message_input_scope_value: i32,
     /// Target global `dword_565BAC` configured by 0x90:0x92.
     pub(crate) message_input_filter_enabled: bool,
-    text_substitutions: BTreeMap<String, String>,
+    /// Target ruby registry `unk_565BB4`, shared by `91:94/95/96`, the
+    /// `<r>`/`<ruby>` message tags and the message layout.
+    pub(crate) ruby_registry: RubyRegistry,
 }
 
 impl GraphRuntimeDefaults {
@@ -282,56 +284,22 @@ impl GraphRuntimeDefaults {
         replacement: Option<String>,
     ) {
         match (source.filter(|value| !value.is_empty()), replacement) {
-            (None, _) => self.text_substitutions.clear(),
+            (None, _) => self.ruby_registry.clear(),
             (Some(source), Some(replacement)) if !replacement.is_empty() => {
-                self.text_substitutions.insert(source, replacement);
+                self.ruby_registry.register(&source, &replacement, false);
             }
             (Some(source), _) => {
-                self.text_substitutions.remove(&source);
+                self.ruby_registry.remove(&source);
             }
         }
     }
 
-    pub(crate) fn collect_ruby_records(&self, text: &str) -> (String, i32) {
-        let mut records = String::new();
-        let mut matches = 0_i32;
-        let mut offset = 0;
-        while offset < text.len() {
-            let tail = &text[offset..];
-            let hit = self
-                .text_substitutions
-                .iter()
-                .filter(|(base, _)| tail.starts_with(base.as_str()))
-                .max_by_key(|(base, _)| base.len());
-            if let Some((base, reading)) = hit {
-                records.push_str(base);
-                records.push('\\');
-                records.push_str(reading);
-                records.push('\n');
-                matches = matches.saturating_add(1);
-                offset += base.len();
-            } else {
-                offset += tail.chars().next().map(char::len_utf8).unwrap_or(1);
-            }
-        }
-        (records, matches)
+    pub(crate) fn collect_ruby_records(&mut self, text: &str) -> (String, i32) {
+        self.ruby_registry.collect_records(text)
     }
 
     pub(crate) fn register_ruby_records(&mut self, records: &str) -> bool {
-        if records.is_empty() {
-            return true;
-        }
-        for line in records.lines() {
-            let Some((base, reading)) = line.split_once('\\') else {
-                return false;
-            };
-            if base.is_empty() || reading.is_empty() {
-                return false;
-            }
-            self.text_substitutions
-                .insert(base.to_string(), reading.to_string());
-        }
-        true
+        self.ruby_registry.register_records(records)
     }
 }
 

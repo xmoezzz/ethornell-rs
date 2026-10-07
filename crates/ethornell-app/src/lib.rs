@@ -46,6 +46,7 @@ mod native_system_ext;
 mod native_user;
 mod platform;
 mod resource_lookup;
+mod ruby_registry;
 mod runtime_frontend;
 mod scenario;
 mod scene;
@@ -805,7 +806,8 @@ impl RuntimeTraceApi {
             graph_defaults: GraphRuntimeDefaults::default(),
             system92_text_output_pair: [0, 0],
             system92_text_fragment_records: Vec::new(),
-            system92_text_render_override: 0,
+            // dword_507650 starts at -1: link glyphs keep the surrounding colour.
+            system92_text_render_override: -1,
             window_mode: 0,
             screen_width: 1280,
             screen_height: 720,
