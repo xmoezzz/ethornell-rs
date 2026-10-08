@@ -5919,12 +5919,19 @@ impl RuntimeTraceApi {
     }
 
     fn retain_surface_backing(&mut self, surface_id: i32, bitmap_id: i32) -> bool {
-        let Some(mut image) = self.graph_bitmap_image(bitmap_id) else {
+        let Some(source) = self.graph_bitmap_image(bitmap_id) else {
             return false;
         };
-        if let Some((width, height)) = self.bitmap_dimensions.get(&bitmap_id).copied() {
-            image = fit_decoded_image_canvas(&image, width, height);
-        }
+        // sub_42B2A0 clears the window's back bitmap (window size) and copies
+        // the source at (0, 0) with mode 128, clipped to the window.
+        let Some((width, height)) = self
+            .graph_surfaces
+            .get(&surface_id)
+            .map(|surface| (surface.width.max(1.0) as u32, surface.height.max(1.0) as u32))
+        else {
+            return false;
+        };
+        let image = fit_decoded_image_canvas(&source, width, height);
         let key = format!("runtime:surface:{surface_id}:backing");
         let dimensions = (image.width, image.height);
         self.store_graph_image(key.clone(), image);
@@ -21005,9 +21012,29 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let decoration_error_context = call.pop_i32("decoration_error_context")?;
                 let window = call.pop_i32("window")?;
                 call.require_consumed()?;
-                let retained = if !Self::is_window_surface_handle(window) {
-                    false
-                } else if source_bitmap == -1 {
+                // sub_47DD80 -> sub_440780 -> sub_42B2A0: missing window,
+                // a window without its own bitmap (+0x13C) and a missing
+                // source bitmap are script errors.
+                let Some((width, height)) = Self::is_window_surface_handle(window)
+                    .then(|| self.graph_surfaces.get(&window))
+                    .flatten()
+                    .map(|surface| (surface.width as u32, surface.height as u32))
+                else {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:86 #{window} is not a window object"
+                    )));
+                };
+                if width == 0 || height == 0 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:86 window #{window} has no bitmap"
+                    )));
+                }
+                if source_bitmap != -1 && self.graph_bitmap_image(source_bitmap).is_none() {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:86 bitmap {source_bitmap} does not exist ({decoration_error_context}, {frame_error_context})"
+                    )));
+                }
+                let retained = if source_bitmap == -1 {
                     self.graph_resources.remove(&window);
                     self.graph_surfaces.get_mut(&window).is_some_and(|surface| {
                         surface.resource_id = None;

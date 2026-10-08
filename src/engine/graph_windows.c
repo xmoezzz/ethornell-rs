@@ -185,3 +185,20 @@ int Graph90_85_ConfigureWindowObject(struct CThread *t)
         script_error("invalid window", t);
     return 0;
 }
+
+// sub_47DD80 -> sub_462990 -> sub_440780 -> sub_42B2A0. Script order
+// (window, ctx1, ctx2, bitmap); the two middle values only appear in the
+// error text. Missing window (255), a window without its own bitmap
+// (+0x13C == 0 -> 1) and a missing bitmap (2) are fatal. Bitmap -1 clears
+// the back bitmap (+0x164); otherwise it is cleared and the bitmap copied
+// in at (0, 0) with mode 128; then the window recomposes (sub_42B3B0).
+int Graph90_86_SetWindowBackgroundBitmap(struct CThread *t)
+{
+    uint32_t bitmap = pop(t), ctx2 = pop(t), ctx1 = pop(t), window = pop(t);
+    switch (window_set_back_bitmap(window, bitmap)) {
+    case 255: script_error("invalid window", t);
+    case 1:   script_error("window has no bitmap", t);     // byte_4E9B0C
+    case 2:   script_error("bitmap does not exist", t);    // byte_4E9B48 (ctx1, ctx2, bitmap)
+    }
+    return 0;
+}

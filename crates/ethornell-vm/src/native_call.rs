@@ -17748,7 +17748,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH_BIND_BITMAP_TO_SURFACE_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DD80 pops [back_bitmap, frame_error_context, decoration_error_context, window]. Only window and back_bitmap reach sub_42B2A0; the middle values are diagnostic context. Bitmap -1 clears the background backing.",
+        notes: "sub_47DD80 -> sub_42B2A0: a missing window, a window without its own bitmap and a missing bitmap are fatal; -1 clears the window back bitmap, otherwise it is cleared and the bitmap copied in at (0, 0) (a snapshot, clipped to the window). The two middle arguments are only error-message context.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH92_CONFIGURE_COMPACT_WAVE_TABLE,
@@ -20929,6 +20929,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
     opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP,
     opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
+    opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21204,7 +21205,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_WINDOWS_PATH_FILE,
     opcodes::GRAPH_SET_MESSAGE_INPUT_SCOPE,
     opcodes::GRAPH_SET_MESSAGE_INPUT_FILTER,
-    opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
     opcodes::GRAPH92_PRELOAD_BITMAP_RESOURCE,
     opcodes::GRAPH92_CANCEL_PENDING_BITMAP_PRELOADS,
     opcodes::GRAPH92_READ_BITMAP_PIXEL_VALUE,
