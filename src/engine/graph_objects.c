@@ -146,3 +146,23 @@ int Graph90_5C_ConfigureSpriteMode5(struct CThread *t)
 //       a = total >> 8
 // p = primary (sprite[84]), s = secondary (sprite[85]); sub_42AAA0 may
 // substitute a mip level (sprite+0x160 / +0x1C0) when the scale is <= 0.5.
+
+// ------------------------------------------ Graph90:43 BackF (class 4) ---
+
+// sub_47B7C0. Script order: x, y, primary, sx, sy, secondary, mask,
+// mask_param, alpha. Alpha > 256 is fatal first (sub_497DB0).
+// sub_43D750: sub_43E190(4) makes the current layer object a BackF, then
+//   sub_41D350: primary missing -> 1, secondary missing -> 2 (secondary may
+//     be 0x7000 black, 0x7001 white, 0x7FFF or -1); stores +0x13C x,
+//     +0x140 y, +0x144 primary, +0x14C sx, +0x150 sy, +0x154 secondary;
+//   sub_41D440: mask -1 clears +0x15C, else it must exist (3) and be
+//     format 3 (4); stores +0x15C mask, +0x160 mask_param;
+//   then vtbl+72 stores the alpha. Errors are fatal; state stored by the
+//   first stage survives a mask-stage failure.
+// Draw (sub_41D590, vtbl+0x84) with a = sub_41B770 (effective alpha):
+//   secondary bitmap: copy it (mode 128) at (sx, sy); with a mask, blend
+//     the primary through sub_411990(mask, mask_param, a, sub_41D540) (the
+//     rule-image wipe), else the primary with mode 1 and parameter a;
+//   0x7000 / 0x7001: unless the primary covers the target and there is no
+//     mask, fill black / white first; the primary then uses mode 192 / 193
+//     (0x7FFF and -1 use 128, or 192 when a != 0), or the masked blend.

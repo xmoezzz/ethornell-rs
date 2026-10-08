@@ -16796,7 +16796,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47B7C0 reverse-pops nine VM values; sub_462170 restores their natural source order into sub_43D750. CDspObjBackF construction installs blend selector 1; configuration stores two coordinate/resource pairs, accepts 0x7000/0x7001/0x7fff/-1 only for the secondary resource, validates an optional format-3 mask, then calls raw sub_41B620 to store the transparency DWORD. Selector 1 is format-sensitive: format 1/1 reaches sub_40B4B0 while mixed/format-2 pairs use sub_40B5D0/sub_40B6F0/sub_40B9B0, so rendering remains Partial.",
+        notes: "sub_47B7C0: alpha > 256 is fatal (sub_497DB0); sub_43D750 makes the current object a BackF and stores primary/secondary (sub_41D350: missing primary or non-sentinel secondary fatal) and mask (sub_41D440: missing or non-8-bit mask fatal), then the alpha. Drawing follows sub_41D590: secondary copy then the primary with mode 1, or the rule-image mask blend (sub_411990 weights, backf_mask_weight); sentinels 0x7000/0x7001 fade towards black/white.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_FRAME_TABLE,
@@ -20923,6 +20923,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_SET_REGISTERED_OBJECT_STATE,
     opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
     opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
+    opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21063,7 +21064,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_CURRENT_OBJECT_BITMAP,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_DUAL_BITMAP,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_QUAD_BITMAP,
-    opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_FRAME_TABLE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_RESOURCE_TRIPLET,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_MODE,

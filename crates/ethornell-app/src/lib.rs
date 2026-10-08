@@ -10198,13 +10198,18 @@ mod input_tests {
             Value::Int(1808),
         ];
         call_graph(&mut api, 0x90, 0x28, &mut motion).unwrap();
-        for _ in 0..50 {
-            api.layer_animations.tick(
-                &mut api.graph_layers,
-                &mut api.graph_surfaces,
-                &mut api.graph_object_properties,
-            );
-        }
+        // CProcCtrlDspObj advances only when its procedure ticks.
+        let control_id = *api.native_control_last_poll_ms.keys().max().unwrap();
+        api.engine_time_ms += 1000;
+        ethornell_vm::GraphApi::poll_native_graph_control_procedure(
+            &mut api,
+            ethornell_vm::NativeOpcode {
+                group: 0x90,
+                id: 0x28,
+            },
+            0,
+            control_id,
+        );
         api.graph90_refresh_backf_primary(0).unwrap();
 
         assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 0);
@@ -10403,21 +10408,16 @@ mod input_tests {
         assert_eq!(items[1].blend_mode, 0xf0);
         assert!((items[1].opacity - 0.75).abs() < f32::EPSILON);
 
-        // 90:43 itself does not reject/clamp this DWORD: sub_43D750 calls
-        // sub_41B620 directly after resource and mask validation succeeds.
-        let mut raw_alpha = vec![
-            Value::Int(0),
-            Value::Int(0),
-            Value::Int(411),
-            Value::Int(0),
-            Value::Int(0),
-            Value::Int(-1),
-            Value::Int(-1),
-            Value::Int(0),
-            Value::Int(257),
-        ];
-        call_graph(&mut api, 0x90, 0x43, &mut raw_alpha).unwrap();
-        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 257);
+        // sub_47B7C0 rejects an alpha above 256 (sub_497DB0) before
+        // anything else; 256 itself is stored by sub_41B620.
+        let raw_alpha = |alpha| {
+            [0, 0, 411, 0, 0, -1, -1, 0, alpha]
+                .map(Value::Int)
+                .to_vec()
+        };
+        assert!(call_graph(&mut api, 0x90, 0x43, &mut raw_alpha(257)).is_err());
+        call_graph(&mut api, 0x90, 0x43, &mut raw_alpha(256)).unwrap();
+        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 256);
     }
 
     #[test]

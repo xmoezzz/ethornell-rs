@@ -2512,6 +2512,14 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x43) => {
                 let args = Self::graph90_source_args(stack, 9);
+                // sub_47B7C0 checks the alpha (sub_497DB0) before anything else.
+                if let Some(&alpha) = args.get(8)
+                    && alpha as u32 > 0x100
+                {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:43 alpha {alpha} exceeds 256"
+                    ))));
+                }
                 let object = self.graph90_prepare_current_background(NativeBackgroundClass::BackF);
                 if let [
                     primary_x,
@@ -2541,10 +2549,8 @@ impl RuntimeTraceApi {
                         ))));
                     }
                     // sub_43D750 applies vtable+0x48 only after both resource
-                    // configuration stages have succeeded.
-                    // sub_43D750 invokes CDspObjBackF vtable +72 directly.
-                    // sub_41B620 stores the DWORD verbatim; unlike several
-                    // other wrappers, 90:43 performs no 0..=256 range check.
+                    // configuration stages have succeeded (the range was
+                    // checked by sub_497DB0 above).
                     self.set_graph_object_alpha_recursive_raw(object, *alpha_parameter);
                     if let Err(reason) = self.graph90_refresh_backf_primary(object) {
                         return Some(Err(ethornell_vm::VmError::Runtime(format!(
