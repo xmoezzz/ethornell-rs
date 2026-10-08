@@ -2923,7 +2923,26 @@ impl RuntimeTraceApi {
                         .and_then(|properties| properties.format_resource)
                         .unwrap_or(-1);
 
-                    let replaced = if !sprite_valid || !bitmap_valid {
+                    // sub_497B60 rejects handles >= 0x4000; sub_43ECA0
+                    // returns 255 for a missing sprite and 1 when the mode
+                    // 0/2/5/6 rebuild cannot find the bitmap (sub_407F20).
+                    // Modes 1/3/4 ignore the bitmap and succeed.
+                    if *primary_bitmap as u32 >= 0x4000 {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:57 bitmap handle {primary_bitmap} is out of range"
+                        ))));
+                    }
+                    if !sprite_valid {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:57 #{object} is not a sprite object"
+                        ))));
+                    }
+                    if matches!(mode, 0 | 2 | 5 | 6) && !bitmap_valid {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:57 bitmap {primary_bitmap} does not exist"
+                        ))));
+                    }
+                    let replaced = if !bitmap_valid {
                         false
                     } else {
                         match mode {

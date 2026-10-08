@@ -16924,7 +16924,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_REPLACE_SPRITE_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Current Tayutama2_trial_TG.exe: sub_47C3E0 validates the bitmap and resolves the existing Sprite, then sub_462510 -> sub_43ECA0 -> sub_4272F0 switches on Sprite mode. Mode 0 calls sub_427410 with the new primary; mode 2 calls sub_4275B0 with the new primary plus the existing affine parameters; modes 5/6 call sub_427AA0/sub_427D90 with the new primary, secondary=-1, transition=0, secondary_parameter=-1 and the existing projection/quad parameters. This mutates the Sprite; it does not render the Sprite into the bitmap.",
+        notes: "sub_47C3E0: bitmap handle >= 0x4000 and a missing sprite are fatal; sub_4272F0 rebuilds modes 0/2/5/6 with the existing geometry (5/6 with secondary=-1, transition=0) and a missing bitmap there is fatal; modes 1/3/4 ignore the bitmap.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
@@ -20910,6 +20910,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_START_NODE_CONTROL_EX,
     opcodes::SYS_FILE_EXISTS,
     opcodes::SYS_DELETE_FILE,
+    opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21063,7 +21064,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
-    opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SCALED_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_MASKED_BITMAP,

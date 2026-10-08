@@ -11564,6 +11564,33 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_57_rejects_bad_handles_and_missing_bitmaps_only_for_bitmap_modes() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        // A fresh sprite is in mode 0, which needs the bitmap.
+        let mut missing = vec![Value::Int(sprite), Value::Int(1262)];
+        assert!(call_graph(&mut api, 0x90, 0x57, &mut missing).is_err());
+        let mut range = vec![Value::Int(sprite), Value::Int(0x4000)];
+        assert!(call_graph(&mut api, 0x90, 0x57, &mut range).is_err());
+        let mut no_sprite = vec![Value::Int(sprite + 1), Value::Int(0)];
+        assert!(call_graph(&mut api, 0x90, 0x57, &mut no_sprite).is_err());
+        // Modes 1/3/4 (transition, ...) never look the bitmap up.
+        api.graph_object_properties
+            .entry(sprite)
+            .or_default()
+            .named_properties
+            .insert("target-object-mode".to_string(), 1);
+        let mut ignored = vec![Value::Int(sprite), Value::Int(1262)];
+        assert!(call_graph(&mut api, 0x90, 0x57, &mut ignored).is_ok());
+    }
+
+    #[test]
     fn graph90_57_replaces_mode0_sprite_bitmap_without_losing_display_state() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
