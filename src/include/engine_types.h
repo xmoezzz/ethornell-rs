@@ -83,3 +83,63 @@ struct CThread {
     uint32_t data_sp;            // +0x80  byte offset into data region (sub_445110/4450F0)
     uint32_t deadline;           // +0x84  absolute time for wait helpers (sub_445260..4452B0)
 };
+
+// ------------------------------------------------------------ graphics ---
+
+// Bitmap descriptor, 0x18 bytes (sub_409030 fills it, sub_407F20 copies it
+// out of the bitmap library by handle).
+struct BitmapDesc {
+    uint8_t *bits;         // +0x00
+    int32_t pitch;         // +0x04  bytes per row (width * bpp)
+    int32_t width;         // +0x08
+    int32_t height;        // +0x0C
+    int32_t format;        // +0x10  0 555, 1 XRGB, 2 ARGB, 3 8-bit, 4/6 maps
+    int32_t bpp;           // +0x14  sub_407B30(format)
+};
+
+// Inclusive rectangle used by sub_409110 (intersect), sub_409170 (offset by
+// (dx in edx, dy in ecx)), sub_409190 (descriptor -> 0,0,w-1,h-1).
+struct Rect { int32_t left, top, right, bottom; };
+
+// CDspObj member record, 0x10 bytes, list at CDspObj+0x12C (sub_41AB40
+// appends, sub_41B1D0 walks, sub_41C130 rewrites the offset).
+struct MemberLink {
+    struct CDspObj *obj;   // +0
+    int32_t dx;            // +4  offset from the parent's +0x30
+    int32_t dy;            // +8  offset from the parent's +0x34
+    struct MemberLink *next; // +12
+};
+
+// The parts of CDspObj (constructor sub_41A400) used by the cleaned code.
+struct CDspObj {
+    void **vtbl;           // +0x00 (+40 SetPosition(x,y,relink,propagate),
+                           //        +44 SetPosition(x,y), +48 GetPosition)
+    int32_t x, y;          // +0x30 / +0x34 (vtbl index 12/13 as dwords)
+    struct CDspObj *parent;// +0x11C (dword 71)
+    struct MemberLink *members; // +0x12C (dword 75)
+};
+
+// CDspObjSprite fields (dword indices as Hex-Rays prints them).
+//   [77]  +0x134 mode: 0 plain, 1 transition, 2 rotated, 5 perspective, 6 quad
+//   [84]  +0x150 primary bitmap      [85] +0x154 secondary bitmap or -1
+//   [86]  +0x158 primary generation  [87] +0x15C secondary generation
+//   [136] +0x220 two-bitmap cache descriptor (sub_428E70 / sub_40C0F0)
+//   [142] +0x238 transition the cache was built for
+//   [144] +0x240 transition value    [145] +0x244 secondary parameter
+//   [146]/[147] +0x248/+0x24C fixed x/y   [148] +0x250 rotation
+//   [158] +0x278 perspective  [159] +0x27C project position  [160] +0x280
+//   [167] +0x29C projected x scale (mip level selector, sub_42AA20)
+//   [181]/[182] +0x2D4/+0x2D8 projected raster size (sub_4291E0/sub_429220)
+
+// Text shadow style, 0x14 bytes (sub_434E30).
+struct ShadowStyle {
+    uint32_t mode;         // 0 none, 1 drop shadow, 2 glow
+    uint32_t x_percent;    // <= 100: offset/radius = size * x% / 100 (>= 1)
+    uint32_t y_percent;    // <= 100
+    uint32_t color;        // 0x00RRGGBB
+    uint32_t concentration;// <= 256: blended with parameter 256 - value
+};
+
+// Font-name registry node, 0x0C bytes, list dword_56631C, next id
+// dword_566314 (sub_468A70 interns, sub_468BB0 looks up by id).
+struct FontName { int32_t id; char *name; struct FontName *next; };

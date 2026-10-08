@@ -275,3 +275,27 @@ int CThread_callback_dequeue(struct CThread *t, uint32_t *out) // sub_445300
     *out = n->value; t->callbacks = n->next; free(n);
     return 1;
 }
+
+// ---------------------------------------------------- Sys80:44 threads ---
+
+// sub_488D00 -> sub_48D080. Script order: archive, file, slots, code bytes,
+// data bytes. Pushes the new thread id.
+int Sys80_44_LoadProgramThread(struct CThread *t)
+{
+    uint32_t data_bytes = pop(t), code_bytes = pop(t), slots = pop(t);
+    const char *file = pop_ptr(t), *archive = pop_ptr(t);
+    uint8_t *image = new_bytes(0x20000);
+    struct CThread *child, *last;
+    if (!read_resource(file, image, archive))            // sub_465AB0
+        script_error("cannot read program", t);          // byte_4EB960
+    for (last = t; last->next_child; last = last->next_child)
+        ;                                                // sub_444A70: append
+    child = CThread_init(new_thread(), slots, CThread_root(last), code_bytes, data_bytes, 1);
+    last->next_child = child;
+    if (CThread_load_module(child, image, file) == LOAD_FAILED)  // sub_444CE0
+        script_error("program does not fit", t);         // byte_4EBF48
+    delete_bytes(image);
+    push(t, child->thread_id);                           // sub_42D560 = +8
+    return 0;
+}
+

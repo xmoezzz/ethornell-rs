@@ -12827,14 +12827,22 @@ mod input_tests {
             assert_eq!((native.position_x, native.position_y), expected);
         }
 
+        // Moving an attached child directly rewrites its member offset
+        // (sub_41C130), so the parent later carries it from the new place.
+        let mut direct = vec![Value::Int(child), Value::Int(0), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x33, &mut direct).unwrap();
+        let mut again = vec![Value::Int(parent), Value::Int(0), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x33, &mut again).unwrap();
+        let child_native = api.graph_object_properties[&child].native;
+        assert_eq!((child_native.position_x, child_native.position_y), (20, -11));
+        let mut back = vec![Value::Int(parent), Value::Int(-20), Value::Int(11)];
+        call_graph(&mut api, 0x90, 0x33, &mut back).unwrap();
+
         let mut detach = vec![Value::Int(parent), Value::Int(child)];
         call_graph(&mut api, 0x91, 0x3f, &mut detach).unwrap();
         assert!(!api.graph_native_owners.contains_key(&child));
         let child_native = api.graph_object_properties[&child].native;
-        assert_eq!(
-            (child_native.position_x, child_native.position_y),
-            (-13, 19)
-        );
+        assert_eq!((child_native.position_x, child_native.position_y), (0, 0));
 
         let missing = 0x7000_0033;
         let mut args = vec![Value::Int(missing), Value::Int(1), Value::Int(2)];

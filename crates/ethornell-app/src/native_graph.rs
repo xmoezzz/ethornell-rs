@@ -331,6 +331,20 @@ impl RuntimeTraceApi {
         }
     }
 
+    fn graph90_set_child_link_offset(&mut self, parent: i32, child: i32, offset: (i32, i32)) {
+        if let Some(member) = self
+            .graph_groups
+            .get_mut(&parent)
+            .and_then(|group| group.members.get_mut(&child))
+        {
+            *member = offset;
+            return;
+        }
+        if let Some(transform) = self.graph91_object_transforms.get_mut(&child) {
+            transform.attachment_offset = [offset.0, offset.1];
+        }
+    }
+
     fn graph90_child_link_offset(&self, parent: i32, child: i32) -> (i32, i32) {
         if let Some(offset) = self
             .graph_groups
@@ -367,7 +381,17 @@ impl RuntimeTraceApi {
         if self.graph90_set_specialized_position(object, x, y) {
             return;
         }
-        let mut pending = vec![(object, x, y, None)];
+        // sub_41B1D0 with its update flag set: sub_41C130 rewrites the
+        // parent's member record for this object (CDspObj+0x11C parent,
+        // record list at +0x12C) to the new offset from the parent.
+        let relink = self.graph_native_owners.get(&object).copied().and_then(|parent| {
+            let (parent_x, parent_y) = self.graph_native_base_position(parent)?;
+            Some((parent, (x.wrapping_sub(parent_x), y.wrapping_sub(parent_y))))
+        });
+        let mut pending = vec![(object, x, y, relink.map(|(_, offset)| offset))];
+        if let Some((parent, offset)) = relink {
+            self.graph90_set_child_link_offset(parent, object, offset);
+        }
         let mut visited = BTreeSet::new();
         while let Some((current, absolute_x, absolute_y, local)) = pending.pop() {
             if !visited.insert(current) {
