@@ -18428,7 +18428,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_WINDOW_FONT_PARAMETERS,
         returns: "void; target reports native font/window validation errors",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "0x004840A0 reaches sub_4409C0 and stores the recovered CDspObjWindow font fields at +0x354..+0x364.",
+        notes: "sub_4840A0 pops render option, layout option, style, scale %, size, font id, window. An unregistered font id (sub_497AF0), a non-window handle, size outside 4..=200 and scale outside 25..=200 (sub_42EAB0) are fatal. sub_4409C0 stores layout option at window+0x354 and render option at +0x364; sub_42C3B0 stores size at +0x358 and size*scale/100 at +0x35C, and with +0x364 set narrows the valid rectangle's right edge to bitmap width-1 minus that width (sub_42B900, cursor reset).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_SET_WINDOW_LINE_SPACING,
@@ -20913,6 +20913,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
     opcodes::GRAPH92_DRAW_BITMAP_TEXT,
+    opcodes::GRAPH91_CONFIGURE_WINDOW_FONT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -20986,7 +20987,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_OPEN_DIRECTSHOW_MOVIE,
     opcodes::GRAPH91_START_DIRECTSHOW_MOVIE,
     opcodes::GRAPH91_GET_MOVIE_POSITION,
-    opcodes::GRAPH91_CONFIGURE_WINDOW_FONT,
     opcodes::GRAPH91_START_EXTENDED_MESSAGE,
     opcodes::GRAPH91_RENDER_WINDOW_TEXT,
     opcodes::GRAPH91_START_EXTENDED_MESSAGE_WITH_OPTION,

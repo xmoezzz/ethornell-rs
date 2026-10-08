@@ -696,8 +696,8 @@ impl RuntimeTraceApi {
         let stack = call.args_mut();
         let value = match id {
             0x88 => {
-                // Source order: window, font-name id, font size, scale percent,
-                // font style, layout option, render option.
+                // sub_4840A0 pops render option, layout option, style, scale
+                // percent, size, font id, window (script order reversed).
                 let render_option = pop_int_value(stack).unwrap_or_default();
                 let layout_option = pop_int_value(stack).unwrap_or_default();
                 let font_style = pop_int_value(stack).unwrap_or_default();
@@ -705,28 +705,51 @@ impl RuntimeTraceApi {
                 let font_size = pop_int_value(stack).unwrap_or_default();
                 let font_name_id = pop_int_value(stack).unwrap_or_default();
                 let window = pop_int_value(stack).unwrap_or_default();
-                let font_exists = font_name_id == 0
-                    || self.graph91_fonts.contains_key(&font_name_id)
-                    || self
-                        .graph_config
-                        .fonts
-                        .iter()
-                        .any(|font| font.font_name_id == font_name_id);
-                if self.graph_surfaces.contains_key(&window)
-                    && font_exists
-                    && (4..=200).contains(&font_size)
-                    && (25..=200).contains(&scale_percent)
+                let fail = |what: String| {
+                    Some(Err(ethornell_vm::VmError::Runtime(format!("Graph91:88 {what}"))))
+                };
+                // sub_497AF0, sub_4406C0, then sub_42EAB0's range checks;
+                // every failure is a script error.
+                if self.native_user.font_face(font_name_id).is_none() {
+                    return fail(format!("font {font_name_id} is not registered"));
+                }
+                if !Self::is_window_surface_handle(window)
+                    || !self.graph_surfaces.contains_key(&window)
                 {
-                    let state = self.surface_text_states.entry(window).or_default();
-                    state.font = font_name_id;
-                    state.font_size = font_size;
-                    state.scale_percent = scale_percent;
-                    state.font_style = font_style;
-                    state.layout_option = layout_option;
-                    state.render_option = render_option;
-                    self.text_state.font_size = font_size as f32;
-                    self.text_state.line_height =
-                        (font_size as f32 * scale_percent as f32 / 100.0).max(1.0);
+                    return fail(format!("#{window} is not a window object"));
+                }
+                if !(4..=200).contains(&font_size) {
+                    return fail(format!("font size {font_size} is out of range"));
+                }
+                if !(25..=200).contains(&scale_percent) {
+                    return fail(format!("font scale {scale_percent}% is out of range"));
+                }
+                let state = self.surface_text_states.entry(window).or_default();
+                state.font = font_name_id;
+                state.font_size = font_size;
+                state.scale_percent = scale_percent;
+                state.font_style = font_style;
+                state.layout_option = layout_option;
+                state.render_option = render_option;
+                self.text_state.font_size = font_size as f32;
+                self.text_state.line_height =
+                    (font_size as f32 * scale_percent as f32 / 100.0).max(1.0);
+                // sub_42C3B0: with window+0x364 set, keep one scaled glyph
+                // width free at the right edge of the bitmap; sub_42B900
+                // applies the narrowed valid rectangle and resets the cursor.
+                if render_option != 0 {
+                    let reserve = scale_percent * font_size / 100;
+                    let narrowed = self.graph_surfaces.get_mut(&window).and_then(|surface| {
+                        let limit = surface.width as i32 - 1 - reserve;
+                        (surface.valid_right > limit
+                            && surface.valid_left >= 0
+                            && surface.valid_left < surface.width as i32
+                            && (0..surface.width as i32).contains(&limit))
+                        .then(|| surface.valid_right = limit)
+                    });
+                    if narrowed.is_some() {
+                        self.reset_window_text_cursor(window);
+                    }
                 }
                 ethornell_vm::Value::None
             }

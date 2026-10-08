@@ -9343,6 +9343,37 @@ mod input_tests {
     }
 
     #[test]
+    fn graph91_88_raises_target_errors_and_reserves_a_vertical_column() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 0xB000_0002_u32 as i32;
+        let mut record = RuntimeSurface::display(surface, 400.0, 300.0);
+        record.valid_left = 10;
+        record.valid_right = 389;
+        api.graph_surfaces.insert(surface, record);
+        let font = |window, id, size, scale, render| {
+            [window, id, size, scale, 0, 0, render]
+                .into_iter()
+                .map(Value::Int)
+                .collect::<Vec<_>>()
+        };
+        for bad in [
+            font(surface, 7, 28, 100, 0),
+            font(surface + 1, 0, 28, 100, 0),
+            font(surface, 0, 3, 100, 0),
+            font(surface, 1, 28, 201, 0),
+        ] {
+            assert!(call_graph(&mut api, 0x91, 0x88, &mut bad.clone()).is_err(), "{bad:?}");
+        }
+        call_graph(&mut api, 0x91, 0x88, &mut font(surface, 0, 28, 100, 0)).unwrap();
+        assert_eq!(api.graph_surfaces[&surface].valid_right, 389);
+        // 28 * 150 / 100 = 42: the right edge moves to 399 - 42.
+        call_graph(&mut api, 0x91, 0x88, &mut font(surface, 1, 28, 150, 1)).unwrap();
+        assert_eq!(api.graph_surfaces[&surface].valid_right, 357);
+    }
+
+    #[test]
     fn window_valid_region_is_not_bitmap_viewport_and_compact_icons_keep_its_origin() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
