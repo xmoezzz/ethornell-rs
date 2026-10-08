@@ -2865,6 +2865,33 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x55) => {
                 let args = Self::graph90_source_args(stack, 2);
+                // sub_47C230 -> sub_43ED20 -> sub_427F80: missing sprite
+                // (255), missing bitmap (1) and a bitmap that is neither
+                // 8-bit nor ARGB (2) are script errors; -1 clears the aux
+                // bitmap. Setting one drops an aux-object relation.
+                if let [handle, bitmap] = args.as_slice() {
+                    if !self.graph90_object_matches(*handle, GRAPH90_SPRITE_TAG, 512, GRAPH90_CLASS_SPRITE)
+                    {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:55 #{handle} is not a sprite object"
+                        ))));
+                    }
+                    if *bitmap != -1 {
+                        match self.query_bitmap_info(*bitmap) {
+                            None => {
+                                return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                                    "Graph90:55 bitmap {bitmap} does not exist"
+                                ))));
+                            }
+                            Some(info) if !matches!(info.format, 2 | 3) => {
+                                return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                                    "Graph90:55 bitmap {bitmap} is not a grayscale bitmap"
+                                ))));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
                 if let [handle, bitmap] = args.as_slice()
                     && self.graph90_object_matches(
                         *handle,

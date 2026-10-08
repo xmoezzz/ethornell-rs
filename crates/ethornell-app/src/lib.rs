@@ -714,6 +714,9 @@ struct RuntimeTraceApi {
     /// dword_503E40: last press point per mouse button (left, right,
     /// middle, X1, X2) in game coordinates (sub_48E560 from the WndProc).
     button_press_points: [(i32, i32); 5],
+    /// Sprites drawn through their aux bitmap (Graph90:55): sprite ->
+    /// (masked image key, inputs it was built from).
+    aux_masked_sprites: BTreeMap<i32, (String, (i32, i32, u64, u64))>,
     /// Physically held descriptors (GetAsyncKeyState), independent of the
     /// native records that Sys80:10 may clear.
     input_physically_held: BTreeSet<i32>,
@@ -1026,6 +1029,7 @@ impl RuntimeTraceApi {
             input_descriptor_deadlines: BTreeMap::new(),
             last_button_press: None,
             button_press_points: [(0, 0); 5],
+            aux_masked_sprites: BTreeMap::new(),
             input_physically_held: BTreeSet::new(),
             pointer_object_nodes: Vec::new(),
             sync_load_deadline: 0,
@@ -7120,7 +7124,10 @@ impl RuntimeTraceApi {
                 continue;
             }
             let draw_key = self
-                .message_control_layer_draw_key(*layer_id, layer)
+                .aux_masked_sprites
+                .get(layer_id)
+                .map(|(key, _)| key.as_str())
+                .or_else(|| self.message_control_layer_draw_key(*layer_id, layer))
                 .unwrap_or(layer.key.as_str());
             let Some(image) = self.graph_images.get(draw_key) else {
                 continue;
@@ -7202,7 +7209,8 @@ impl RuntimeTraceApi {
                 src_width,
                 src_height,
                 opacity,
-                ignore_source_alpha: self.graph_layer_ignores_source_alpha(*layer_id, layer),
+                ignore_source_alpha: !self.aux_masked_sprites.contains_key(layer_id)
+                    && self.graph_layer_ignores_source_alpha(*layer_id, layer),
                 rotation_degrees: layer.rotation_degrees,
                 destination_quad,
                 linear_sampling: mode5_render_state
@@ -8281,6 +8289,7 @@ impl RuntimeEngine {
         // Input edges are visible for one cooperative main-loop pass.
         self.api.finish_native_tick_input();
         self.api.sync_display_tree_from_runtime();
+        self.api.refresh_aux_masked_sprites();
         report
     }
 }
@@ -13343,6 +13352,39 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_55_aux_bitmap_masks_the_sprite_in_screen_space() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        // 2x1 opaque ARGB sprite bitmap and a 16x2 8-bit mask.
+        assert!(api.create_bitmap_from_rgb(600, 2, 1, 2, &[255; 8]));
+        let mut mask = vec![0u8; 16 * 2];
+        mask[10] = 128;
+        mask[11] = 255;
+        assert!(api.create_bitmap_from_rgb(601, 16, 2, 3, &mask));
+        let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() else {
+            panic!("no sprite");
+        };
+        let mut configure = [sprite, 10, 0, 600, 0x80, 0, 100].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        call_graph(&mut api, 0x90, 0x54, &mut vec![Value::Int(sprite), Value::Int(1)]).unwrap();
+        assert!(call_graph(&mut api, 0x90, 0x55, &mut vec![Value::Int(sprite), Value::Int(602)]).is_err());
+        call_graph(&mut api, 0x90, 0x55, &mut vec![Value::Int(sprite), Value::Int(601)]).unwrap();
+        api.refresh_aux_masked_sprites();
+        let item = api
+            .graph_draw_items()
+            .into_iter()
+            .find(|item| item.owner_object == Some(sprite))
+            .expect("sprite draw item");
+        let image = &api.graph_images[&item.key];
+        assert_eq!((image.rgba[3], image.rgba[7]), (127, 254));
+        // -1 removes the mask.
+        call_graph(&mut api, 0x90, 0x55, &mut vec![Value::Int(sprite), Value::Int(-1)]).unwrap();
+        api.refresh_aux_masked_sprites();
+        assert!(api.aux_masked_sprites.is_empty());
+    }
+
+    #[test]
     fn graph90_88_checks_each_corner_like_sub_42b900() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -17431,6 +17473,90 @@ impl RuntimeTraceApi {
         if self.graph_surfaces.contains_key(&surface) {
             self.replace_graph_input_control_layers(object, surface, &descriptor);
         }
+    }
+
+    /// CDspObjSprite draw (sub_4258D0, modes 0 and 1) with an aux bitmap
+    /// (+0x138 set, +0x13C bitmap): the sprite's pixels for the drawn area
+    /// are combined with the aux bitmap sampled at the same screen position
+    /// (sub_428280 / sub_4091B0) before the normal blit (sub_4155A0): an
+    /// 8-bit mask becomes the alpha of an RGB source (sub_4156F0) or scales
+    /// an ARGB source's alpha, a = m * a >> 8 (sub_415790). A screen pixel
+    /// outside the mask is not drawn. (A format-2 mask is applied the same
+    /// way with its alpha byte.)
+    pub(crate) fn refresh_aux_masked_sprites(&mut self) {
+        let candidates = self
+            .graph_object_properties
+            .iter()
+            .filter_map(|(&sprite, properties)| {
+                let aux = properties.aux_resource?;
+                let mode = properties
+                    .named_properties
+                    .get("target-object-mode")
+                    .copied()
+                    .unwrap_or_default();
+                matches!(mode, 0 | 1).then_some((sprite, aux))
+            })
+            .collect::<Vec<_>>();
+        let mut next = BTreeMap::new();
+        for (sprite, aux) in candidates {
+            let Some(layer) = self.graph_layers.get(&sprite) else {
+                continue;
+            };
+            let (x, y, _) = self.layer_world_transform(sprite, layer);
+            let base_key = layer.key.clone();
+            let Some(mask_key) = self.resolve_resource_key(aux).map(str::to_string) else {
+                continue;
+            };
+            let signature = (
+                x as i32 - layer.src_x as i32,
+                y as i32 - layer.src_y as i32,
+                self.graph_image_revision(&base_key),
+                self.graph_image_revision(&mask_key),
+            );
+            let key = format!("runtime:sprite:{sprite}:aux-masked");
+            if let Some((_, previous)) = self.aux_masked_sprites.get(&sprite)
+                && *previous == signature
+                && self.graph_images.contains_key(&key)
+            {
+                next.insert(sprite, (key, signature));
+                continue;
+            }
+            let (Some(base), Some(mask)) =
+                (self.graph_images.get(&base_key), self.graph_bitmap_image(aux))
+            else {
+                continue;
+            };
+            let base_format = self
+                .graph_layers
+                .get(&sprite)
+                .and_then(|_| self.graph_object_properties.get(&sprite))
+                .and_then(|properties| properties.format_resource)
+                .and_then(|resource| self.bitmap_formats.get(&resource).copied())
+                .unwrap_or(2);
+            let mask_format = self.bitmap_formats.get(&aux).copied().unwrap_or(3);
+            let (origin_x, origin_y) = (signature.0, signature.1);
+            let mut out = base.clone();
+            for py in 0..out.height as i32 {
+                for px in 0..out.width as i32 {
+                    let (sx, sy) = (origin_x + px, origin_y + py);
+                    let at = ((py as u32 * out.width + px as u32) * 4) as usize;
+                    let m = if (0..mask.width as i32).contains(&sx) && (0..mask.height as i32).contains(&sy) {
+                        let mask_at = ((sy as u32 * mask.width + sx as u32) * 4) as usize;
+                        if mask_format == 3 { mask.rgba[mask_at] } else { mask.rgba[mask_at + 3] }
+                    } else {
+                        0
+                    };
+                    out.rgba[at + 3] = if base_format == 1 {
+                        m
+                    } else {
+                        ((u32::from(m) * u32::from(out.rgba[at + 3])) >> 8) as u8
+                    };
+                }
+            }
+            self.store_graph_image(key.clone(), out);
+            next.insert(sprite, (key, signature));
+        }
+        self.aux_masked_sprites = next;
     }
 
     /// Icon item sprites are mode-5 sprites placed at (item - screen/2) with
