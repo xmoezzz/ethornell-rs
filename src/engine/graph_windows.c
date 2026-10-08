@@ -167,3 +167,21 @@ int Graph90_83_RenderWindowToBitmap(struct CThread *t)
         script_error("invalid window", t);
     return 0;
 }
+
+// sub_47DCD0. Script order (window, x, y, blend, transparency, reserved,
+// priority). priority < 0x10000, reserved <= 256, transparency <= 256 and a
+// valid blend mode are checked first; sub_462AF0 -> sub_42B360 then sets
+// position, blend, transparency and priority (reserved is not forwarded).
+// A missing window is fatal.
+int Graph90_85_ConfigureWindowObject(struct CThread *t)
+{
+    uint32_t priority = pop(t), reserved = pop(t), transparency = pop(t),
+             blend = pop(t), y = pop(t), x = pop(t), window = pop(t);
+    check_priority(priority, t);
+    check_le_256(reserved, t);
+    check_le_256(transparency, t);
+    check_blend(blend, t);
+    if (!window_configure(window, x, y, blend, transparency, priority))
+        script_error("invalid window", t);
+    return 0;
+}

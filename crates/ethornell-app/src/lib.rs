@@ -21411,10 +21411,28 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let blend_mode = values[3];
                     let y = values[4];
                     let x = values[5];
+                    // sub_47DCD0: priority, reserved, transparency and blend
+                    // checks (sub_497BB0/497DB0/497C40), then a missing window
+                    // (sub_462AF0) - every failure is a script error.
+                    if reserved as u32 > 0x100 {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:85 value {reserved} exceeds 256"
+                        )));
+                    }
+                    Self::graph90_validate_sprite_arguments(
+                        0x85,
+                        priority,
+                        transparency,
+                        blend_mode,
+                        &[],
+                    )?;
                     let valid = Self::is_window_surface_handle(window)
-                        && (0..0x1_0000).contains(&priority)
-                        && (0..=256).contains(&reserved)
-                        && (0..=256).contains(&transparency);
+                        && self.graph_surfaces.contains_key(&window);
+                    if !valid {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:85 #{window} is not a window object"
+                        )));
+                    }
                     if valid {
                         if let Some(surface) = self.graph_surfaces.get_mut(&window) {
                             surface.x = x as f32;

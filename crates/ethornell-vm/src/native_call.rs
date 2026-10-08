@@ -17116,7 +17116,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_WINDOW_OBJECT_PARAMETERS,
         returns: "void; target validates blend, transparency, reserved value, priority and handle",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target pop order is priority,reserved,transparency,blend,y,x,window. sub_42B360 sets position, blend, alpha/transparency and priority. The reserved 0..=256 value is validated by the public handler but not forwarded to the core.",
+        notes: "sub_47DCD0: priority >= 0x10000, reserved > 256, transparency > 256, an invalid blend mode and a missing window are fatal; sub_42B360 sets position, blend, transparency and priority (reserved is not forwarded).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_WINDOW_ISOLATED_COMPOSITION,
@@ -20928,6 +20928,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_SWITCH_PROGRAM,
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
     opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP,
+    opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21090,7 +21091,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_UPLOAD_MAP_TILE_DATA,
     opcodes::GRAPH90_SET_MAP_VIEWPORT,
     opcodes::GRAPH90_REPLACE_MAP_TILE_ID,
-    opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
     opcodes::GRAPH90_START_WINDOW_MESSAGE_PROCEDURE,
     opcodes::GRAPH90_CONFIGURE_MESSAGE_CARET_FRAMES,
     opcodes::GRAPH_SET_MESSAGE_START_DELAY,
