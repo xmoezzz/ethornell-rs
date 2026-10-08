@@ -17316,7 +17316,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_LAYOUT_PARAMETERS,
         returns: "status 0,1,2,3",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target uses the extended 40-byte root, 64-byte groups and 196-byte item records. Extended constructor sub_44A900 uses item x/y directly and, unlike compact sub_447C10, does not add the Window valid-region origin.",
+        notes: "sub_47EE60 -> sub_46CDB0: a non-Window handle returns 1; sub_46C9D0 copies the 40-byte root, 64-byte groups and 196-byte items (status 2 for a bad root/group count, 3 for a bad item table, low word only); sub_44B260 clears the window's icon sprites, rechecks every full group-count dword (status 3) and builds one mode-5 Sprite per item with item+4 != 0 whose bitmap resolves: normal bitmap, or the selected one for the group's current item; position item+8/+0xC with origin item+0x10/+0x14; depth item+4 (flag 0x10), item+0xC (flag 2) or the running item ordinal.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_ICON_INPUT_PROCESSOR,
@@ -20911,6 +20911,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_FILE_EXISTS,
     opcodes::SYS_DELETE_FILE,
     opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
+    opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21094,7 +21095,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_DRAW_ICON_BATCH,
     opcodes::GRAPH90_DRAW_EXTENDED_ICON_BATCH,
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT,
-    opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
     opcodes::GRAPH90_CREATE_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_RELEASE_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_CONFIGURE_ICON_INPUT_PROCESSOR,

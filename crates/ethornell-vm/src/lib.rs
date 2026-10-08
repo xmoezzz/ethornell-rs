@@ -4814,6 +4814,16 @@ impl Vm {
                         self.validate_graph_input_descriptor(descriptor_ptr, true)?
                     {
                         Value::Int(status)
+                    } else if self.graph_input_group_counts_exceed_range(descriptor_ptr)? {
+                        // sub_46C9D0 validated only the low word of each
+                        // group count; sub_44B260 has already released the
+                        // window's icon sprites when it rechecks the whole
+                        // dword and returns 0x80000002 (status 3).
+                        api.configure_graph_surface_controls(
+                            window,
+                            GraphInputDescriptor::default(),
+                        );
+                        Value::Int(3)
                     } else {
                         let descriptor = self.read_graph_input_descriptor(descriptor_ptr)?;
                         api.configure_graph_surface_controls(window, descriptor);
@@ -7036,6 +7046,20 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// Extended-descriptor recheck in sub_44B260: every 64-byte group's
+    /// count dword (not just its low word) must be in 1..=256.
+    fn graph_input_group_counts_exceed_range(&self, ptr: u32) -> VmResult<bool> {
+        let group_count = self.read_int(ptr, 2)? as i32;
+        let groups_ptr = self.read_pointer_field(ptr.wrapping_add(4))?;
+        for group in 0..group_count.clamp(0, 256) as u32 {
+            let count = self.read_int(groups_ptr.wrapping_add(group * 64), 2)? as i32;
+            if !(1..=256).contains(&count) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn read_graph_input_descriptor(&self, ptr: u32) -> VmResult<GraphInputDescriptor> {
@@ -12626,6 +12650,7 @@ mod tests {
         graph_input_extended: bool,
         graph_window: Option<i32>,
         graph_icon_batch: Option<(i32, Vec<GraphIconRecord>)>,
+        graph_surface_controls: Option<(i32, super::GraphInputDescriptor)>,
         graph_input_registered_state: i32,
         graph_input_region_values: Vec<i32>,
         input_class_state: i32,
@@ -12868,6 +12893,14 @@ mod tests {
             }
             self.graph_icon_batch = Some((window, records.to_vec()));
             true
+        }
+
+        fn configure_graph_surface_controls(
+            &mut self,
+            surface: i32,
+            descriptor: super::GraphInputDescriptor,
+        ) {
+            self.graph_surface_controls = Some((surface, descriptor));
         }
 
         fn graph_input_registered_state(&self, object: i32) -> Option<i32> {
@@ -15032,6 +15065,37 @@ mod tests {
         assert_eq!(vm.read_int(destination + 120, 2).unwrap() as i32, 17);
         assert_eq!(vm.read_int(destination + 124, 2).unwrap() as i32, -9);
         assert!(api.system92_text_fragment_records.is_empty());
+    }
+
+    #[test]
+    fn graph90_b7_rechecks_full_group_counts_after_clearing_the_window() {
+        let window = 0xB000_0001_u32 as i32;
+        let (root, groups, items) = (0x3000_u32, 0x4000_u32, 0x5000_u32);
+        let mut vm = Vm::new();
+        vm.write_int(root, 2, 1).unwrap();
+        vm.write_int(root + 4, 2, groups).unwrap();
+        // Low word 1 passes sub_46C9D0; sub_44B260 sees 0x10001.
+        vm.write_int(groups, 2, 0x0001_0001).unwrap();
+        vm.write_int(groups + 8, 2, items).unwrap();
+        vm.write_int(items + 4, 2, 1).unwrap();
+        let mut api = SchedulingApi {
+            graph_window: Some(window),
+            ..Default::default()
+        };
+        let b7 = test_instruction(0x10, 0x90, "grp1", vec![0x90, 0xB7], Vec::new());
+        vm.stack.extend([Value::Int(window), Value::Ptr(root)]);
+        vm.dispatch(&b7, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(3)]);
+        let (surface, descriptor) = api.graph_surface_controls.take().unwrap();
+        assert_eq!(surface, window);
+        assert!(descriptor.regions.is_empty());
+
+        vm.stack.clear();
+        vm.write_int(groups, 2, 1).unwrap();
+        vm.stack.extend([Value::Int(window), Value::Ptr(root)]);
+        vm.dispatch(&b7, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(0)]);
+        assert_eq!(api.graph_surface_controls.unwrap().1.regions.len(), 1);
     }
 
     #[test]
