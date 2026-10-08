@@ -166,3 +166,25 @@ int Graph90_5C_ConfigureSpriteMode5(struct CThread *t)
 //   0x7000 / 0x7001: unless the primary covers the target and there is no
 //     mask, fill black / white first; the primary then uses mode 192 / 193
 //     (0x7FFF and -1 use 128, or 192 when a != 0), or the masked blend.
+
+// ------------------------------------- Graph90:4C background controls ---
+
+// sub_47C090 -> sub_462330 -> sub_43E490. Script order (draw, active).
+// The manager keeps both (+0x54/+0x58; sub_442850 starts with (1, 0)) and
+// sub_43E190 re-applies them whenever it recreates the background class.
+int Graph90_4C_SetCurrentObjectRenderControls(struct CThread *t)
+{
+    int active = pop(t), draw = pop(t);
+    struct ObjectManager *m = g_objects;               // dword_56674C
+    m->back_draw = draw;
+    m->back_active = active;
+    m->back->vtbl_SetDrawEnabled(m->back, draw);       // vtbl+4, sub_41AE00: +0x14,
+                                                       // then every member
+    m->back->vtbl_SetActive(m->back, active);          // vtbl+120: +0x138
+    manager_invalidate(m);                             // sub_430D10
+    return 0;
+}
+
+// CDspObjBack (sub_41C220): vtbl+0x0C (sub_41C330) invalidates every frame
+// while +0x138 is set; vtbl+0x18 (sub_41C340) clears the target to 0
+// (sub_40A620) when +0x138 is 0 or the class draw (vtbl+0x84) fails.

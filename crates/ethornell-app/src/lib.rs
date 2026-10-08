@@ -856,7 +856,14 @@ impl RuntimeTraceApi {
             debug_graph: std::env::var("DEBUG").ok().as_deref() == Some("1"),
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
-            graph_images: BTreeMap::new(),
+            graph_images: BTreeMap::from([(
+                native_background::BACK_INACTIVE_FILL_KEY.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 0, 0, 255],
+                },
+            )]),
             graph_image_formats: BTreeMap::new(),
             graph_image_auxiliary_pairs: BTreeMap::new(),
             graph_image_revisions: BTreeMap::new(),
@@ -6877,6 +6884,7 @@ impl RuntimeTraceApi {
         // display objects. Real graph layers remain authoritative.
         self.push_title_compatibility_items(&mut items);
         self.push_surface_draw_items(&mut items);
+        let mut inactive_backgrounds = BTreeSet::new();
         for (layer_id, layer) in &self.graph_layers {
             if !self.should_draw_graph_layer(*layer_id, layer) {
                 continue;
@@ -6885,6 +6893,39 @@ impl RuntimeTraceApi {
                 .owner_object
                 .and_then(|object| self.graph_object_properties.get(&object))
                 .and_then(|properties| properties.background);
+            // CDspObjBack draw (sub_41C340) with +0x138 == 0 clears the
+            // target to black instead of drawing any content layer.
+            if let (Some(background), Some(object)) = (owner_background, layer.owner_object)
+                && background.active == 0
+            {
+                if inactive_backgrounds.insert(object) {
+                    let (_, _, z) = self.layer_world_transform(*layer_id, layer);
+                    let (width, height) = snapshot::runtime_frame_size(self);
+                    items.push(RuntimeGraphDrawItem {
+                        owner_object: Some(object),
+                        key: native_background::BACK_INACTIVE_FILL_KEY.to_string(),
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f32,
+                        height: height as f32,
+                        src_x: 0.0,
+                        src_y: 0.0,
+                        src_width: 1.0,
+                        src_height: 1.0,
+                        opacity: 1.0,
+                        ignore_source_alpha: true,
+                        rotation_degrees: 0.0,
+                        destination_quad: None,
+                        linear_sampling: false,
+                        clip: None,
+                        z,
+                        blend_mode: 0x80,
+                        order_serial: self.display_order_serial(*layer_id, layer.owner_object),
+                        hit_id: layer.hit_id,
+                    });
+                }
+                continue;
+            }
             let backb_secondary = *layer_id == BACK_B_SECONDARY_LAYER_ID
                 && owner_background
                     .is_some_and(|background| background.class == NativeBackgroundClass::BackB);
@@ -8429,6 +8470,13 @@ mod input_tests {
         let result = ethornell_vm::SysApi::call_sys(api, &mut call);
         *stack = call.into_args();
         result
+    }
+
+    /// Scripts call Graph90:4C(1, 1) before they rely on a background; the
+    /// manager starts with the background inactive (drawn black).
+    fn activate_backgrounds(api: &mut super::RuntimeTraceApi) {
+        let mut active = vec![Value::Int(1), Value::Int(1)];
+        call_graph(api, 0x90, 0x4c, &mut active).unwrap();
     }
 
     fn call_graph(
@@ -10099,10 +10147,40 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_4c_inactive_background_draws_black_instead_of_its_content() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.store_graph_image(
+            "test:back".to_string(),
+            DecodedImage {
+                width: 4,
+                height: 3,
+                rgba: vec![255; 4 * 3 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(128, RuntimeGraphResource::whole("test:back".to_string()));
+        api.bitmap_formats.insert(128, 1);
+        let mut configure = [0, 0, 128, 0, 0, -1, -1, 0, 0].map(Value::Int).to_vec();
+        // The manager starts as (draw 1, active 0): the new BackF is inactive.
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let keys = |api: &super::RuntimeTraceApi| {
+            api.graph_draw_items().into_iter().map(|item| item.key).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&api), [super::native_background::BACK_INACTIVE_FILL_KEY]);
+        call_graph(&mut api, 0x90, 0x4c, &mut vec![Value::Int(1), Value::Int(1)]).unwrap();
+        assert_eq!(keys(&api), ["test:back"]);
+        call_graph(&mut api, 0x90, 0x4c, &mut vec![Value::Int(0), Value::Int(1)]).unwrap();
+        assert!(keys(&api).is_empty(), "draw gate off");
+    }
+
+    #[test]
     fn graph90_43_materializes_backf_layer_and_motion_fades_it_in() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         let bitmap = 128;
         let key = "test:backf-primary".to_string();
         api.store_graph_image(
@@ -10222,6 +10300,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         for (handle, key, rgba) in [
             (401, "test:backf-primary-abi", [240, 10, 20, 255]),
             (402, "test:backf-secondary-abi", [10, 220, 30, 255]),
@@ -10369,6 +10448,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         for (handle, key, pixel) in [
             (411, "test:backf-selector1-primary", [200, 100, 50, 255]),
             (412, "test:backf-selector1-secondary", [10, 20, 30, 255]),
@@ -10425,6 +10505,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         for (handle, key, pixel) in [
             (413, "test:backf-format2-primary", [200, 100, 50, 128]),
             (414, "test:backf-format2-secondary", [10, 20, 30, 192]),
@@ -10466,6 +10547,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         for (handle, key, pixel) in [
             (419, "test:backf-xrgb-primary", [200, 100, 50, 255]),
             (420, "test:backf-xrgb-secondary", [10, 20, 30, 7]),
@@ -10512,6 +10594,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         api.store_graph_image(
             "test:backf-format2-sentinel-primary".to_string(),
             DecodedImage {
@@ -10551,6 +10634,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         api.store_graph_image(
             "test:backf-format2-mask-primary".to_string(),
             DecodedImage {
@@ -10605,6 +10689,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         for (handle, key) in [
             (417, "test:backf-selector1-maskalpha-primary"),
             (418, "test:backf-selector1-maskalpha-secondary"),
@@ -10702,6 +10787,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         let primary = 501;
         let key = "test:backf-sentinel-primary";
         api.store_graph_image(
@@ -10863,6 +10949,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         api.graph_default_priority = 901;
 
         let bitmap = 99;
@@ -10976,6 +11063,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         let primary = 301;
         let secondary = 302;
         for (handle, key, rgba) in [
@@ -11046,6 +11134,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         api.screen_width = 8;
         api.screen_height = 6;
         api.bitmap_formats.insert(NATIVE_SCREEN_BITMAP, 2);
@@ -11508,6 +11597,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        activate_backgrounds(&mut api);
         api.configure_screen_size(1280, 720);
         let bitmap = 9997;
         let key = "test:mode5-background".to_string();

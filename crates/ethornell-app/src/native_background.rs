@@ -2,6 +2,8 @@ use crate::display_tree::NativeDisplayKind;
 
 pub(crate) const BACK_B_SECONDARY_LAYER_ID: i32 = -0x2200_0000;
 pub(crate) const BACK_F_SECONDARY_LAYER_ID: i32 = -0x2400_0000;
+/// 1x1 opaque black image drawn full-screen for an inactive CDspObjBack.
+pub(crate) const BACK_INACTIVE_FILL_KEY: &str = "runtime:back-inactive-fill";
 pub(crate) const BACK_S_ADDITIONAL_LAYER_IDS: [i32; 3] = [-0x2300_0001, -0x2300_0002, -0x2300_0003];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +105,10 @@ pub(crate) struct NativeBackgroundState {
     pub(crate) secondary_resource_binding: Option<NativeBackgroundSecondaryResource>,
     pub(crate) quad_resource_bindings: Option<[(i32, u64); 4]>,
     pub(crate) backf: Option<NativeBackFState>,
+    /// CDspObjBack+0x138 (vtable+120, Graph90:4C's second value). While 0
+    /// the draw method (sub_41C340) clears the target to black instead of
+    /// drawing the content.
+    pub(crate) active: i32,
 }
 
 impl NativeBackgroundState {
@@ -129,6 +135,7 @@ impl NativeBackgroundState {
             secondary_resource_binding: None,
             quad_resource_bindings: None,
             backf: (class == NativeBackgroundClass::BackF).then(NativeBackFState::default),
+            active: 0,
         }
     }
 

@@ -33,7 +33,9 @@ impl Default for RuntimeGraphConfig {
             sync_load_hold_ms: 0,
             enabled: 0,
             display_mode: (0, 0),
-            renderer_options: (0, 0),
+            // sub_442850 -> sub_43E490(1, 0): draw gate on, background
+            // inactive.
+            renderer_options: (1, 0),
             bitmap_priorities: BTreeMap::new(),
             fonts: Vec::new(),
             text_global_properties: BTreeMap::new(),

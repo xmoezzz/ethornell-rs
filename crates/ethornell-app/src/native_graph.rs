@@ -537,7 +537,10 @@ impl RuntimeTraceApi {
             }
             self.graph_layers.remove(&object);
             let mut properties = RuntimeGraphObjectProperties::default();
-            properties.background = Some(NativeBackgroundState::new(class));
+            let mut background = NativeBackgroundState::new(class);
+            // sub_43E190 re-applies the manager's stored Graph90:4C pair.
+            background.active = self.graph_config.renderer_options.1;
+            properties.background = Some(background);
             if class == NativeBackgroundClass::BackMl {
                 // CDspObjBackML::CDspObjBackML (sub_41DB20) clears +0x7C
                 // after the base constructor, matching transformed sprites.
@@ -558,6 +561,10 @@ impl RuntimeTraceApi {
                 .named_properties
                 .insert("target-object-mode".to_string(), class as i32);
             self.graph_object_properties.insert(object, properties);
+        }
+        if previous_class != Some(class) {
+            let draw = self.graph_config.renderer_options.0 != 0;
+            self.set_graph_object_draw_enabled(object, draw);
         }
         self.display_tree.replace_kind(object, class.display_kind());
         let priority = self.graph_object_properties[&object].native.priority as i32;
@@ -2714,13 +2721,21 @@ impl RuntimeTraceApi {
                 let args = Self::graph90_source_args(stack, 2);
                 let object = self.graph90_current_object();
                 if args.len() == 2 {
-                    self.graph_object_draw_enabled.insert(object, args[0] != 0);
-                    self.graph_object_properties
+                    // sub_43E490: the manager keeps (draw, active) for later
+                    // background classes; the current one gets vtable+4
+                    // (draw gate with member propagation) and vtable+120
+                    // (CDspObjBack+0x138).
+                    self.graph_config.renderer_options = (args[0], args[1]);
+                    self.set_graph_object_draw_enabled(object, args[0] != 0);
+                    if let Some(background) = self
+                        .graph_object_properties
                         .entry(object)
                         .or_default()
-                        .native
-                        .draw_enabled = u32::from(args[0] != 0);
-                    self.graph_config.renderer_options = (args[0], args[1]);
+                        .background
+                        .as_mut()
+                    {
+                        background.active = args[1];
+                    }
                     self.graph_redraw_requested = Some(true);
                 }
                 self.graph90_record_call(object, id, &args);

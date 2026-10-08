@@ -16860,7 +16860,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C090/sub_462330 updates two current-object render controls and invalidates the object.",
+        notes: "sub_47C090 -> sub_43E490: the manager stores (draw, active) (initially (1, 0), sub_442850) and applies them to the current background - vtable+4 draw gate with member propagation and vtable+120 CDspObjBack+0x138 - and again whenever sub_43E190 recreates the class. An inactive background clears the target to black (sub_41C340) instead of drawing its content.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_CURRENT_OBJECT_MODE,
@@ -20926,6 +20926,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK,
     opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
     opcodes::SYS_SWITCH_PROGRAM,
+    opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21073,7 +21074,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE_POSITION,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BLIT_SOURCES,
-    opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
