@@ -16372,7 +16372,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_WORK_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target allocates a work bitmap using current display dimensions and native format.",
+        notes: "sub_4794C0: bitmap >= 0x4000 is fatal; sub_442EE0 creates a back-buffer-sized format-1 bitmap and copies the current frame into it.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
@@ -16380,7 +16380,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target creates a work bitmap and registers its 16-bit render priority.",
+        notes: "sub_4794F0: priority >= 0x10000 and bitmap >= 0x4000 are fatal; sub_442F80 creates a back-buffer-sized bitmap and renders once every object with sort key <= (priority << 16 | 0xFFFF) into it (sub_430D30).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_CENTER,
@@ -20930,6 +20930,8 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP,
     opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
     opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
+    opcodes::GRAPH90_CREATE_WORK_BITMAP,
+    opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21046,8 +21048,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_SET_MULTILAYER_LAYER_SOURCE_VELOCITY,
     opcodes::GRAPH91_SET_MULTILAYER_LAYER_TRANSFORM_VELOCITY,
     opcodes::GRAPH90_INITIALIZE_BITMAP_MEMORY_MANAGER,
-    opcodes::GRAPH90_CREATE_WORK_BITMAP,
-    opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
     opcodes::GRAPH90_SET_DISPLAY_OPTIONS,
     opcodes::GRAPH90_SET_RASTER_FORMAT_MODE,
     opcodes::GRAPH90_REGISTER_FONT,

@@ -21283,6 +21283,12 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x04) => {
                 let bitmap = pop_int_value(stack).unwrap_or_default();
+                // sub_4794C0: sub_497B60 rejects handles >= 0x4000.
+                if bitmap as u32 >= 0x4000 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:04 bitmap handle {bitmap} is out of range"
+                    )));
+                }
                 let created = self.create_native_work_bitmap(bitmap, None);
                 let dimensions = self.bitmap_dimensions.get(&bitmap).copied();
                 tracing::debug!(
@@ -21299,6 +21305,17 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 // the supplied 16-bit render priority.
                 let priority = pop_int_value(stack).unwrap_or_default();
                 let bitmap = pop_int_value(stack).unwrap_or_default();
+                // sub_4794F0: sub_497BB0 then sub_497B60.
+                if priority as u32 >= 0x1_0000 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:05 priority {priority} is out of range"
+                    )));
+                }
+                if bitmap as u32 >= 0x4000 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:05 bitmap handle {bitmap} is out of range"
+                    )));
+                }
                 let created = self.create_native_work_bitmap(bitmap, Some(priority));
                 tracing::debug!(bitmap, priority, created, "GraphCreatePrioritizedBitmap");
             }

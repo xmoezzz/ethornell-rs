@@ -188,3 +188,29 @@ int Graph90_4C_SetCurrentObjectRenderControls(struct CThread *t)
 // CDspObjBack (sub_41C220): vtbl+0x0C (sub_41C330) invalidates every frame
 // while +0x138 is set; vtbl+0x18 (sub_41C340) clears the target to 0
 // (sub_40A620) when +0x138 is 0 or the class draw (vtbl+0x84) fails.
+
+// ------------------------------------------------------ work bitmaps ---
+
+// sub_4794C0 -> sub_442EE0. Script order (bitmap). Creates the bitmap with
+// the back buffer's size and format (sub_442E10) and copies the current
+// back buffer into it (sub_40ADF0) when it can be locked (sub_442FF0),
+// otherwise clears it.
+int Graph90_04_CreateWorkBitmap(struct CThread *t)
+{
+    uint32_t bitmap = pop(t);
+    check_bitmap(bitmap, t);
+    work_bitmap_capture_screen(bitmap);
+    return 0;
+}
+
+// sub_4794F0 -> sub_442F80. Script order (bitmap, priority). Creates the
+// same bitmap and renders, once, every object whose sort key is <=
+// (priority << 16 | 0xFFFF) into it (sub_430D30).
+int Graph90_05_CreatePrioritizedWorkBitmap(struct CThread *t)
+{
+    uint32_t priority = pop(t), bitmap = pop(t);
+    check_priority(priority, t);
+    check_bitmap(bitmap, t);
+    work_bitmap_render_through(bitmap, priority);
+    return 0;
+}
