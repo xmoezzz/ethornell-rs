@@ -153,3 +153,17 @@ int Graph90_88_SetWindowValidRegion(struct CThread *t)
     if (!window_set_valid_rect(win, &r)) script_error("valid region", t); // byte_4E9BF8
     return 0;
 }
+
+// sub_47DBC0 -> sub_462E80 -> sub_440C80. Script order (bitmap, window).
+// Bitmap >= 0x4000 and a missing window are fatal. The bitmap is created
+// (sub_407DA0) with the window rect's size (vtbl+32) in the default format
+// (1 promoted to 2); a failed creation is silent. sub_42C940 then copies the
+// window's own composed bitmap (+0x144..) into it (sub_40AF50).
+int Graph90_83_RenderWindowToBitmap(struct CThread *t)
+{
+    uint32_t window = pop(t), bitmap = pop(t);
+    check_bitmap(bitmap, t);
+    if (window_capture(window, bitmap) == 255)
+        script_error("invalid window", t);
+    return 0;
+}

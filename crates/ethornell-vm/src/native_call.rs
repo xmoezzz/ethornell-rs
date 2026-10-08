@@ -17740,7 +17740,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH_RENDER_OBJECT_TO_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DBC0 validates the destination bitmap and sub_440C80 renders the second BP argument CDspObjWindow into the first bitmap. This closes both handle roles from target code.",
+        notes: "sub_47DBC0: bitmap >= 0x4000 and a missing window are fatal; sub_440C80 recreates the bitmap at the window's size in format 2 and copies the window's composed image into it (sub_42C940).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
@@ -20927,6 +20927,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
     opcodes::SYS_SWITCH_PROGRAM,
     opcodes::GRAPH90_SET_CURRENT_OBJECT_RENDER_CONTROLS,
+    opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21203,7 +21204,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_WINDOWS_PATH_FILE,
     opcodes::GRAPH_SET_MESSAGE_INPUT_SCOPE,
     opcodes::GRAPH_SET_MESSAGE_INPUT_FILTER,
-    opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP,
     opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
     opcodes::GRAPH92_PRELOAD_BITMAP_RESOURCE,
     opcodes::GRAPH92_CANCEL_PENDING_BITMAP_PRELOADS,

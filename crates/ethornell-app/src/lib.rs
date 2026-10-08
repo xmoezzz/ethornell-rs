@@ -20966,8 +20966,28 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let source_window = call.pop_i32("source_window")?;
                 let destination_bitmap = call.pop_i32("destination_bitmap")?;
                 call.require_consumed()?;
-                let rendered = Self::is_window_surface_handle(source_window)
-                    && self.render_graph_object_to_bitmap(source_window, destination_bitmap);
+                // sub_47DBC0: bitmap handle range (sub_497B60), then a
+                // missing window is fatal (sub_440C80 -> 255). The bitmap is
+                // recreated at the window's size in the default format (1
+                // promoted to 2) and receives a raw copy of the window's
+                // composed bitmap (sub_42C940 -> sub_40AF50).
+                if destination_bitmap as u32 >= 0x4000 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:83 bitmap handle {destination_bitmap} is out of range"
+                    )));
+                }
+                let Some(window_size) = Self::is_window_surface_handle(source_window)
+                    .then(|| self.graph_surfaces.get(&source_window))
+                    .flatten()
+                    .map(|surface| (surface.width.max(1.0) as u32, surface.height.max(1.0) as u32))
+                else {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:83 #{source_window} is not a window object"
+                    )));
+                };
+                self.bitmap_dimensions.insert(destination_bitmap, window_size);
+                let rendered = self.render_graph_object_to_bitmap(source_window, destination_bitmap);
+                self.bitmap_formats.insert(destination_bitmap, 2);
                 tracing::info!(
                     source_window,
                     destination_bitmap,
