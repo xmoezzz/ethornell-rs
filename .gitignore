@@ -28,3 +28,5 @@ reverse/
 testcase/
 pack_source.sh
 docs/
+
+.DS_Store

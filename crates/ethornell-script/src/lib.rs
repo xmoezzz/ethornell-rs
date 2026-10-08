@@ -665,7 +665,7 @@ pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
         (0xa0, 0x27) => Some("SoundLoadSeCustomRate"),
         (0xa0, 0x28) => Some("SoundRegisterSeMemory"),
         (0xa0, 0x2c) => Some("SoundSetSeSecondaryVolume"),
-        (0xa0, 0x2f) => Some("SoundGetSePosition"),
+        (0xa0, 0x2f) => Some("SoundGetSeLength"),
         (0xa0, 0x80) => Some("SoundOpenCdAudio"),
         (0xa0, 0x81) => Some("SoundCloseCdAudio"),
         (0xa0, 0x84) => Some("SoundPlayCdTrack"),
