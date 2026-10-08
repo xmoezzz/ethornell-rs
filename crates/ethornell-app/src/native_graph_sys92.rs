@@ -209,45 +209,56 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::Int(result)
             }
             0x1e => {
-                // Script order: destination, x, y, text, font, size, style,
-                // spacing, packed_rgb. This is the direct bitmap text path.
+                // sub_485F10 pops packed_rgb, spacing, bold, size, font,
+                // text, y, x, bitmap (script order reversed).
                 let mut source = pop_args(stack, 9);
                 source.reverse();
-                let destination = source.first().map(value_to_i32).unwrap_or_default();
-                let x = source.get(1).map(value_to_i32).unwrap_or_default();
-                let y = source.get(2).map(value_to_i32).unwrap_or_default();
+                let int = |index: usize| source.get(index).map(value_to_i32).unwrap_or_default();
+                let (bitmap, x, y) = (int(0), int(1), int(2));
                 let text = source.get(3).and_then(value_to_string).unwrap_or_default();
-                let size = source
-                    .get(5)
-                    .map(value_to_i32)
-                    .filter(|value| (4..=256).contains(value))
-                    .unwrap_or(self.text_state.font_size as i32);
-                let spacing = source.get(7).map(value_to_i32).unwrap_or_default();
-                let packed_rgb = source.get(8).map(value_to_i32).unwrap_or(0x00ff_ffff);
-                let color = [
-                    ((packed_rgb >> 16) & 0xff) as f32 / 255.0,
-                    ((packed_rgb >> 8) & 0xff) as f32 / 255.0,
-                    (packed_rgb & 0xff) as f32 / 255.0,
-                    1.0,
-                ];
-                // sub_485F10 -> sub_4039E0 -> sub_403840 writes glyph
-                // coverage straight into the selected bitmap descriptor and
-                // returns the accumulated advance. The string is not markup.
-                let mut advance = 0;
-                if destination > 0 && !text.is_empty() {
-                    if let Some(mut image) = self.graph_bitmap_image(destination) {
-                        advance = snapshot::rasterize_direct_bitmap_text(
-                            &mut image,
-                            &text,
-                            x,
-                            y,
-                            size as f32,
-                            spacing as f32,
-                            color,
+                let (font, size, bold, spacing, packed_rgb) =
+                    (int(4), int(5), int(6), int(7), int(8));
+                let fail = |what: String| {
+                    Some(Err(ethornell_vm::VmError::Runtime(format!("Graph92:1E {what}"))))
+                };
+                // sub_497B60, sub_497AF0, then sub_4039E0's own checks.
+                if bitmap as u32 >= 0x4000 {
+                    return fail(format!("bitmap handle {bitmap} is out of range"));
+                }
+                if self.native_user.font_face(font).is_none() {
+                    return fail(format!("font {font} is not registered"));
+                }
+                let Some(mut image) = self
+                    .query_bitmap_info(bitmap)
+                    .and_then(|_| self.graph_bitmap_image(bitmap))
+                else {
+                    return fail(format!("bitmap {bitmap} does not exist"));
+                };
+                // sub_42F4F0 accepts heights 8..=200.
+                if (size - 8) as u32 > 0xC0 {
+                    return fail(format!("font size {size} is out of range"));
+                }
+                let bytes = encoding_rs::SHIFT_JIS.encode(&text).0.into_owned();
+                let (glyphs, advance) = snapshot::layout_direct_bitmap_text(
+                    &bytes,
+                    x,
+                    y,
+                    size as u32,
+                    bold != 0,
+                    spacing,
+                    packed_rgb as u32,
+                    image.width,
+                    image.height,
+                );
+                if !glyphs.is_empty() {
+                    let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+                    for glyph in &glyphs {
+                        crate::bitmap_blend::blit_mode(
+                            &mut image, format, &glyph.cell, 2, glyph.x, glyph.y, 0, 0,
                         );
-                        if self.replace_graph_bitmap_pixels(destination, image) {
-                            self.clear_bitmap_text(destination);
-                        }
+                    }
+                    if self.replace_graph_bitmap_pixels(bitmap, image) {
+                        self.clear_bitmap_text(bitmap);
                     }
                 }
                 ethornell_vm::Value::Int(advance)

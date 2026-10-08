@@ -412,8 +412,28 @@ impl Default for NativeUserState {
             next_dialog_result: None,
             modeless_dialogs: BTreeMap::new(),
             next_modeless_dialog: 1,
-            next_font_id: 1,
-            fonts: BTreeMap::new(),
+            // sub_468B70 resets the registry at startup and interns the
+            // two stock faces first: id 0 Gothic, id 1 Mincho (the
+            // Japanese names on a Japanese system, sub_46F6F0).
+            next_font_id: 2,
+            fonts: BTreeMap::from([
+                (
+                    "ＭＳ ゴシック".to_string(),
+                    NativeFontRecord {
+                        id: 0,
+                        option: -1,
+                        metadata_charset: None,
+                    },
+                ),
+                (
+                    "ＭＳ 明朝".to_string(),
+                    NativeFontRecord {
+                        id: 1,
+                        option: -1,
+                        metadata_charset: None,
+                    },
+                ),
+            ]),
             font_resources: BTreeSet::new(),
             font_aliases: BTreeMap::new(),
             wallpaper: None,
@@ -475,6 +495,14 @@ impl NativeUserState {
         self.debug_windows
             .get_mut(Self::debug_slot(handle)?)?
             .as_mut()
+    }
+
+    /// sub_468BB0: the face name interned under `id`.
+    pub(crate) fn font_face(&self, id: i32) -> Option<&str> {
+        self.fonts
+            .iter()
+            .find(|(_, record)| record.id == id)
+            .map(|(name, _)| name.as_str())
     }
 
     fn intern_font(&mut self, name: String, option: i32) -> i32 {
@@ -1460,6 +1488,10 @@ mod tests {
         assert_eq!(state.fonts["default"].metadata_charset, Some(0));
         assert_ne!(plain, japanese);
         assert_ne!(japanese, default_charset);
+        assert_eq!(plain, 2);
+        assert_eq!(state.font_face(0), Some("ＭＳ ゴシック"));
+        assert_eq!(state.font_face(1), Some("ＭＳ 明朝"));
+        assert_eq!(state.intern_font("ＭＳ 明朝".to_string(), -1), 1);
     }
 
     #[test]

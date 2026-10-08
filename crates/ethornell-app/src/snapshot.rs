@@ -628,93 +628,152 @@ pub(crate) fn rasterize_bitmap_text(
     (x.round() as i32, line_y.round() as i32)
 }
 
-/// Direct bitmap text of `Graph92:1E` (`sub_403840`).
-///
-/// There is no markup here: `<` is an ordinary glyph. Control characters:
-/// * `0x03 n` sets the line spacing to `n` percent of the cell height;
-/// * `0x04` enables wrapping at the destination bitmap width;
-/// * `0x0A` starts a new line at the original x;
-/// * every other character below 0x20 is skipped.
-///
-/// With wrapping enabled a glyph that would cross the bitmap width moves to
-/// the next line first. The result is the accumulated advance
-/// (`glyph width + spacing` over every drawn glyph, across all lines).
-pub(crate) fn rasterize_direct_bitmap_text(
-    dst: &mut DecodedImage,
-    text: &str,
+/// One glyph of the Graph92:1E direct text path: a `width` x `height`
+/// format-2 cell (ink is `color | 0xFF000000`, the rest transparent) to be
+/// blitted with mode 0 at (`x`, `y`).
+pub(crate) struct DirectTextGlyph {
+    pub x: i32,
+    pub y: i32,
+    pub cell: DecodedImage,
+}
+
+/// sub_403840: lay out Shift-JIS `bytes` from (`start_x`, `start_y`).
+/// Every character occupies a fixed cell: `size` wide for a double-byte
+/// code, `size / 2` for a single byte, advancing by that width plus
+/// `spacing`. 0x03 <n> sets the line pitch to n percent of `size`, 0x04
+/// wraps at the bitmap width, 0x0A starts a new line; other control bytes
+/// are skipped. Layout stops at the first glyph that does not overlap the
+/// `bitmap_width` x `bitmap_height` bitmap (sub_40A530 returns 4).
+/// Returns the glyphs and the accumulated advance.
+pub(crate) fn layout_direct_bitmap_text(
+    bytes: &[u8],
     start_x: i32,
     start_y: i32,
-    size: f32,
-    spacing: f32,
-    color: [f32; 4],
-) -> i32 {
-    let size = size.max(1.0);
-    let font = snapshot_font();
-    let scale = PxScale::from(size);
-    let mut x = start_x as f32;
-    let mut y = start_y as f32;
-    let mut wrap_width: Option<f32> = None;
-    let mut line_percent = 100.0f32;
-    let mut total = 0.0f32;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if (ch as u32) < 0x20 {
-            match ch as u32 {
-                3 => {
-                    if let Some(next) = chars.next() {
-                        line_percent = (next as u32 & 0xff) as f32;
+    size: u32,
+    bold: bool,
+    spacing: i32,
+    packed_rgb: u32,
+    bitmap_width: u32,
+    bitmap_height: u32,
+) -> (Vec<DirectTextGlyph>, i32) {
+    let size_i = size as i32;
+    let mut glyphs = Vec::new();
+    let mut x = start_x;
+    let mut y = start_y;
+    let mut line_percent = 100_i32;
+    let mut wrap: u32 = 0;
+    let mut total = 0_i32;
+    let mut index = 0;
+    while index < bytes.len() && bytes[index] != 0 {
+        let lead = bytes[index];
+        // sub_42FA80: 0x80..0x9F and 0xE0..0xFF lead a double-byte code.
+        let double = lead >= 0x80 && !(0xA0..0xE0).contains(&lead);
+        let code = if double {
+            (u32::from(lead) << 8) | u32::from(bytes.get(index + 1).copied().unwrap_or(0))
+        } else {
+            u32::from(lead)
+        };
+        if code >= 0x20 {
+            let width = if double { size } else { size >> 1 };
+            if wrap != 0 && (x as i64 + i64::from(width)) > i64::from(wrap) {
+                x = start_x;
+                y = y.wrapping_add(size_i * line_percent / 100);
+            }
+            let visible = x <= bitmap_width as i32 - 1
+                && x + width as i32 - 1 >= 0
+                && y <= bitmap_height as i32 - 1
+                && y + size_i - 1 >= 0;
+            if !visible {
+                break;
+            }
+            let ink = direct_text_glyph_cell(code, size, bold);
+            let mut cell = DecodedImage {
+                width: width.max(1),
+                height: size,
+                rgba: vec![0; (width.max(1) * size * 4) as usize],
+            };
+            let rgba = [
+                (packed_rgb >> 16) as u8,
+                (packed_rgb >> 8) as u8,
+                packed_rgb as u8,
+                0xFF,
+            ];
+            for row in 0..size {
+                for col in 0..width {
+                    if ink[(row * size + col) as usize] {
+                        let at = ((row * cell.width + col) * 4) as usize;
+                        cell.rgba[at..at + 4].copy_from_slice(&rgba);
                     }
                 }
-                4 => wrap_width = Some(dst.width as f32),
-                0x0a => {
-                    x = start_x as f32;
-                    y += size * line_percent / 100.0;
+            }
+            if width > 0 {
+                glyphs.push(DirectTextGlyph { x, y, cell });
+            }
+            x = x.wrapping_add(width as i32 + spacing);
+            total = total.wrapping_add(width as i32 + spacing);
+        } else {
+            match code {
+                3 => {
+                    line_percent = i32::from(bytes.get(index + 1).copied().unwrap_or(0));
+                    index += 1;
+                }
+                4 => wrap = bitmap_width,
+                10 => {
+                    x = start_x;
+                    y = y.wrapping_add(size_i * line_percent / 100);
                 }
                 _ => {}
             }
-            continue;
         }
-        let advance = match font {
-            Some(font) => font
-                .as_scaled(scale)
-                .h_advance(font.glyph_id(ch))
-                .max(size * 0.5),
-            None => {
-                if ch.is_ascii() {
-                    size * 0.5
-                } else {
-                    size
+        index += if double { 2 } else { 1 };
+    }
+    (glyphs, total)
+}
+
+/// sub_42F790: draw one code with TextOut at (0, 0) into the font's
+/// monochrome `size` x `size` DIB. 0x7F is drawn as U+2014 and 0xEF40 as
+/// two U+2014; other codes at or above 0xEF40 draw nothing.
+fn direct_text_glyph_cell(code: u32, size: u32, bold: bool) -> Vec<bool> {
+    let mut ink = vec![false; (size * size) as usize];
+    let text: String = match code {
+        0x7F => "\u{2014}".into(),
+        0xEF40 => "\u{2014}\u{2014}".into(),
+        c if c >= 0xEF40 => return ink,
+        c if c < 0x100 => encoding_rs::SHIFT_JIS.decode(&[c as u8]).0.into_owned(),
+        c => encoding_rs::SHIFT_JIS
+            .decode(&[(c >> 8) as u8, c as u8])
+            .0
+            .into_owned(),
+    };
+    let Some(font) = snapshot_font() else {
+        return ink;
+    };
+    let scale = PxScale::from(size as f32);
+    let scaled = font.as_scaled(scale);
+    let mut pen = 0.0_f32;
+    for ch in text.chars() {
+        let glyph = font
+            .glyph_id(ch)
+            .with_scale_and_position(scale, point(pen, scaled.ascent()));
+        pen += scaled.h_advance(font.glyph_id(ch));
+        let Some(outlined) = font.outline_glyph(glyph) else {
+            continue;
+        };
+        let bounds = outlined.px_bounds();
+        outlined.draw(|gx, gy, coverage| {
+            if coverage < 0.5 {
+                return;
+            }
+            let y = bounds.min.y as i32 + gy as i32;
+            for dx in 0..=i32::from(bold) {
+                let x = bounds.min.x as i32 + gx as i32 + dx;
+                if (0..size as i32).contains(&x) && (0..size as i32).contains(&y) {
+                    ink[(y as u32 * size + x as u32) as usize] = true;
                 }
             }
-        };
-        if let Some(width) = wrap_width {
-            if x + advance > width {
-                x = start_x as f32;
-                y += size * line_percent / 100.0;
-            }
-        }
-        match font {
-            Some(font) => {
-                let baseline = y + font.as_scaled(scale).ascent();
-                let glyph = font
-                    .glyph_id(ch)
-                    .with_scale_and_position(scale, point(x, baseline));
-                draw_glyph(dst, font, glyph, color, 0, 0, false, false, None);
-            }
-            None => fill_rect(
-                dst,
-                x.round() as i32,
-                y.round() as i32,
-                advance.max(1.0) as i32,
-                (size * 0.85).max(1.0) as i32,
-                color,
-                None,
-            ),
-        }
-        x += advance + spacing;
-        total += advance + spacing;
+        });
     }
-    total.round() as i32
+    ink
 }
 
 /// Horizontal advance of one glyph, scaled by the horizontal percentage.
@@ -1377,61 +1436,43 @@ mod styled_text_snapshot_tests {
 
 #[cfg(test)]
 mod direct_bitmap_text_tests {
-    use super::rasterize_direct_bitmap_text;
-    use ethornell_image::DecodedImage;
+    use super::layout_direct_bitmap_text;
 
-    fn blank(width: u32, height: u32) -> DecodedImage {
-        DecodedImage {
-            width,
-            height,
-            rgba: vec![0; (width * height * 4) as usize],
-        }
-    }
-
-    fn ink_rows(image: &DecodedImage) -> Vec<u32> {
-        (0..image.height)
-            .filter(|row| {
-                (0..image.width)
-                    .any(|col| image.rgba[((row * image.width + col) * 4 + 3) as usize] != 0)
-            })
-            .collect()
+    fn sjis(text: &str) -> Vec<u8> {
+        encoding_rs::SHIFT_JIS.encode(text).0.into_owned()
     }
 
     #[test]
-    fn wraps_only_after_control_code_four() {
-        let white = [1.0; 4];
-        let mut plain = blank(30, 60);
-        let advance =
-            rasterize_direct_bitmap_text(&mut plain, "あいうえお", 0, 0, 12.0, 0.0, white);
-        assert!(advance >= 5 * 6);
-        // Without 0x04 the text stays on the first row band (it is clipped).
-        assert!(ink_rows(&plain).iter().all(|row| *row < 14));
-
-        let mut wrapped = blank(30, 60);
-        rasterize_direct_bitmap_text(&mut wrapped, "\u{4}あいうえお", 0, 0, 12.0, 0.0, white);
-        assert!(ink_rows(&wrapped).iter().any(|row| *row >= 12));
+    fn cells_are_fixed_width_and_stop_at_the_first_invisible_glyph() {
+        let (glyphs, advance) =
+            layout_direct_bitmap_text(&sjis("あa"), 0, 0, 12, false, 1, 0xFFFFFF, 100, 20);
+        assert_eq!(glyphs.len(), 2);
+        assert_eq!((glyphs[0].x, glyphs[0].cell.width), (0, 12));
+        assert_eq!((glyphs[1].x, glyphs[1].cell.width), (13, 6));
+        assert_eq!(advance, 13 + 7);
+        // The third glyph starts at x=30, past a 30-pixel bitmap: stop.
+        let (glyphs, advance) =
+            layout_direct_bitmap_text(&sjis("あいう"), 0, 0, 12, false, 3, 0xFFFFFF, 30, 20);
+        assert_eq!(glyphs.len(), 2);
+        assert_eq!(advance, 30);
     }
 
     #[test]
-    fn newline_and_line_spacing_percent_move_the_next_row() {
-        let white = [1.0; 4];
-        let mut a = blank(40, 80);
-        rasterize_direct_bitmap_text(&mut a, "あ\nあ", 0, 0, 12.0, 0.0, white);
-        let mut b = blank(40, 80);
-        // 0x03 followed by the raw byte 200: line spacing 200 percent.
-        rasterize_direct_bitmap_text(&mut b, "\u{3}\u{c8}あ\nあ", 0, 0, 12.0, 0.0, white);
-        let last = |image: &DecodedImage| *ink_rows(image).last().unwrap();
-        assert!(last(&b) >= last(&a) + 11);
+    fn control_codes_wrap_and_set_the_line_pitch() {
+        let (glyphs, _) =
+            layout_direct_bitmap_text(&sjis("\u{4}あいう"), 0, 0, 12, false, 0, 0, 30, 60);
+        assert_eq!((glyphs[2].x, glyphs[2].y), (0, 12));
+        let mut bytes = vec![3, 150];
+        bytes.extend(sjis("あ\nあ"));
+        let (glyphs, _) = layout_direct_bitmap_text(&bytes, 5, 0, 12, false, 0, 0, 40, 80);
+        assert_eq!((glyphs[1].x, glyphs[1].y), (5, 18));
     }
 
     #[test]
     fn angle_brackets_are_glyphs_not_markup() {
-        let white = [1.0; 4];
-        let mut with_tags = blank(80, 20);
-        let tagged =
-            rasterize_direct_bitmap_text(&mut with_tags, "<b>x</b>", 0, 0, 12.0, 0.0, white);
-        let mut plain = blank(80, 20);
-        let untagged = rasterize_direct_bitmap_text(&mut plain, "x", 0, 0, 12.0, 0.0, white);
-        assert!(tagged > untagged);
+        let (glyphs, advance) =
+            layout_direct_bitmap_text(b"<b>x</b>", 0, 0, 12, false, 0, 0, 80, 20);
+        assert_eq!(glyphs.len(), 8);
+        assert_eq!(advance, 48);
     }
 }

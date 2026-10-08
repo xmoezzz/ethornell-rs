@@ -9651,6 +9651,54 @@ mod input_tests {
     }
 
     #[test]
+    fn graph92_1e_draws_one_bit_cells_and_raises_the_target_errors() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(5), Value::Int(64), Value::Int(16), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x11, &mut create).unwrap();
+        let draw = |api: &mut super::RuntimeTraceApi, bitmap: i32, font: i32, size: i32| {
+            let mut stack = vec![
+                Value::Int(bitmap),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Str("■a".into()),
+                Value::Int(font),
+                Value::Int(size),
+                Value::Int(0),
+                Value::Int(2),
+                Value::Int(0xFF0000),
+            ];
+            call_graph(api, 0x92, 0x1E, &mut stack)
+        };
+        // Full cell 12 + half cell 6, each followed by the spacing.
+        assert_eq!(draw(&mut api, 5, 0, 12).unwrap(), Value::Int(12 + 2 + 6 + 2));
+        let image = api.graph_bitmap_image(5).unwrap();
+        let colors = image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        // Ink is the packed colour with no antialiased intermediate tones;
+        // the format-1 fourth byte keeps its value (0).
+        assert_eq!(colors, [[0, 0, 0, 0], [255, 0, 0, 0]].into());
+        {
+            // Nothing is drawn below the cell height.
+            assert!((12..16).all(|row| (0..64).all(|col| {
+                image.rgba[((row * 64 + col) * 4) as usize] == 0
+            })));
+        }
+        assert!(draw(&mut api, 0x4000, 0, 12).is_err());
+        assert!(draw(&mut api, 6, 0, 12).is_err());
+        assert!(draw(&mut api, 5, 99, 12).is_err());
+        assert!(draw(&mut api, 5, 1, 7).is_err());
+        assert!(draw(&mut api, 5, 1, 201).is_err());
+        assert!(draw(&mut api, 5, 1, 200).is_ok());
+    }
+
+    #[test]
     fn bitmap_pixel_bridge_uses_target_dib_byte_order_per_format() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();

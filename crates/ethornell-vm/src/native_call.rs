@@ -17876,7 +17876,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH92_DRAW_BITMAP_TEXT_PARAMETERS,
         returns: "text advance",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "0x00485F10 -> sub_4039E0 -> sub_403840 renders colored text directly into the selected bitmap descriptor and returns the accumulated glyph advance through the native output slot. It does not create a display-tree text node. Portable rendering now mutates bitmap pixels so subsequent GraphCompositeBitmap calls receive the glyphs.",
+        notes: "sub_485F10 pops packed_rgb, spacing, bold, size, font, text, y, x, bitmap. Bitmap handle >= 0x4000, an unregistered font id (sub_468BB0), a missing bitmap and a size outside 8..=200 are fatal. sub_403840 draws 1-bit GDI glyph cells (CreateFont height=size, width=size/2, weight 700 when bold) with fixed advances (size for double-byte codes, size/2 for single bytes) plus spacing; 0x03 n sets the line pitch to n% of size, 0x04 wraps at the bitmap width, 0x0A starts a new line; each cell is a format-2 bitmap (color|0xFF000000 or 0) blitted with mode 0, and drawing stops at the first cell outside the bitmap. Returns the accumulated advance.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH92_LOAD_EXTERNAL_BMP,
@@ -20912,6 +20912,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_DELETE_FILE,
     opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
+    opcodes::GRAPH92_DRAW_BITMAP_TEXT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21210,7 +21211,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH92_COMPOSE_BITMAP_ALPHA_AT_OFFSET,
     opcodes::GRAPH92_DRAW_BITMAP_TEXT_MEASURE,
     opcodes::GRAPH92_DRAW_WRAPPED_BITMAP_TEXT,
-    opcodes::GRAPH92_DRAW_BITMAP_TEXT,
     opcodes::GRAPH92_LOAD_EXTERNAL_BMP,
     opcodes::GRAPH_SET_GLYPH_REVEAL_DELAY,
     opcodes::GRAPH_SET_TEXT_REVEAL_ANIMATION,
