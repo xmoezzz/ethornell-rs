@@ -15484,7 +15484,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: THREAD_CALLBACK_PARAMETERS,
         returns: "callback presence/invocation status",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target BPThread_InvokeCallback reads the callback object at CThread+0x58 and invokes it with three values.",
+        notes: "sub_488FC0: finds the thread with sub_444B90 (id 0, the empty root CThread, is never found; the script thread is 1) and queues {a, b, c} on its current procedure (sub_445230 -> sub_431B40); pushes 1 when queued, 0 for an unknown thread or no procedure.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_SYSTEM_WAIT_STATE,
@@ -20919,6 +20919,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
     opcodes::SYS_READ_CURSOR_POINT,
     opcodes::GRAPH90_RELEASE_ICON_INPUT_PROCESSOR,
+    opcodes::SYS_INVOKE_THREAD_CALLBACK,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21166,7 +21167,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_QUERY_INPUT_EVENT_BITS,
     opcodes::SYS_QUERY_SCOPED_INPUT_EVENT,
     opcodes::SYS_CONFIGURE_CURSOR_MOTION,
-    opcodes::SYS_INVOKE_THREAD_CALLBACK,
     opcodes::SYS_WAIT_WINDOW_MESSAGE,
     opcodes::SYS_SET_THREAD_TIMER,
     opcodes::SYS_WAIT_THREAD_TIMER,

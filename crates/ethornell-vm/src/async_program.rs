@@ -1,3 +1,4 @@
+use crate::MAIN_THREAD_ID;
 use crate::{
     ADDRESS_MASK, GraphApi, LOCAL_MEMORY_BASE, SoundApi, SysApi, Value, Vm, VmRunOptions,
     VmStopReason,
@@ -25,7 +26,7 @@ impl Vm {
     pub(crate) fn async_program_is_active(&self, program: Value) -> i32 {
         if matches!(program, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = program.as_i32();
-            if thread_id == 0 || self.native_thread_exists(thread_id) {
+            if thread_id == MAIN_THREAD_ID || self.native_thread_exists(thread_id) {
                 return 1;
             }
             return 0;
@@ -109,6 +110,10 @@ impl Vm {
         Some(thread_id)
     }
 
+    pub(crate) fn async_program_is_active_value(&self, program: &Value) -> bool {
+        self.async_program_is_active(program.clone()) != 0
+    }
+
     pub(crate) fn native_thread_exists(&self, thread_id: i32) -> bool {
         if thread_id == 0 {
             return false;
@@ -188,7 +193,7 @@ impl Vm {
     ) -> bool {
         if matches!(program, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = program.as_i32();
-            if thread_id == 0 {
+            if thread_id == MAIN_THREAD_ID && self.thread.thread_id() != MAIN_THREAD_ID {
                 self.pending_root_program_messages.push_back(message);
                 return true;
             }
@@ -229,8 +234,8 @@ impl Vm {
     ) -> bool {
         if matches!(program, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = program.as_i32();
-            if thread_id == 0 {
-                if self.thread.thread_id() == 0 {
+            if thread_id == MAIN_THREAD_ID {
+                if self.thread.thread_id() == MAIN_THREAD_ID {
                     return self.enqueue_native_callback(callback, trace_events);
                 }
                 if !self.root_procedure_active {
@@ -282,8 +287,8 @@ impl Vm {
     ) -> (bool, Option<i32>) {
         if matches!(program, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = program.as_i32();
-            if thread_id == 0 {
-                return (true, Some(0));
+            if thread_id == MAIN_THREAD_ID && self.thread.thread_id() != MAIN_THREAD_ID {
+                return (true, Some(MAIN_THREAD_ID));
             }
             let activated = self.activate_native_thread(thread_id);
             return (activated, Some(thread_id));
@@ -333,7 +338,7 @@ impl Vm {
         let requested_start = self.scheduler_switch_target.take();
         let mut cursor =
             match requested_start {
-                Some(thread_id) if thread_id == 0 || thread_id == self.thread.thread_id() => {
+                Some(thread_id) if thread_id == MAIN_THREAD_ID || thread_id == self.thread.thread_id() => {
                     // Status 3 selected the root CThread; `run_loaded` executes it
                     // immediately after returning from this child scheduler.
                     self.refresh_thread_links();
@@ -381,7 +386,7 @@ impl Vm {
             scheduler_tasks.append(&mut task.vm.async_tasks);
             task.vm.async_tasks = scheduler_tasks;
             task.vm.suppress_async_pump_once = true;
-            task.vm.root_procedure_active = if self.thread.thread_id() == 0 {
+            task.vm.root_procedure_active = if self.thread.thread_id() == MAIN_THREAD_ID {
                 self.thread.current_procedure().is_some()
             } else {
                 self.root_procedure_active
@@ -462,7 +467,7 @@ impl Vm {
                 let Some(target_thread_id) = requested_switch else {
                     break;
                 };
-                if target_thread_id == 0 || target_thread_id == self.thread.thread_id() {
+                if target_thread_id == MAIN_THREAD_ID || target_thread_id == self.thread.thread_id() {
                     // The requested root CThread is executed by `run_loaded`
                     // immediately after this flat child pass.
                     break;

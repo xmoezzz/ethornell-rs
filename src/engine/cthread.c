@@ -299,3 +299,60 @@ int Sys80_44_LoadProgramThread(struct CThread *t)
     return 0;
 }
 
+
+// ------------------------------------------------- thread lookup by id ---
+// sub_48C990 builds an empty root CThread first (id 0, no regions) and
+// then the script thread with sub_48D080 (id 1); 0x80:0x44 children
+// follow from 2. sub_444B90 walks root -> next_child and never resolves
+// id 0, so the selectors below treat 0 like an unknown thread.
+static struct CThread *thread_by_id(struct CThread *t, uint32_t id)
+{
+    struct CThread *c;
+    for (c = CThread_root(t); c; c = c->next_child)   // sub_444A60, sub_444B90
+        if (c->thread_id == id)
+            return id ? c : 0;
+    return 0;
+}
+
+// sub_488DA0. Script order (thread). Pushes whether the thread exists.
+int Sys80_47_ThreadExists(struct CThread *t) { push(t, thread_by_id(t, pop(t)) != 0); return 0; }
+
+// sub_488DE0. Script order (thread, value): unknown thread is fatal.
+int Sys80_48_PostMessage(struct CThread *t)
+{
+    uint32_t value = pop(t);
+    struct CThread *target = thread_by_id(t, pop(t));
+    if (!target) script_error("thread does not exist", t);       // byte_4EB9BC
+    CThread_queue_message(target, value);                        // sub_4452C0
+    return 0;
+}
+
+// sub_488E60. Script order (thread, count, values): unknown thread and a
+// count below 1 are fatal; there is no upper bound.
+int Sys80_4A_PostMessages(struct CThread *t)
+{
+    const uint32_t *values = pop_ptr(t);
+    int count = pop(t), i;
+    struct CThread *target = thread_by_id(t, pop(t));
+    if (!target) script_error("thread does not exist", t);
+    if (count < 1) script_error("message count", t);             // byte_4EB9E4
+    for (i = 0; i < count; ++i)
+        CThread_queue_message(target, values[i]);
+    return 0;
+}
+
+// sub_488FC0. Script order (thread, a, b, c). Queues {a, b, c} on the
+// thread's current procedure (sub_445230 -> sub_431B40) and pushes 1, or
+// pushes 0 when the thread is unknown or has no procedure.
+int Sys80_4C_InvokeThreadCallback(struct CThread *t)
+{
+    uint32_t c = pop(t), b = pop(t), a = pop(t);
+    struct CThread *target = thread_by_id(t, pop(t));
+    int queued = 0;
+    if (target && target->procedure) {
+        procedure_queue_callback(target->procedure, a, b, c);
+        queued = 1;
+    }
+    push(t, queued);
+    return 0;
+}

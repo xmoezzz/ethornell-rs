@@ -2362,9 +2362,12 @@ fn target_strreplace(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec
     (out, count)
 }
 
+/// Id of the script thread `sub_48C990` creates (see `Vm::new`).
+pub(crate) const MAIN_THREAD_ID: i32 = 1;
+
 impl Vm {
     pub fn new() -> Self {
-        Self {
+        let mut vm = Self {
             trace_id: NEXT_VM_TRACE_ID.fetch_add(1, Ordering::Relaxed),
             operand_slots: vec![Value::Int(0); OPERAND_STACK_CAPACITY],
             memory: vec![0; INITIAL_MEMORY_SIZE],
@@ -2372,11 +2375,17 @@ impl Vm {
             rng_seed: 1,
             system_wait_state: 1,
             next_indexed_record_handle: 1,
-            next_thread_id: 1,
+            // sub_48C990 first builds an empty root CThread (id 0, never a
+            // script thread: sub_444B90 cannot resolve 0) and then the
+            // script thread through sub_48D080 (id 1); 0x80:0x44 children
+            // continue from 2.
+            next_thread_id: MAIN_THREAD_ID + 1,
             global_config: vec![0; user_data::GLOBAL_CONFIG_SIZE],
             global_user_data: vec![0; user_data::GLOBAL_USER_DATA_SIZE],
             ..Self::default()
-        }
+        };
+        vm.thread.set_thread_id(MAIN_THREAD_ID);
+        vm
     }
 
     pub fn advance_time_ms(&mut self, milliseconds: u64) {
@@ -8089,7 +8098,13 @@ impl Vm {
     fn sys80_48_enqueue_message(&mut self, trace_events: bool) -> VmResult<Value> {
         let message = self.pop_value()?;
         let thread_or_program = self.pop_value()?;
-        self.post_async_program_message(thread_or_program, message, trace_events);
+        // sub_488DE0: a thread sub_444B90 cannot find is a script error.
+        if !self.post_async_program_message(thread_or_program.clone(), message, trace_events) {
+            return Err(VmError::Runtime(format!(
+                "PostMessage: thread {} does not exist",
+                value_summary(&thread_or_program)
+            )));
+        }
         Ok(Value::None)
     }
 
@@ -8119,9 +8134,23 @@ impl Vm {
     /// native pop order: `messages_ptr`, `message_count`, `thread_or_program`.
     /// No immediate BP output.
     fn sys80_4a_enqueue_message_array(&mut self, trace_events: bool) -> VmResult<Value> {
+        // sub_488E60: an unknown thread and a count below 1 are script
+        // errors; every value is posted, without an upper bound.
         let messages_ptr = self.pop_ptr()?;
-        let message_count = self.pop_int()?.max(0).min(64) as usize;
+        let message_count = self.pop_int()?;
         let thread_or_program = self.pop_value()?;
+        if !self.async_program_is_active_value(&thread_or_program) {
+            return Err(VmError::Runtime(format!(
+                "PostMessages: thread {} does not exist",
+                value_summary(&thread_or_program)
+            )));
+        }
+        if message_count < 1 {
+            return Err(VmError::Runtime(format!(
+                "PostMessages: message count {message_count} is below 1"
+            )));
+        }
+        let message_count = message_count as usize;
         if trace_events {
             tracing::debug!(
                 program = ?value_summary(&thread_or_program),
@@ -15775,8 +15804,7 @@ mod tests {
             message_animating: true,
             ..Default::default()
         };
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(256), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -15798,8 +15826,7 @@ mod tests {
                 message_animating: true,
                 ..Default::default()
             };
-            assert!(vm.post_async_program_callback(
-                Value::Int(0),
+            assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
                 [Value::Int(code), Value::Int(0), Value::Int(0)],
                 false,
             ));
@@ -15820,8 +15847,7 @@ mod tests {
             message_animating: true,
             ..Default::default()
         };
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(257), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -15832,8 +15858,7 @@ mod tests {
         assert_eq!(api.message_reveals, 0);
         assert_eq!(api.message_finishes, 0);
 
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(257), Value::Int(1), Value::Int(0)],
             false,
         ));
@@ -16090,8 +16115,7 @@ mod tests {
         let mut vm = Vm::new();
         install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
 
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(0), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -16104,8 +16128,7 @@ mod tests {
         let mut vm = Vm::new();
         install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
 
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(1), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -16118,8 +16141,7 @@ mod tests {
         // sub_43D4B0 reacts to code 1 only; sub_431AF0 latches only code 0.
         let mut vm = Vm::new();
         install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(2), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -16163,8 +16185,7 @@ mod tests {
     fn replacing_or_finishing_a_procedure_discards_its_queued_callbacks() {
         let mut vm = Vm::new();
         install_wait_timing_ex(&mut vm, 60_001, 0, 1808);
-        assert!(vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(7), Value::Int(0), Value::Int(0)],
             false,
         ));
@@ -16175,8 +16196,7 @@ mod tests {
     #[test]
     fn native_program_callback_fails_without_an_installed_procedure() {
         let mut vm = Vm::new();
-        assert!(!vm.post_async_program_callback(
-            Value::Int(0),
+        assert!(!vm.post_async_program_callback(Value::Int(super::MAIN_THREAD_ID),
             [Value::Int(1), Value::Int(0), Value::Int(0)],
             false,
         ));
