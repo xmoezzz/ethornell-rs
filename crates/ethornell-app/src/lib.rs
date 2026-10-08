@@ -712,6 +712,9 @@ struct RuntimeTraceApi {
     input_descriptor_deadlines: BTreeMap<i32, u64>,
     /// WM_*BUTTONDBLCLK detection: last press (button, time ms, x, y).
     last_button_press: Option<(i32, u64, f32, f32)>,
+    /// dword_503E40: last press point per mouse button (left, right,
+    /// middle, X1, X2) in game coordinates (sub_48E560 from the WndProc).
+    button_press_points: [(i32, i32); 5],
     /// Physically held descriptors (GetAsyncKeyState), independent of the
     /// native records that Sys80:10 may clear.
     input_physically_held: BTreeSet<i32>,
@@ -1023,6 +1026,7 @@ impl RuntimeTraceApi {
             background_key_polling: 0,
             input_descriptor_deadlines: BTreeMap::new(),
             last_button_press: None,
+            button_press_points: [(0, 0); 5],
             input_physically_held: BTreeSet::new(),
             pointer_object_nodes: Vec::new(),
             sync_load_deadline: 0,
@@ -4002,6 +4006,38 @@ impl RuntimeTraceApi {
             3 => pixel[0] != 0,
             _ => true,
         }
+    }
+
+    /// Inclusive screen rectangle of one processor item sprite (vtable+0x24
+    /// of the child sub_44A6A0 returns).
+    fn graph_input_item_sprite_rect(&self, object: i32, group: i32, item: i32) -> Option<(i32, i32, i32, i32)> {
+        let input = self.graph_input_objects.get(&object)?;
+        let ordinal = input
+            .descriptor
+            .regions
+            .iter()
+            .position(|region| region.group == group && region.index == item)?;
+        let owner = SurfaceControlOwner::InputObject(object);
+        let Some((layer_id, layer)) = self.graph_layers.iter().find(|(layer_id, layer)| {
+            layer.target_surface == Some(input.layer)
+                && self.surface_controls.contains_layer_for_owner(owner, **layer_id)
+                && usize::try_from(layer.hit_id).ok() == Some(ordinal)
+        }) else {
+            // Without a materialized child, use the descriptor rectangle
+            // like the descriptor-only hit test.
+            let region = input.descriptor.regions[ordinal];
+            return Some((
+                region.x,
+                region.y,
+                region.x + region.width - 1,
+                region.y + region.height - 1,
+            ));
+        };
+        let (left, top, _) = self.layer_world_transform(*layer_id, layer);
+        let width = (layer.width * layer.scale_x).abs() as i32;
+        let height = (layer.height * layer.scale_y).abs() as i32;
+        let (left, top) = (left as i32, top as i32);
+        Some((left, top, left + width - 1, top + height - 1))
     }
 
     fn hit_test_graph_input_object(
@@ -14475,7 +14511,19 @@ mod input_tests {
             77,
             super::graph_input::RuntimeGraphInputObject::new(surface),
         );
+        // A real descriptor always has its group table; this group allows
+        // selection but not pointer-driven selection, so hovering only
+        // swaps the hover bitmap.
         let descriptor = GraphInputDescriptor {
+            groups: vec![GraphInputGroup {
+                index: 0,
+                initial_current_item: -1,
+                selection_enabled: true,
+                pointer_selection_enabled: false,
+                pointer_activation_enabled: false,
+                selection_exclusion_key: -1,
+                extended_flags: 0,
+            }],
             regions: vec![GraphInputRegion {
                 group: 0,
                 index: 2,
@@ -15295,7 +15343,17 @@ mod input_tests {
             api.graph_input_objects[&object].deferred_pointer_activation(),
             Some((0, 2))
         );
-        assert!(api.graph_input_objects[&object].queued_events.is_empty());
+        // The press arrives at a new pointer position: the hit change and
+        // pointer selection queue 0x10000001/2/4 first (sub_448690).
+        let hover = api
+            .graph_input_objects
+            .get_mut(&object)
+            .unwrap()
+            .queued_events
+            .drain(..)
+            .map(|event| event[0])
+            .collect::<Vec<_>>();
+        assert_eq!(hover, [0x1000_0001, 0x1000_0002, 0x1000_0004]);
 
         super::apply_runtime_input_event(
             &mut api,
@@ -15393,7 +15451,15 @@ mod input_tests {
             api.graph_input_objects[&object].deferred_pointer_activation(),
             None
         );
-        assert!(api.graph_input_objects[&object].queued_events.is_empty());
+        // No activation (0x10000006/7) is queued for a release outside.
+        assert!(
+            api.graph_input_objects[&object]
+                .queued_events
+                .iter()
+                .all(|event| !matches!(event[0], 0x1000_0006 | 0x1000_0007)),
+            "{:x?}",
+            api.graph_input_objects[&object].queued_events
+        );
     }
 
     #[test]
@@ -16384,6 +16450,17 @@ fn drain_native_input_descriptor(api: &mut RuntimeTraceApi, descriptor: i32) -> 
 /// 6) clear the first-held latch and count every press; other descriptors
 /// count only an up-to-down edge. Returns whether the record was up.
 fn note_native_input_press(api: &mut RuntimeTraceApi, descriptor: i32) -> bool {
+    if let Some(slot) = match descriptor {
+        1 => Some(0),
+        2 => Some(1),
+        4 => Some(2),
+        5 => Some(3),
+        6 => Some(4),
+        _ => None,
+    } && let Some((x, y)) = api.mouse_pos
+    {
+        api.button_press_points[slot] = (x as i32, y as i32);
+    }
     api.input_physically_held.insert(descriptor);
     let was_up = api.input_down_descriptors.insert(descriptor);
     let mouse = matches!(descriptor, 1 | 2 | 4 | 5 | 6);
@@ -23646,10 +23723,36 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
 
     fn poll_object_state_record(&mut self, object: i32) -> [i32; 6] {
         if let Some(input) = self.graph_input_objects.get(&object) {
-            // Graph90:BC is target sub_46CC00 -> sub_4484C0: a pure read of
-            // six fields.  It must never hit-test, consume a host input edge,
-            // mutate hover/current selection, or advance the processor.
-            let state = input.state_record();
+            // Graph90:BC is target sub_46CC00 -> sub_4484C0: a read of the
+            // activation record. With a non-zero value the last two words
+            // are computed now by sub_44A6F0: the live cursor while the
+            // group's +0x14 flag is set and mouse-left is held, otherwise
+            // the last left-button press point, taken relative to the item
+            // sprite's rectangle ((0, 0) when outside).
+            let mut state = input.state_record();
+            if state[3] != 0 {
+                let (group, item) = (state[1], state[2]);
+                let held_flag = input
+                    .descriptor
+                    .groups
+                    .iter()
+                    .find(|candidate| candidate.index == group)
+                    .is_some_and(|candidate| candidate.pointer_activation_enabled);
+                let point = if held_flag && self.input_physically_held.contains(&1) {
+                    self.mouse_pos.map(|(x, y)| (x as i32, y as i32)).unwrap_or_default()
+                } else {
+                    self.button_press_points[0]
+                };
+                let local = self
+                    .graph_input_item_sprite_rect(object, group, item)
+                    .filter(|&(left, top, right, bottom)| {
+                        (left..=right).contains(&point.0) && (top..=bottom).contains(&point.1)
+                    })
+                    .map(|(left, top, _, _)| (point.0 - left, point.1 - top))
+                    .unwrap_or((0, 0));
+                state[4] = local.0;
+                state[5] = local.1;
+            }
             tracing::debug!(
                 target: "graph_input",
                 object,

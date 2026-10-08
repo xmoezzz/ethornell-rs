@@ -88,10 +88,24 @@ impl RuntimeGraphInputObject {
         // couples runtime state back into descriptor equality.
         self.raw_hit = None;
         self.hovered = None;
-        self.registered_state = descriptor.initial_group;
+        // sub_44A900 / sub_447C10 store root+0x08 and each group's +0x0C
+        // only when they index an existing group / item, else -1.
+        let group_count = descriptor.groups.len() as i32;
+        self.registered_state = if descriptor.groups.is_empty()
+            || (0..group_count).contains(&descriptor.initial_group)
+        {
+            descriptor.initial_group
+        } else {
+            -1
+        };
         self.current_selections.clear();
         for group in &descriptor.groups {
-            if group.initial_current_item >= 0 {
+            let item_count = descriptor
+                .regions
+                .iter()
+                .filter(|region| region.group == group.index)
+                .count() as i32;
+            if (0..item_count).contains(&group.initial_current_item) {
                 self.current_selections
                     .insert(group.index, group.initial_current_item);
             }

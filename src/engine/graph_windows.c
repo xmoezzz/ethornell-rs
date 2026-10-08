@@ -202,3 +202,53 @@ int Graph90_86_SetWindowBackgroundBitmap(struct CThread *t)
     }
     return 0;
 }
+
+// sub_484EF0. Script order (window). sub_46C630(window, 1): DCIPIconEx.
+int Graph91_B8_CreateExtendedIconInputProcessor(struct CThread *t)
+{
+    struct DCIPIcon *p = DCIPIconEx_new(find_window(pop(t)));   // sub_44A7C0
+    push(t, p ? icon_registry_add(p) : 0);
+    return 0;
+}
+
+// sub_484F20 -> sub_46CB60. Script order (handle, descriptor). Pushes
+// 1 unknown handle, 4 not a DCIPIconEx, 2/3 from sub_46C9D0 (root count /
+// item tables, low word only) and from sub_44A900, which first empties
+// the processor (vtbl+0x34) and then rechecks every whole group-count
+// dword (3). sub_44A900 stores root+0x08 as the current group only when it
+// indexes a group, and each group's +0x0C only when it indexes an item
+// (else -1).
+int Graph91_BA_ConfigureExtendedIconInputProcessor(struct CThread *t)
+{
+    void *descriptor = pop_ptr(t);
+    push(t, icon_configure_ex(pop(t), descriptor));
+    return 0;
+}
+
+// sub_47EF40 -> sub_46CC00 -> sub_4484C0. Script order (handle, out[6]).
+// out = {+0x30 running, +0x68 group, +0x6C item, +0x70 value, dx, dy}; when
+// the value is non-zero dx/dy come from sub_44A6F0 at read time: the live
+// cursor if the group's +0x14 flag is set and mouse-left is held, else the
+// last left-button press point (dword_503E40), relative to the item
+// sprite's rectangle, (0, 0) when outside. Pushes whether the handle exists.
+int Graph90_BC_GetIconInputState(struct CThread *t)
+{
+    uint32_t handle = pop(t);
+    uint32_t *out = pop_ptr(t);
+    struct DCIPIcon *p = icon_registry_find(handle);
+    if (p) icon_state_record(p, out);
+    push(t, p != 0);
+    return 0;
+}
+
+// sub_47F000 -> sub_46CC70 -> sub_448560. Script order (handle, out[3]).
+// Pops one queued event {code, packed item, value} or writes zeros.
+int Graph90_BF_PopIconInputEvent(struct CThread *t)
+{
+    uint32_t handle = pop(t);
+    uint32_t *out = pop_ptr(t);
+    struct DCIPIcon *p = icon_registry_find(handle);
+    if (p) icon_pop_event(p, out);
+    push(t, p != 0);
+    return 0;
+}

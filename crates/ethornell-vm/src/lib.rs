@@ -4040,14 +4040,9 @@ impl Vm {
                     let event_buffer = self.pop_ptr()?;
                     let exists = api.graph_input_object_exists(object.as_i32());
                     if exists {
+                        // sub_47F000 -> sub_448560: pop one event (zeros when
+                        // the queue is empty); nothing else is written.
                         let event = api.poll_object_event_record(object.as_i32());
-                        if input::clears_title_pending_callback(event[0], event[1]) {
-                            self.write_value(
-                                input::TITLE_PENDING_CALLBACK_ADDR,
-                                2,
-                                &Value::Int(0),
-                            )?;
-                        }
                         for (index, value) in event.into_iter().enumerate() {
                             self.write_int(
                                 event_buffer.wrapping_add((index * 4) as u32),
@@ -4747,6 +4742,11 @@ impl Vm {
                         self.validate_graph_input_descriptor(descriptor_ptr, true)?
                     {
                         Value::Int(status)
+                    } else if self.graph_input_group_counts_exceed_range(descriptor_ptr)? {
+                        // sub_44A900 empties the processor (vtable+0x34) before
+                        // it rechecks every whole group-count dword.
+                        api.configure_graph_input_object(object, GraphInputDescriptor::default());
+                        Value::Int(3)
                     } else {
                         let descriptor = self.read_graph_input_descriptor(descriptor_ptr)?;
                         api.configure_graph_input_object(object, descriptor);

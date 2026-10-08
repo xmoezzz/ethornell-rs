@@ -17348,7 +17348,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_STATE_OUTPUT_PARAMETERS,
         returns: "1 on valid handle, 0 on invalid handle",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_46CC00 -> sub_4484C0 writes [DCIPIcon+0x30 running, +0x68 group, +0x6C item, +0x70 state, local_x, local_y]. local coordinates are derived by sub_44A6F0 only when state is nonzero.",
+        notes: "sub_47EF40 -> sub_4484C0: writes {running, group, item, value, dx, dy}; with a non-zero value dx/dy are computed at read time from the live cursor (group +0x14 flag and mouse-left held) or the last left-button press point, relative to the item sprite rectangle.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_ICON_INPUT_CURRENT_GROUP,
@@ -17372,7 +17372,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_POP_ICON_INPUT_EVENT_PARAMETERS,
         returns: "1 for a valid processor handle, 0 for an invalid handle",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_47F000 -> sub_46CC70 -> sub_448560 destructively pops one FIFO record. Base hover/current-item changes DO append 0x10000002 via sub_448690 -> sub_449760/sub_4497A0 -> sub_448670; payload packs item/group (or -1 on leave) and parameter reports whether compact item+0x14 has a hover bitmap. Base activation updates BC state through sub_449FA0 and does not manufacture 06/07. DCIPIconEx sub_44C170/sub_44C230/sub_44B9E0 add the confirmed 06/07 paths.",
+        notes: "sub_47F000 -> sub_448560: pops one queued {code, packed item, value} event or writes zeros; pushes whether the handle exists. Nothing else is written.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_LOAD_BG_BITMAP_RESOURCE,
@@ -18612,7 +18612,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_EXTENDED_ICON_CREATE_PARAMETERS,
         returns: "input processor handle or 0",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "0x00484EF0 calls sub_46C630(window, 1), which constructs the 0xD8-byte DCIPIconEx variant.",
+        notes: "sub_484EF0 -> sub_46C630(window, 1): constructs a DCIPIconEx and registers it; pushes the handle.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR,
@@ -18620,7 +18620,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_EXTENDED_ICON_CONFIGURE_PARAMETERS,
         returns: "i32 status 0/1/2/3/4",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "0x00484F20 -> sub_46CB60/sub_44A900 validates the extended variant and parses 40-byte roots, 64-byte groups and 196-byte item records. Each resolvable item gets a processor-owned CDspObjVirtual from sub_42AC50. sub_41AB10 sizes that Virtual from the configure-time bitmap descriptor returned by sub_407F20, not from extended item +0x10/+0x14 w/h; sub_41AB40 attaches it at item x/y. sub_4495C0 hit-tests the Virtual's final vtable+0x24 rectangle directly and does not add a renderer clip test. The live child table belongs to the processor rather than the Window, so multiple processors sharing one Window remain independent and releasing one cannot erase another's controls. DCIPIconEx vtable+0x48 is sub_44C6F0: group source +0x3C bit 0x02 or item source +0xC0 bit 0x20 changes action 1 from press-time to release-time activation. sub_448690 stores the pending live-item index in DCIPIcon+0x90 and activates only if MouseRelease occurs while the pointer still resolves to that same item. CDspObjVirtual::IsEnabled (sub_42AD30) delegates to its parent Window.",
+        notes: "sub_484F20 -> sub_46CB60: 1 unknown handle, 4 not extended, 2/3 descriptor errors (low-word item counts in sub_46C9D0, then sub_44A900 empties the processor and rechecks the whole group-count dwords). The initial group and per-group initial items are kept only when in range.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_SET_EXTENDED_ICON_INPUT_ITEM_STATE,
@@ -20934,6 +20934,10 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
     opcodes::SOUND_PLAY_SE,
     opcodes::SOUND_GET_SE_POSITION,
+    opcodes::GRAPH91_CREATE_EXTENDED_ICON_INPUT_PROCESSOR,
+    opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR,
+    opcodes::GRAPH90_GET_ICON_INPUT_STATE,
+    opcodes::GRAPH90_POP_ICON_INPUT_EVENT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21000,8 +21004,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_CREATE_FLASH_CONTROL,
     opcodes::GRAPH91_START_FLASH_CONTROL,
     opcodes::GRAPH91_CAPTURE_AND_RELEASE_FLASH_CONTROL,
-    opcodes::GRAPH91_CREATE_EXTENDED_ICON_INPUT_PROCESSOR,
-    opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH91_SET_EXTENDED_ICON_INPUT_ITEM_STATE,
     opcodes::GRAPH91_GET_ACTIVE_KNOB_HANDLE,
     opcodes::GRAPH91_OPEN_DIRECTSHOW_MOVIE,
@@ -21110,10 +21112,8 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT,
     opcodes::GRAPH90_CREATE_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_CONFIGURE_ICON_INPUT_PROCESSOR,
-    opcodes::GRAPH90_GET_ICON_INPUT_STATE,
     opcodes::GRAPH90_GET_ICON_INPUT_CURRENT_GROUP,
     opcodes::GRAPH90_GET_ICON_INPUT_SELECTIONS,
-    opcodes::GRAPH90_POP_ICON_INPUT_EVENT,
     opcodes::GRAPH90_LOAD_BG_BITMAP_RESOURCE,
     opcodes::GRAPH90_DOWNSAMPLE_BITMAP_HALF,
     opcodes::GRAPH90_IMPORT_EXTERNAL_IMAGE,
