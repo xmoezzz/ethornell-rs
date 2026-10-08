@@ -17132,7 +17132,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_WINDOW_VALID_REGION_PARAMETERS,
         returns: "void; target errors when the inclusive rectangle exceeds the window",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DE90 builds the inclusive rectangle (x,y,x+width-1,y+height-1); sub_42B900 validates and stores it at CDspObjWindow+0x1A0..+0x1AC. It is a Window valid/content rectangle, not a bitmap source crop. sub_42C2A0 returns the same fields and compact DCIPIcon sub_447C10 adds their left/top to compact item offsets.",
+        notes: "sub_47DE90 -> sub_4408D0 -> sub_42B970/sub_42B900: (x, y, x+w-1, y+h-1) is accepted when every corner lies inside the window bitmap (left <= right is not required); a rejected rect and a missing window are fatal. Stores the valid rect and resets the text cursor.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_WINDOW_VALID_REGION,
@@ -20924,6 +20924,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
     opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK,
+    opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21088,7 +21089,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_MAP_VIEWPORT,
     opcodes::GRAPH90_REPLACE_MAP_TILE_ID,
     opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
-    opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
     opcodes::GRAPH90_START_WINDOW_MESSAGE_PROCEDURE,
     opcodes::GRAPH90_CONFIGURE_MESSAGE_CARET_FRAMES,
     opcodes::GRAPH_SET_MESSAGE_START_DELAY,

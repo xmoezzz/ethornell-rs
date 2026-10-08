@@ -13148,6 +13148,28 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_88_checks_each_corner_like_sub_42b900() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(100), Value::Int(50)];
+        let Value::Int(window) = call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() else {
+            panic!("no window");
+        };
+        let region = |x, y, w, h| [window, x, y, w, h].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x90, 0x88, &mut region(10, 5, 80, 40)).unwrap();
+        assert_eq!(api.graph_surfaces[&window].valid_right, 89);
+        // Zero width is accepted when x - 1 is still inside (right < left).
+        call_graph(&mut api, 0x90, 0x88, &mut region(10, 5, 0, 40)).unwrap();
+        assert_eq!(api.graph_surfaces[&window].valid_right, 9);
+        for bad in [region(0, 0, 0, 10), region(0, 0, 101, 10), region(-1, 0, 5, 5), region(0, 45, 5, 6)] {
+            assert!(call_graph(&mut api, 0x90, 0x88, &mut bad.clone()).is_err(), "{bad:?}");
+        }
+        let mut missing = [window + 1, 0, 0, 5, 5].map(Value::Int).to_vec();
+        assert!(call_graph(&mut api, 0x90, 0x88, &mut missing).is_err());
+    }
+
+    #[test]
     fn graph90_81_refuses_attached_and_missing_windows() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -21339,21 +21361,37 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let y = value_to_i32(&args[2]);
                     let x = value_to_i32(&args[3]);
                     let window = value_to_i32(&args[4]);
-                    let valid = Self::is_window_surface_handle(window)
-                        && width > 0
-                        && height > 0
-                        && x >= 0
-                        && y >= 0
-                        && self.graph_surfaces.get(&window).is_some_and(|surface| {
-                            x.saturating_add(width) <= surface.width as i32
-                                && y.saturating_add(height) <= surface.height as i32
-                        });
+                    // sub_47DE90 -> sub_4408D0: a missing window and a rect
+                    // sub_42B900 rejects are script errors. sub_42B900 only
+                    // checks each corner of (x, y, x+w-1, y+h-1) against
+                    // the window bitmap; it never requires left <= right.
+                    let Some((surface_width, surface_height)) = Self::is_window_surface_handle(window)
+                        .then(|| self.graph_surfaces.get(&window))
+                        .flatten()
+                        .map(|surface| (surface.width as i32, surface.height as i32))
+                    else {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:88 #{window} is not a window object"
+                        )));
+                    };
+                    let right = x.wrapping_add(width).wrapping_sub(1);
+                    let bottom = y.wrapping_add(height).wrapping_sub(1);
+                    let inside = |value: i32, limit: i32| (0..limit).contains(&value);
+                    let valid = inside(x, surface_width)
+                        && inside(right, surface_width)
+                        && inside(y, surface_height)
+                        && inside(bottom, surface_height);
+                    if !valid {
+                        return Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:88 valid region ({x}, {y}) {width}x{height} is outside window #{window}"
+                        )));
+                    }
                     if valid {
                         if let Some(surface) = self.graph_surfaces.get_mut(&window) {
                             surface.valid_left = x;
                             surface.valid_top = y;
-                            surface.valid_right = x.saturating_add(width).saturating_sub(1);
-                            surface.valid_bottom = y.saturating_add(height).saturating_sub(1);
+                            surface.valid_right = right;
+                            surface.valid_bottom = bottom;
                         }
                         self.reset_window_text_cursor(window);
                         trace_graph!(

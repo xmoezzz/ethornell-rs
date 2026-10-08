@@ -136,3 +136,20 @@ static void indproc_drain(struct DCIndProc *p)
 //   0x10000007 (6) vt+0x3C(group, item, x, y, z): Ex moves the item and
 //        sets its sprite to ((x + ox - sw/2) << 16, ..., z << 16)
 //        (sub_42C0D0); the base class only validates.
+
+// sub_47DE90 -> sub_462B20 -> sub_4408D0 -> sub_42B970. Script order
+// (window, x, y, width, height). sub_42B900 accepts the rect (x, y,
+// x+w-1, y+h-1) when left and right lie in [0, bitmap width) and top and
+// bottom in [0, bitmap height) -- left <= right is not required -- stores
+// it at +0x1A0..+0x1AC and resets the text cursor (sub_42C5B0: variant 0
+// (left, top), variant 1 (right, top)). A rejected rect (4 -> 1) and a
+// missing window (255 -> -1) are script errors.
+int Graph90_88_SetWindowValidRegion(struct CThread *t)
+{
+    int h = pop(t), w = pop(t), y = pop(t), x = pop(t);
+    struct CDspObjWindow *win = find_window(pop(t));
+    struct Rect r = { x, y, x + w - 1, y + h - 1 };
+    if (!win) script_error("invalid window", t);                 // byte_4E9AB8
+    if (!window_set_valid_rect(win, &r)) script_error("valid region", t); // byte_4E9BF8
+    return 0;
+}
