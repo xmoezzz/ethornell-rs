@@ -12787,8 +12787,12 @@ mod input_tests {
         let child = api.alloc_window_surface(160, 90).unwrap();
         let grandchild = api.alloc_window_surface(80, 45).unwrap();
 
-        assert!(api.attach_graph_surface(parent, child, 7.0, 8.0));
-        assert!(api.attach_graph_surface(child, grandchild, -2.0, 3.0));
+        // Graph91:3E (sub_41AB40) creates the +0x12C member links that
+        // sub_41B1D0 walks.
+        for (master, slave, x, y) in [(parent, child, 7, 8), (child, grandchild, -2, 3)] {
+            let mut attach = [master, slave, x, y].map(Value::Int).to_vec();
+            call_graph(&mut api, 0x91, 0x3e, &mut attach).unwrap();
+        }
 
         let mut position = vec![Value::Int(parent), Value::Int(50), Value::Int(60)];
         call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
@@ -12823,8 +12827,9 @@ mod input_tests {
             assert_eq!((native.position_x, native.position_y), expected);
         }
 
-        assert!(api.detach_graph_surface(parent, child));
-        assert_eq!(api.display_tree.parent(child), None);
+        let mut detach = vec![Value::Int(parent), Value::Int(child)];
+        call_graph(&mut api, 0x91, 0x3f, &mut detach).unwrap();
+        assert!(!api.graph_native_owners.contains_key(&child));
         let child_native = api.graph_object_properties[&child].native;
         assert_eq!(
             (child_native.position_x, child_native.position_y),
@@ -12865,10 +12870,11 @@ mod input_tests {
             Value::Int(-4),
         ];
         call_graph(&mut api, 0x90, 0xe8, &mut add).unwrap();
-        assert_eq!(
-            api.display_tree.local_position(object),
-            Some((109.0, 196.0))
-        );
+        // The member is placed at group + offset; the portable hierarchy
+        // keeps the member-local offset.
+        let native = api.graph_object_properties[&object].native;
+        assert_eq!((native.position_x, native.position_y), (109, 196));
+        assert_eq!(api.display_tree.local_position(object), Some((9.0, -4.0)));
 
         let mut position = vec![Value::Int(group), Value::Int(-30), Value::Int(40)];
         call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
