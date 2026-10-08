@@ -46,3 +46,30 @@ int SoundA0_2F_GetSeLength(struct CThread *t)
     push(t, se_length_ms(channel));
     return 0;
 }
+
+// ------------------------------------------------------------------ BGM ---
+// 16 channels, 0x44-byte records at dword_5085A8 (stream object +4).
+// sub_4A2180: 20 sound system down, 19 channel empty, 21 out of range.
+
+// sub_4873C0. Script order (channel, value). channel >= 16 is fatal;
+// sub_4A2AB0 calls the stream's vtbl+12 with pause = (value == 0).
+int SoundA0_14_ControlBgm(struct CThread *t)
+{
+    uint32_t value = pop(t), channel = pop(t);
+    if (channel >= 0x10) script_error("BGM channel", t);
+    bgm_pause(channel, value == 0);
+    return 0;
+}
+
+// sub_487450. Script order (channel, volume, ms). volume > 128 and
+// channel >= 16 are fatal; sub_4A2AE0 starts a linear ramp from the
+// current volume (+0x28) to the target over `ms` (start tick +0x18,
+// end tick +0x1C, from +0x20, to +0x24, active +0x14).
+int SoundA0_16_SetBgmVolume(struct CThread *t)
+{
+    uint32_t ms = pop(t), volume = pop(t), channel = pop(t);
+    if (volume > 0x80) script_error("volume", t);
+    if (channel >= 0x10) script_error("BGM channel", t);
+    bgm_ramp_volume(channel, volume, ms);
+    return 0;
+}

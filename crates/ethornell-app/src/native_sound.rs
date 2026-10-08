@@ -96,8 +96,16 @@ impl RuntimeTraceApi {
             }
             // sub_4A3150 forwards pause/resume to the resident BGM buffer.
             0x14 => {
+                // sub_4873C0: channel >= 16 is fatal (sub_497A40); sub_4A2AB0
+                // ignores an unloaded channel and calls the stream's
+                // vtable+12 with pause = (value == 0).
                 let action = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                if channel as u32 >= 0x10 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "SoundA0:14 BGM channel {channel} is out of range"
+                    ))));
+                }
                 if action == 0 {
                     if self.bgm_slots.contains_key(&channel) {
                         self.audio_requests.push_back(AudioCommand::Pause {
@@ -133,9 +141,21 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::Int(self.bgm_status(channel))
             }
             0x16 => {
+                // sub_487450: volume > 128 (sub_4979F0) and channel >= 16
+                // (sub_497A40) are fatal; sub_4A2AE0 ignores an unloaded
+                // channel and otherwise ramps linearly from the current
+                // volume to the new one over `duration` ms.
                 let duration = pop_int_value(stack).unwrap_or_default();
                 let volume = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                if volume as u32 > 0x80 || channel as u32 >= 0x10 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "SoundA0:16 volume {volume} / BGM channel {channel} is out of range"
+                    ))));
+                }
+                if !self.bgm_slots.contains_key(&channel) {
+                    return Some(Ok(ethornell_vm::Value::None));
+                }
                 self.set_native_bgm_play_volume(channel, volume);
                 self.apply_native_bgm_volume(channel, duration);
                 ethornell_vm::Value::None

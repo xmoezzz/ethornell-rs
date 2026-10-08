@@ -18973,7 +18973,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: SOUND_BGM_CONTROL_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4873C0 -> sub_4A3150 pauses on zero and starts/resumes on non-zero.",
+        notes: "sub_4873C0: channel >= 16 is fatal; an unloaded channel is ignored; otherwise the stream pauses on 0 and starts/resumes on non-zero (vtable+12).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SOUND_QUERY_BGM_STATE,
@@ -18989,7 +18989,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: SOUND_BGM_FADE_VOLUME_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_487450 updates per-channel BGM gain and schedules the requested transition.",
+        notes: "sub_487450: volume > 128 and channel >= 16 are fatal; an unloaded channel is ignored; otherwise the channel volume ramps linearly from its current value over the given milliseconds (sub_4A2AE0).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SOUND_SET_BGM_PAN,
@@ -20938,6 +20938,8 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_GET_ICON_INPUT_STATE,
     opcodes::GRAPH90_POP_ICON_INPUT_EVENT,
+    opcodes::SOUND_CONTROL_BGM,
+    opcodes::SOUND_SET_BGM_VOLUME,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21258,9 +21260,7 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SOUND_LOAD_BGM_FILE,
     opcodes::SOUND_LOAD_BGM_ARCHIVE,
     opcodes::SOUND_LOAD_BGM_PAIR,
-    opcodes::SOUND_CONTROL_BGM,
     opcodes::SOUND_QUERY_BGM_STATE,
-    opcodes::SOUND_SET_BGM_VOLUME,
     opcodes::SOUND_SET_BGM_PAN,
     opcodes::SOUND_FADE_BGM_TO_FULL,
     opcodes::SOUND_FADE_BGM_TO_SILENCE,
