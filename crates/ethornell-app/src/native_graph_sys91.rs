@@ -839,10 +839,10 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             0x95 => {
-                // The second native argument is accepted but ignored. The
-                // public result is only the number of dictionary matches.
+                // Direct API path: the VM writes the records to the output
+                // buffer (sub_434920); this returns the match count.
                 let source = pop_string_value(stack).unwrap_or_default();
-                let _ignored = stack.pop();
+                let _output = stack.pop();
                 let (_, count) = self.graph_defaults.collect_ruby_records(&source);
                 ethornell_vm::Value::Int(count)
             }

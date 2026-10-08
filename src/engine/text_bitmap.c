@@ -209,3 +209,18 @@ int Graph91_88_ConfigureWindowFont(struct CThread *t)
 //               (item+0x10, item+0x14)
 //     depth   = item+4 if item+0xC0 & 0x10, item+0x0C if & 2, else the
 //               running item ordinal
+
+// ------------------------------------------------ ruby substitutions ---
+
+// sub_484740 -> sub_4632A0 -> sub_434920. Script order (output, source).
+// For every position where the ruby dictionary (unk_565BB4, sub_4348C0)
+// matches, sprintf(out, "%s\\%s\n", base, reading) is appended and the
+// scan skips the rest of the match (sub_434B50(0) - 1 characters).
+// Returns the match count; no match leaves the buffer untouched.
+int Graph91_95_CollectRubyMatches(struct CThread *t)
+{
+    const char *source = pop_ptr(t);
+    char *out = pop_ptr(t);
+    push(t, ruby_collect(source, out));
+    return 0;
+}

@@ -18520,11 +18520,11 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
-        symbol: "Graph91_95_CountTextSubstitutionMatches",
+        symbol: "Graph91_95_CollectRubyMatches",
         parameters: GRAPH91_TEXT_SUBSTITUTION_COUNT_PARAMETERS,
         returns: "i32 match count",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "0x00484740 scans the source and returns only the match count; its other converted argument is ignored and no output pointer is written.",
+        notes: "sub_484740 -> sub_434920: appends 'base\\\\reading\\\\n' for every ruby-dictionary match of the source into the output buffer (the second argument, passed in ecx) and pushes the match count; no match writes nothing.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_REGISTER_TEXT_SUBSTITUTION_RECORDS,
@@ -20943,6 +20943,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_SET_OBJECT_FIXED_POSITION,
     opcodes::GRAPH91_SET_OBJECT_SECONDARY_VECTOR,
     opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
+    opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21018,7 +21019,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_RENDER_WINDOW_TEXT,
     opcodes::GRAPH91_START_EXTENDED_MESSAGE_WITH_OPTION,
     opcodes::GRAPH91_RENDER_WINDOW_TEXT_WITH_STYLE_MODE,
-    opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
     opcodes::GRAPH91_SET_PERSISTENT_TEXT_STYLE,
     opcodes::GRAPH91_CONFIGURE_TEXT_LAYOUT_GLOBALS,
     opcodes::GRAPH91_MEASURE_TEXT,

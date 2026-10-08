@@ -4625,12 +4625,17 @@ impl Vm {
                     }
                     Value::Int(labels.len() as i32)
                 } else if (code, id) == (0x91, 0x95) {
-                    // sub_484740 accepts a second converted argument but the
-                    // target core ignores it. The public result is the match
-                    // count; no BP output buffer is written.
+                    // sub_484740 pops the source, then the output buffer, and
+                    // passes the buffer in ecx to sub_434920, which appends
+                    // "base\\reading\n" for every dictionary match
+                    // (sprintf, so the last one is NUL-terminated) and
+                    // returns the match count. No match writes nothing.
                     let source = self.pop_string_lossy()?;
-                    let _ignored = self.pop_value()?;
-                    let (_, count) = api.collect_ruby_substitutions(&source);
+                    let output = self.pop_ptr()?;
+                    let (records, count) = api.collect_ruby_substitutions(&source);
+                    if count > 0 {
+                        self.write_c_string(output, &records)?;
+                    }
                     if trace_events && (!source.is_empty() || count != 0) {
                         tracing::debug!(source, count, "GraphCountTextSubstitutionMatches");
                     }
