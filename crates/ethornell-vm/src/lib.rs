@@ -1041,6 +1041,18 @@ pub trait GraphApi {
     ) {
     }
 
+    /// CProcCtrlDspObj callback code 1 (sub_4320B0): when the payload or the
+    /// control's input flag is non-zero the control is asked to finish at
+    /// its end values on the next update (+0x98).
+    fn request_native_graph_control_stop(
+        &mut self,
+        _opcode: NativeOpcode,
+        _object_id: i32,
+        _control_id: u64,
+        _payload: i32,
+    ) {
+    }
+
     /// Consume the two deferred values published by CProcCtrlDspObj::Tick
     /// (0x431F00). Value 0 is procedure progress scaled by 1000; value 1 is
     /// 0 for natural completion, 1 for an input/procedure-local forced end,
@@ -6128,14 +6140,23 @@ impl Vm {
                 // code 512 (sub_43A830: forced selection) do anything;
                 // CProcSelectItem* and CProcShakeScreen ignore them.
                 let (terminal, callbacks) = self.drain_procedure_callbacks();
+                if procedure.mode == native_thread::NativeGraphProcedureMode::Control
+                    && let (Some(object_id), Some(control_id)) =
+                        (procedure.object_id, procedure.control_id)
+                {
+                    for callback in callbacks.iter().filter(|callback| callback[0].as_i32() == 1) {
+                        api.request_native_graph_control_stop(
+                            installed.source_opcode,
+                            object_id,
+                            control_id,
+                            callback[1].as_i32(),
+                        );
+                    }
+                }
                 let cancelled = !self.procedure_alive(terminal)
                     || callbacks.iter().any(|callback| {
-                        let code = callback[0].as_i32();
-                        match procedure.mode {
-                            native_thread::NativeGraphProcedureMode::Control => code == 1,
-                            native_thread::NativeGraphProcedureMode::Select => code == 512,
-                            native_thread::NativeGraphProcedureMode::Shake => false,
-                        }
+                        procedure.mode == native_thread::NativeGraphProcedureMode::Select
+                            && callback[0].as_i32() == 512
                     });
                 match procedure.mode {
                     native_thread::NativeGraphProcedureMode::Select => {

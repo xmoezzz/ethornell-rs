@@ -4575,6 +4575,13 @@ impl RuntimeTraceApi {
         input_descriptor: i32,
         source: &'static str,
     ) -> ethornell_vm::VmResult<u64> {
+        // Every control starter checks the input scope with sub_497BB0
+        // (< 0x10000) before the transparency (sub_497DB0).
+        if input_descriptor as u32 >= 0x1_0000 {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} input scope {input_descriptor} is out of range"
+            )));
+        }
         if !self.graph_handle_exists(object) {
             return Err(ethornell_vm::VmError::Runtime(format!(
                 "{source} object #{object} is not registered"
@@ -4693,6 +4700,13 @@ impl RuntimeTraceApi {
         input_descriptor: i32,
         source: &'static str,
     ) -> ethornell_vm::VmResult<u64> {
+        // Every control starter checks the input scope with sub_497BB0
+        // (< 0x10000) before the transparency (sub_497DB0).
+        if input_descriptor as u32 >= 0x1_0000 {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} input scope {input_descriptor} is out of range"
+            )));
+        }
         if !self.graph_handle_exists(object) {
             return Err(ethornell_vm::VmError::Runtime(format!(
                 "{source} object #{object} is not registered"
@@ -11306,7 +11320,15 @@ mod input_tests {
             Value::Int(1808),
         ];
         call_graph(&mut api, 0x90, 0x20, &mut transition).unwrap();
-        api.tick_timelines(50);
+        // CProcCtrlDspObj only advances when its procedure ticks (sub_431F00).
+        let control_id = *api.native_control_last_poll_ms.keys().max().unwrap();
+        api.engine_time_ms += 50;
+        ethornell_vm::GraphApi::poll_native_graph_control_procedure(
+            &mut api,
+            ethornell_vm::NativeOpcode { group: 0x90, id: 0x20 },
+            sprite,
+            control_id,
+        );
 
         // Selector 1's vtable +76 returns +0x240 (64), not base alpha +0xAC.
         // Halfway through a linear 64 -> 200 transition the value is 132.
@@ -19549,6 +19571,23 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 [completion.progress_per_mille, completion.status]
             }
             _ => [1000, 0],
+        }
+    }
+
+    fn request_native_graph_control_stop(
+        &mut self,
+        _opcode: ethornell_vm::NativeOpcode,
+        _object_id: i32,
+        control_id: u64,
+        payload: i32,
+    ) {
+        let input_enabled = self
+            .layer_animations
+            .native_input_controls()
+            .iter()
+            .any(|(id, _)| *id == control_id);
+        if payload != 0 || input_enabled {
+            self.layer_animations.request_native_control_completion(control_id);
         }
     }
 
