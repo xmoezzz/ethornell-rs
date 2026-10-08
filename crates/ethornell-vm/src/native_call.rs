@@ -15540,7 +15540,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: SWITCH_PROGRAM_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::SwitchCoroutine,
-        notes: "Activates the target coroutine and ends the caller's current cooperative slice.",
+        notes: "sub_4892B0 stores the thread id and returns 3; the scheduler (sub_48CD70) runs that thread next in the same pass and continues from its successor, and an unknown id (0 included) ends the pass.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_YIELD,
@@ -20925,6 +20925,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_SPRITE_MASK,
     opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
+    opcodes::SYS_SWITCH_PROGRAM,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21170,7 +21171,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_WAIT_WINDOW_MESSAGE,
     opcodes::SYS_SET_THREAD_TIMER,
     opcodes::SYS_WAIT_THREAD_TIMER,
-    opcodes::SYS_SWITCH_PROGRAM,
     opcodes::SYS_SET_MAIN_LOOP_WAIT_OVERRIDE,
     opcodes::SYS_SET_EXCLUSIVE_THREAD,
     opcodes::SYS_CONFIGURE_DISPLAY_MODE,

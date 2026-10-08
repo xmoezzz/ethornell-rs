@@ -356,3 +356,13 @@ int Sys80_4C_InvokeThreadCallback(struct CThread *t)
     push(t, queued);
     return 0;
 }
+
+// sub_4892B0. Script order (thread). Stores the id in dword_566894 and
+// returns 3: sub_48CD70 then replaces its list cursor with
+// sub_444B90(root, id), so that thread runs next in the same pass and the
+// walk continues from its successor; an unknown id (or 0) ends the pass.
+int Sys80_5E_SwitchThread(struct CThread *t)
+{
+    g_switch_target = pop(t);
+    return 3;
+}
