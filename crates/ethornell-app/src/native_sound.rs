@@ -249,9 +249,25 @@ impl RuntimeTraceApi {
             }
             // sub_487860 starts the resident buffer and returns its position.
             0x24 => {
+                // sub_487860 pops pan, volume, channel and checks pan <= 128
+                // (sub_4979A0), volume <= 128 (sub_4979F0) and channel < 0x40
+                // (sub_497950). An unloaded channel pushes 0; otherwise the
+                // SE restarts and the length in ms is pushed (sub_4943E0).
                 let pan = pop_int_value(stack).unwrap_or(64);
                 let volume = pop_int_value(stack).unwrap_or(128);
                 let channel = pop_int_value(stack).unwrap_or_default();
+                for (value, what, limit) in
+                    [(pan, "pan", 0x80u32), (volume, "volume", 0x80), (channel, "SE channel", 0x3F)]
+                {
+                    if value as u32 > limit {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "SoundA0:24 {what} {value} is out of range"
+                        ))));
+                    }
+                }
+                if !self.sound_slots.contains_key(&channel) {
+                    return Some(Ok(ethornell_vm::Value::Int(0)));
+                }
                 self.set_native_sound_play_volume(channel, volume);
                 let sound = self.sound_slots.get_mut(&channel).map(|sound| {
                     let restart = std::mem::take(&mut sound.needs_restart);
@@ -278,7 +294,7 @@ impl RuntimeTraceApi {
                         self.start_sound_clock(channel, sound.playback_rate);
                     }
                 }
-                ethornell_vm::Value::Int(self.sound_position(channel))
+                ethornell_vm::Value::Int(self.sound_length_ms(channel))
             }
             // sub_4878F0 stops without freeing the resident buffer.
             0x25 => {
@@ -350,11 +366,17 @@ impl RuntimeTraceApi {
                 self.set_native_sound_gain_bank(channel, volume, false);
                 ethornell_vm::Value::None
             }
-            // sub_487BA0 -> sub_4943E0 returns the current playback position
-            // in milliseconds, including the native fixed playback scale.
+            // sub_487BA0 -> sub_4943E0: the loaded SE's length in ms (from
+            // the copied BURIKO wave header, scaled by the playback rate);
+            // channel >= 0x40 is fatal.
             0x2F => {
                 let channel = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(self.sound_position(channel))
+                if channel as u32 >= 0x40 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "SoundA0:2F SE channel {channel} is out of range"
+                    ))));
+                }
+                ethornell_vm::Value::Int(self.sound_length_ms(channel))
             }
             // sub_48D640 opens the target MCI CD-audio device and selects
             // TMSF mode. Portable hosts expose the same lifecycle through a
@@ -954,11 +976,25 @@ impl RuntimeTraceApi {
         }
     }
 
-    fn sound_position(&self, channel: i32) -> i32 {
-        native_clock(&self.sound_playback_clocks, channel)
-            .map(NativeAudioClock::position_ms)
-            .unwrap_or_default()
+    /// sub_4943E0: record +0x0C (samples) * 1000 / record +0x10 (rate)
+    /// times the fixed 65536 / playback-rate scale, then >> 16. The record
+    /// is the 64-byte BURIKO wave header copied at load (sub_494300).
+    fn sound_length_ms(&self, channel: i32) -> i32 {
+        let Some(slot) = self.sound_slots.get(&channel) else {
+            return 0;
+        };
+        let info = ethornell_audio::probe_audio(&slot.asset.bytes);
+        let (Some(samples), Some(frequency)) = (info.sample_len, info.frequency) else {
+            return 0;
+        };
+        if frequency == 0 {
+            return 0;
+        }
+        let scale = (65536.0 / slot.playback_rate) as i64 as u32;
+        let value = f64::from(samples) * 1000.0 / f64::from(frequency) * f64::from(scale);
+        ((value as i64 as u32) >> 16) as i32
     }
+
 }
 
 const NATIVE_CD_AUDIO_CHANNEL: i32 = 0x1FE;

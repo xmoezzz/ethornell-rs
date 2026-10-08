@@ -13245,6 +13245,42 @@ mod input_tests {
     }
 
     #[test]
+    fn se_play_and_query_report_the_length_like_sub_4943e0() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut header = vec![0u8; 0x40];
+        header[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+        header[4..8].copy_from_slice(b"bw  ");
+        header[12..16].copy_from_slice(&66150u32.to_le_bytes()); // samples
+        header[16..20].copy_from_slice(&44100u32.to_le_bytes()); // rate
+        api.sound_slots.insert(
+            3,
+            super::audio_runtime::SoundSlot {
+                asset: super::audio_runtime::AudioAsset {
+                    archive: String::new(),
+                    file: "se".into(),
+                    bytes: header,
+                },
+                loop_asset: None,
+                looped: false,
+                decode_gain: 1.0,
+                playback_rate: 1.0,
+                panning: 0.0,
+                native_start_parameter: 0,
+                needs_restart: false,
+            },
+        );
+        let mut play = vec![Value::Int(3), Value::Int(128), Value::Int(64)];
+        assert_eq!(call_sound(&mut api, 0xA0, 0x24, &mut play).unwrap(), Value::Int(1500));
+        assert_eq!(call_sound(&mut api, 0xA0, 0x2F, &mut vec![Value::Int(3)]).unwrap(), Value::Int(1500));
+        let mut unloaded = vec![Value::Int(4), Value::Int(128), Value::Int(64)];
+        assert_eq!(call_sound(&mut api, 0xA0, 0x24, &mut unloaded).unwrap(), Value::Int(0));
+        let mut bad_pan = vec![Value::Int(3), Value::Int(128), Value::Int(129)];
+        assert!(call_sound(&mut api, 0xA0, 0x24, &mut bad_pan).is_err());
+    }
+
+    #[test]
     fn graph90_88_checks_each_corner_like_sub_42b900() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();

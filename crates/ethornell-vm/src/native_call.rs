@@ -19061,7 +19061,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: SOUND_SE_PLAY_PARAMETERS,
         returns: "playback position/status",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_487860 -> sub_4943A0 starts a resident SE buffer with per-play volume and pan.",
+        notes: "sub_487860: pan > 128, volume > 128 and channel >= 64 are fatal; an unloaded channel pushes 0, otherwise the SE restarts with that volume/pan and the length in ms is pushed (sub_4943E0: header samples * 1000 / rate, scaled by the playback rate).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SOUND_STOP_SE,
@@ -19105,11 +19105,11 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::SOUND_GET_SE_POSITION,
-        symbol: "SoundA0_2F_GetSePosition",
+        symbol: "SoundA0_2F_GetSeLength",
         parameters: SOUND_POSITION_QUERY_PARAMETERS,
         returns: "position/status",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_487BA0 queries the current resident SE playback position.",
+        notes: "sub_487BA0: channel >= 64 is fatal; pushes the loaded SE's length in ms (sub_4943E0 reads the BURIKO wave header copied at load, not a play cursor).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SOUND_OPEN_CD_AUDIO,
@@ -20932,6 +20932,8 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH_BIND_BITMAP_TO_SURFACE,
     opcodes::GRAPH90_CREATE_WORK_BITMAP,
     opcodes::GRAPH90_CREATE_PRIORITIZED_WORK_BITMAP,
+    opcodes::SOUND_PLAY_SE,
+    opcodes::SOUND_GET_SE_POSITION,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21267,13 +21269,11 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SOUND_LOAD_SE_SCALED,
     opcodes::SOUND_RELEASE_SE,
     opcodes::SOUND_LOAD_SE_DOUBLE_RATE,
-    opcodes::SOUND_PLAY_SE,
     opcodes::SOUND_STOP_SE,
     opcodes::SOUND_FADE_SE_TO_SILENCE,
     opcodes::SOUND_LOAD_SE_CUSTOM_RATE,
     opcodes::SOUND_REGISTER_SE_MEMORY,
     opcodes::SOUND_SET_SE_SECONDARY_VOLUME,
-    opcodes::SOUND_GET_SE_POSITION,
     opcodes::SOUND_OPEN_CD_AUDIO,
     opcodes::SOUND_CLOSE_CD_AUDIO,
     opcodes::SOUND_PLAY_CD_TRACK,
