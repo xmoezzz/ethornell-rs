@@ -580,7 +580,7 @@ pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
         (0x91, 0x92) => Some("Graph91_92_StartExtendedMessageWithOption"),
         (0x91, 0x93) => Some("Graph91_93_RenderWindowTextWithStyleMode"),
         (0x91, 0x94) => Some("Graph91_94_UpdateTextSubstitution"),
-        (0x91, 0x95) => Some("Graph91_95_CountTextSubstitutionMatches"),
+        (0x91, 0x95) => Some("Graph91_95_CollectRubyMatches"),
         (0x91, 0x96) => Some("Graph91_96_RegisterTextSubstitutionRecords"),
         (0x91, 0x97) => Some("Graph91_97_SetPersistentTextStyle"),
         (0x91, 0x98) => Some("Graph91_98_ConfigureTextLayoutGlobals"),
