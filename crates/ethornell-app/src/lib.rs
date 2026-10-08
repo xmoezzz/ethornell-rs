@@ -1610,6 +1610,14 @@ impl RuntimeTraceApi {
     }
 
     fn cached_file_exists(&mut self, archive: &str, file: &str) -> bool {
+        // Loose files change at run time (saves are written and deleted;
+        // the target never caches GetFileAttributesA), so only the immutable
+        // archive-entry answer is cached.
+        if find_runtime_file_from_root(&self.manager, &self.native_root, archive, file)
+            .is_some_and(|path| path.is_file())
+        {
+            return true;
+        }
         let key = runtime_file_cache_key(archive, file);
         if let Some(exists) = self.file_exists_cache.get(&key).copied() {
             return exists;
@@ -1620,6 +1628,12 @@ impl RuntimeTraceApi {
     }
 
     fn cached_file_size(&mut self, archive: &str, file: &str) -> i32 {
+        if let Some(size) = find_runtime_file_from_root(&self.manager, &self.native_root, archive, file)
+            .and_then(|path| std::fs::metadata(path).ok())
+            .filter(|meta| meta.is_file())
+        {
+            return size.len() as i32;
+        }
         let key = runtime_file_cache_key(archive, file);
         if let Some(size) = self.file_size_cache.get(&key).copied() {
             return size;

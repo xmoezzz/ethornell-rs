@@ -15196,7 +15196,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: DELETE_FILE_PARAMETERS,
         returns: "Win32 BOOL",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x00488840 constructs either root\\file or primary_root+file, then calls DeleteFileA.",
+        notes: "sub_488840 pops file, then root; it deletes root\\\\file, or primary root + file when the root is null (DeleteFileA), and pushes the success flag.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_FILE_EXISTS,
@@ -15204,7 +15204,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: FILE_EXISTS_PARAMETERS,
         returns: "target search-root status",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x004888C0 pops file first and archive/root second, then calls sub_4665C0 with ECX=file and the archive/root stack argument; both values participate in loose-file and archive lookup.",
+        notes: "sub_4888C0 pops file, then archive/root; sub_4665C0: without an archive an absolute path is tested directly, otherwise the file is looked up as a loose file under the primary and secondary roots (plus the Sys80 additional directories as root\\\\dir\\\\file); with an archive the loose file under the primary root, then the archive at the primary and the secondary root (entry names of 0x60+ bytes are fatal). Loose-file results are never cached.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_FILE_SIZE,
@@ -20908,6 +20908,8 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_START_NODE_CONTROL,
     opcodes::GRAPH90_START_OBJECT_CONTROL_EX,
     opcodes::GRAPH90_START_NODE_CONTROL_EX,
+    opcodes::SYS_FILE_EXISTS,
+    opcodes::SYS_DELETE_FILE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21157,8 +21159,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_FILE_RANGE,
     opcodes::SYS_SET_VALIDATED_FILE_ROOT,
     opcodes::SYS_LOAD_PROGRAM_THREAD,
-    opcodes::SYS_DELETE_FILE,
-    opcodes::SYS_FILE_EXISTS,
     opcodes::SYS_FILE_SIZE,
     opcodes::SYS_GET_CONFIGURED_ROOT,
     opcodes::SYS_SET_PRIMARY_ROOT,

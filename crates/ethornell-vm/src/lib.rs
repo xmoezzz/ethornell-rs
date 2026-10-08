@@ -3646,7 +3646,17 @@ impl Vm {
                     let file = self.value_as_native_string_lossy(raw_file.clone())?;
                     let archive = self.value_as_native_string_lossy(raw_archive.clone())?;
                     let found = self.resource_file_exists_with_search(api, &archive, &file);
-                    tracing::info!(
+                    // sub_466550 rejects an entry name of 0x60 bytes or more
+                    // before it searches the archive (sub_464520 is fatal).
+                    if !found
+                        && !archive.is_empty()
+                        && encoding_rs::SHIFT_JIS.encode(&file).0.len() >= 0x60
+                    {
+                        return Err(VmError::Runtime(format!(
+                            "Sys80:34 resource name {file} is longer than 95 bytes"
+                        )));
+                    }
+                    tracing::debug!(
                         archive,
                         file,
                         ?raw_archive,
@@ -7782,14 +7792,19 @@ impl Vm {
                 return true;
             }
         }
+        // sub_466440: with dword_506BE0 set, each additional directory is
+        // probed as a loose file `root + dir + "\\" + file`.
         if self.additional_resource_search_enabled {
-            for path in &self.additional_resource_paths {
-                let candidate = join_native_path(path, file);
-                if archives
-                    .iter()
-                    .any(|candidate_archive| api.file_exists(candidate_archive, &candidate))
-                {
-                    return true;
+            let roots = [
+                self.primary_resource_root.clone().unwrap_or_default(),
+                self.secondary_resource_root.clone().unwrap_or_default(),
+            ];
+            for root in &roots {
+                for path in &self.additional_resource_paths {
+                    let candidate = join_native_path(&join_native_path(root, path), file);
+                    if api.file_exists("", &candidate) {
+                        return true;
+                    }
                 }
             }
         }
