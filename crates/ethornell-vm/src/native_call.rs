@@ -16592,7 +16592,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_OBJECT_CONTROL,
-        symbol: "Graph90_20_StartObjectControl",
+        symbol: "Graph90_20_StartAlphaControl",
         parameters: GRAPH90_START_OBJECT_CONTROL_PARAMETERS,
         returns: "CProcCtrlDspObj completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
@@ -16600,7 +16600,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_NODE_CONTROL,
-        symbol: "Graph90_21_StartNodeControl",
+        symbol: "Graph90_21_StartMoveControl",
         parameters: GRAPH90_START_NODE_CONTROL_PARAMETERS,
         returns: "CProcCtrlDspObj completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
@@ -16608,7 +16608,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_OBJECT_CONTROL_EX,
-        symbol: "Graph90_22_StartObjectControlEx",
+        symbol: "Graph90_22_StartAlphaControlEx",
         parameters: GRAPH90_START_OBJECT_CONTROL_EX_PARAMETERS,
         returns: "CProcCtrlDspObj completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
@@ -16616,7 +16616,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_NODE_CONTROL_EX,
-        symbol: "Graph90_23_StartNodeControlEx",
+        symbol: "Graph90_23_StartMoveControlEx",
         parameters: GRAPH90_START_NODE_CONTROL_EX_PARAMETERS,
         returns: "CProcCtrlDspObj completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
