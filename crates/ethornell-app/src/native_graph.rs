@@ -2805,19 +2805,40 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             (0x90, 0x53) => {
+                // sub_47C170 -> sub_43EEE0 -> sub_428C00. Script order
+                // (sprite, x, y, width, height); a missing sprite is fatal.
+                // Modes 0/1/3 invalidate the rectangle on screen and reject
+                // a non-positive width/height (status 10, fatal); mode 5
+                // re-rasterizes its projected cache there; other modes
+                // rebuild (mode 6, sub_42A650) and invalidate the sprite.
                 let args = Self::graph90_source_args(stack, 5);
-                if let Some(handle) = args.first().copied()
-                    && self.graph90_object_matches(
-                        handle,
-                        GRAPH90_SPRITE_TAG,
-                        512,
-                        GRAPH90_CLASS_SPRITE,
-                    )
+                let [handle, _x, _y, width, height] = args[..] else {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:53 expected five arguments".into(),
+                    )));
+                };
+                if !self.graph90_object_matches(handle, GRAPH90_SPRITE_TAG, 512, GRAPH90_CLASS_SPRITE)
                 {
-                    // Target sub_428C00 rebuilds/invalidates the sprite's cached geometry.
-                    self.graph_redraw_requested = Some(false);
-                    self.graph90_record_call(handle, id, &args);
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:53 #{handle} is not a sprite object"
+                    ))));
                 }
+                let mode = self
+                    .graph_object_properties
+                    .get(&handle)
+                    .and_then(|properties| properties.named_properties.get("target-object-mode"))
+                    .copied()
+                    .unwrap_or_default();
+                if matches!(mode, 0 | 1 | 3) && (width <= 0 || height <= 0) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:53 update region {width}x{height} is invalid"
+                    ))));
+                }
+                if matches!(mode, 5 | 6) {
+                    let _ = self.graph90_resync_fixed_sprite_geometry(handle);
+                }
+                self.graph_redraw_requested = Some(false);
+                self.graph90_record_call(handle, id, &args);
                 ethornell_vm::Value::None
             }
             (0x90, 0x54) => {

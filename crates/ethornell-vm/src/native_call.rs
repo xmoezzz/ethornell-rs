@@ -16888,11 +16888,11 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
-        symbol: "Graph90_53_RefreshSpriteObject",
+        symbol: "Graph90_53_RefreshSpriteRect",
         parameters: GRAPH90_REFRESH_SPRITE_OBJECT_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C170/sub_462550 rebuilds/refreshes an existing sprite object. The public ABI consumes four additional values, but the target core ignores them.",
+        notes: "sub_47C170 -> sub_428C00 with the rect (x, y, w, h) passed in registers: missing sprite fatal; modes 0/1/3 invalidate the rect and reject an empty one (fatal); mode 5 re-rasterizes its projected cache in the rect; mode 6 rebuilds its cache; other modes invalidate the sprite.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_SPRITE_ENABLED,
@@ -20944,6 +20944,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_SET_OBJECT_SECONDARY_VECTOR,
     opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
     opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
+    opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21083,7 +21084,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE_POSITION,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BLIT_SOURCES,
-    opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SCALED_BITMAP,

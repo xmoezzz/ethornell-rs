@@ -231,3 +231,20 @@ int Graph90_05_CreatePrioritizedWorkBitmap(struct CThread *t)
 // sub_4819F0 -> sub_41B580: secondary vector +0x6C..+0x74, recursively for
 // members, then vtbl+68 with this object's own primary vector -- so every
 // descendant ends with the root's primary vector. Missing object is fatal.
+
+// sub_47C170 -> sub_462550 -> sub_43EEE0 (x/y travel in esi/edi). Script
+// order (sprite, x, y, w, h). Missing sprite -> 255 (fatal). sub_428C00:
+// modes 0/1/3 offset (x, y, x+w-1, y+h-1) by the sprite rect (vtbl+36)
+// and invalidate it, an empty rect returning 0 -> status 10 (fatal,
+// byte_4E9420); mode 5 re-rasterizes its projected cache in that area
+// (sub_42A330 / sub_42A770); other modes rebuild the cache for 5/6
+// (sub_42A650) and invalidate the whole sprite (vtbl+12).
+int Graph90_53_RefreshSpriteRect(struct CThread *t)
+{
+    int h = pop(t), w = pop(t), y = pop(t), x = pop(t);
+    switch (sprite_refresh_rect(pop(t), x, y, w, h)) {
+    case 10:  script_error("invalid update region", t);
+    case 255: script_error("invalid object", t);
+    }
+    return 0;
+}
