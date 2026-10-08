@@ -15908,7 +15908,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: REGISTERED_OBJECT_STATE_SET_PARAMETERS,
         returns: "boolean object found",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Looks up a DCIndProc registry entry and writes its state field at native offset +0x10.",
+        notes: "sub_48A1B0: writes DCIndProc+0x10 (the enabled flag, 1 at construction) of the registered processor and pushes whether the handle exists. Processors with 0 are skipped by the per-frame update and drain no messages.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
@@ -15916,7 +15916,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: REGISTERED_OBJECT_STATE_GET_PARAMETERS,
         returns: "boolean object found",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Looks up a registered object and writes its current state through the output pointer.",
+        notes: "sub_48A200: pops the output pointer then the handle, writes DCIndProc+0x10 and pushes whether the handle exists.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
@@ -15924,7 +15924,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: REGISTERED_OBJECT_MESSAGE_PARAMETERS,
         returns: "boolean object found",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Returns zero only when registry lookup fails. For an existing object, a 1..=256 DWORD descriptor is queued; an invalid count queues nothing but still returns one, matching sub_48A250.",
+        notes: "sub_48A250: queues a 1..256-word message on the registered processor (other counts queue nothing) and pushes whether the handle exists. Each frame enabled processors drain their queue newest-registration first: [0, v] sets the enabled flag, other messages go to sub_44A250 (activate, select group/item, pointer processing, item bitmaps, item depth/position).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_SYSTEM_MODE_FLAG,
@@ -20920,6 +20920,9 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_CURSOR_POINT,
     opcodes::GRAPH90_RELEASE_ICON_INPUT_PROCESSOR,
     opcodes::SYS_INVOKE_THREAD_CALLBACK,
+    opcodes::SYS_SET_REGISTERED_OBJECT_STATE,
+    opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
+    opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21145,9 +21148,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_SET_PERFORMANCE_PROFILING,
     opcodes::SYS_LOAD_GLOBAL_USER_DATA,
     opcodes::SYS_SAVE_GLOBAL_USER_DATA,
-    opcodes::SYS_SET_REGISTERED_OBJECT_STATE,
-    opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
-    opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
     opcodes::SYS_WAIT_EXCLUSION_SECTION,
     opcodes::SYS_QUERY_WINDOW_MINIMIZE_LATCH,
     opcodes::SYS_COUNT_FILES,

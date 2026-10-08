@@ -3751,6 +3751,19 @@ impl Vm {
                     let event_code = self.pop_int()?;
                     api.post_queued_event(event_code, parameter);
                     Value::None
+                } else if (code, id) == (0x80, 0xa9) {
+                    // sub_48A200: pops the output pointer, then the handle;
+                    // writes DCIndProc+0x10 and pushes whether it exists.
+                    let output = self.pop_ptr()?;
+                    let object = self.pop_int()?;
+                    match api.registered_object_value(object) {
+                        Some(state) => {
+                            self.write_int(output, 2, state as u32)?;
+                            self.clear_shadow_values(output, 4);
+                            Value::Int(1)
+                        }
+                        None => Value::Int(0),
+                    }
                 } else if (code, id) == (0x80, 0xa8) {
                     let state = self.pop_int()?;
                     let object = self.pop_int()?;

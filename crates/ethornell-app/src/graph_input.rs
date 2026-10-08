@@ -34,6 +34,13 @@ pub(crate) struct RuntimeGraphInputObject {
     /// current live-item index here and `sub_448690` activates it on release
     /// only if the pointer is still over the same item.
     deferred_pointer_activation: Option<(i32, i32)>,
+    /// DCIndProc+0x10 (1 at construction, sub_4476D0). Sys80:A8/A9 and the
+    /// message `[0, value]` write it; a processor with 0 is skipped by the
+    /// per-frame update (sub_46C570/sub_46C5B0) and drains no messages.
+    pub(crate) enabled: i32,
+    /// DCIPIconEx item sprite z (integer; the sprite gets z << 16) set by
+    /// messages 0x10000005 / 0x10000007 (sub_44C4A0 -> sub_42C0D0).
+    pub(crate) item_depths: BTreeMap<(i32, i32), i32>,
 }
 
 impl RuntimeGraphInputObject {
@@ -69,6 +76,8 @@ impl RuntimeGraphInputObject {
             state_value: 0,
             state_local: (0, 0),
             deferred_pointer_activation: None,
+            enabled: 1,
+            item_depths: BTreeMap::new(),
         }
     }
 
@@ -112,6 +121,7 @@ impl RuntimeGraphInputObject {
         // children, not immutable descriptor bits, so prior runtime states do
         // not survive a descriptor rebuild.
         self.item_states.clear();
+        self.item_depths.clear();
     }
 
     pub(crate) fn set_item_state(&mut self, group: i32, index: i32, state: i32) -> Result<(), i32> {
@@ -374,7 +384,230 @@ impl RuntimeGraphInputObject {
     }
 
     pub(crate) fn is_running(&self) -> bool {
-        self.active && self.running
+        self.active && self.running && self.enabled != 0
+    }
+
+    /// Item count of a configured group (internal group +0x00), None when
+    /// the group index is out of range.
+    fn group_item_count(&self, group: i32) -> Option<i32> {
+        let count = self
+            .descriptor
+            .regions
+            .iter()
+            .filter(|region| region.group == group)
+            .count() as i32;
+        let known = if self.descriptor.groups.is_empty() {
+            count > 0
+        } else {
+            self.descriptor.groups.iter().any(|candidate| candidate.index == group)
+        };
+        (group >= 0 && known).then_some(count)
+    }
+
+    fn valid_item(&self, group: i32, item: i32) -> bool {
+        self.group_item_count(group)
+            .is_some_and(|count| (0..count).contains(&item))
+    }
+
+    fn region_mut(&mut self, group: i32, item: i32) -> Option<&mut GraphInputRegion> {
+        self.descriptor
+            .regions
+            .iter_mut()
+            .find(|region| region.group == group && region.index == item)
+    }
+
+    /// sub_449D60: clear the current item of every other group sharing this
+    /// group's exclusion key (through vtable+0x24 with item -1).
+    fn clear_exclusive_peers(&mut self, group: i32) {
+        if !self.current_selections.contains_key(&group) {
+            return;
+        }
+        let key = self
+            .descriptor
+            .groups
+            .iter()
+            .find(|candidate| candidate.index == group)
+            .map(|candidate| candidate.selection_exclusion_key)
+            .unwrap_or(-1);
+        if key == -1 {
+            return;
+        }
+        let peers = self
+            .descriptor
+            .groups
+            .iter()
+            .filter(|candidate| candidate.index != group && candidate.selection_exclusion_key == key)
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>();
+        for peer in peers {
+            self.current_selections.remove(&peer);
+        }
+    }
+
+    /// sub_44A250, the DCIPIcon(Ex) message handler (vtable+0x08) for words
+    /// queued by Sys80:AC. `pointer_local` gives the pointer position inside
+    /// an item's sprite, or (0, 0) when it is outside (sub_44A6F0). Returns
+    /// whether the item visuals must be rebuilt.
+    pub(crate) fn handle_message(
+        &mut self,
+        words: &[i32],
+        pointer_local: &dyn Fn(i32, i32) -> (i32, i32),
+    ) -> bool {
+        let word = |index: usize| words.get(index).copied().unwrap_or_default();
+        match (word(0) as u32, words.len()) {
+            (0x1000_0000, 3) => {
+                // vtable+0x2C with the packed (group << 16 | item) words
+                // read as signed shorts, then vtable+0x14 (1 for DCIPIcon,
+                // 0 for DCIPIconEx) clears +0x30.
+                let group = (word(1) >> 16) as i16 as i32;
+                let item = word(1) as i16 as i32;
+                self.message_activate(group, item, word(2), pointer_local);
+                false
+            }
+            (0x1000_0001, 2) => {
+                // sub_449A60: switch the current group (+0x3C) when the
+                // group accepts selection, then apply its exclusion.
+                let group = word(1);
+                let accepts = self
+                    .descriptor
+                    .groups
+                    .iter()
+                    .find(|candidate| candidate.index == group)
+                    .is_some_and(|candidate| candidate.selection_enabled);
+                if accepts {
+                    self.registered_state = group;
+                    self.clear_exclusive_peers(group);
+                }
+                accepts
+            }
+            (0x1000_0002, 3) => self.message_select_item(word(1), word(2)),
+            (0x1000_0003, 2) => {
+                self.descriptor.pointer_processing_enabled = word(1) != 0; // +0x88
+                false
+            }
+            (0x1000_0004, 5) => self.message_set_item_field(word(1), word(2), word(3), word(4)),
+            (0x1000_0005, 4) => {
+                // sub_44A600 -> vtable+0x3C with the item's own x/y.
+                self.extended && self.message_place_item(word(1), word(2), None, word(3))
+            }
+            (0x1000_0006, 5) => {
+                // vtable+0x40: DCIPIconEx stores two words in the source
+                // item (+0x18/+0x1C) that no portable path reads.
+                false
+            }
+            (0x1000_0007, 6) => {
+                self.extended
+                    && self.message_place_item(word(1), word(2), Some((word(3), word(4))), word(5))
+            }
+            _ => false,
+        }
+    }
+
+    /// vtable+0x2C: sub_44A000 records the activation (+0x68 group, +0x6C
+    /// item, +0x70 value); DCIPIconEx (sub_44C230) also queues 0x10000007
+    /// with the pointer offset when the value is non-zero, then 0x10000006.
+    fn message_activate(
+        &mut self,
+        group: i32,
+        item: i32,
+        value: i32,
+        pointer_local: &dyn Fn(i32, i32) -> (i32, i32),
+    ) {
+        let group_ok = group == -1 || self.group_item_count(group).is_some();
+        let item_ok = item == -1 || (group != -1 && self.valid_item(group, item));
+        if !group_ok || !item_ok {
+            return;
+        }
+        self.state_group = group;
+        self.state_region = item;
+        self.state_value = value;
+        self.state_local = if value != 0 && group != -1 && item != -1 {
+            pointer_local(group, item)
+        } else {
+            (0, 0)
+        };
+        if self.extended {
+            if group == -1 || item == -1 {
+                self.queue_event([0x1000_0006, -1, value]);
+            } else {
+                let packed = item | (group << 16);
+                if value != 0 {
+                    let (x, y) = self.state_local;
+                    self.queue_event([0x1000_0007, packed, (x & 0xffff) | (y << 16)]);
+                }
+                self.queue_event([0x1000_0006, packed, value]);
+            }
+        } else {
+            self.running = false;
+        }
+    }
+
+    /// vtable+0x24 (sub_449BC0 / sub_44BEC0): set a group's current item.
+    fn message_select_item(&mut self, group: i32, item: i32) -> bool {
+        if self.group_item_count(group).is_none() || !(item == -1 || self.valid_item(group, item)) {
+            return false;
+        }
+        let current = self.current_selections.get(&group).copied().unwrap_or(-1);
+        if item == current {
+            return false;
+        }
+        if item == -1 {
+            self.current_selections.remove(&group);
+            return true;
+        }
+        self.current_selections.insert(group, item);
+        // Base DCIPIcon stops before the exclusion pass for an item whose
+        // normal bitmap (+0x0C) is -1.
+        let normal = self
+            .descriptor
+            .regions
+            .iter()
+            .find(|region| region.group == group && region.index == item)
+            .map(|region| region.normal_resource)
+            .unwrap_or(-1);
+        if self.extended || normal != -1 {
+            self.clear_exclusive_peers(group);
+        }
+        true
+    }
+
+    /// vtable+0x38 (sub_44A3E0 / sub_44C360): replace one item bitmap.
+    /// DCIPIconEx fields 0..=3 are normal / hover / selected /
+    /// hover-selected (source item +0x20..+0x2C); every other field goes
+    /// through the base table: 0 normal, 1 hover, 2 selected, 4 hit mask.
+    fn message_set_item_field(&mut self, group: i32, item: i32, field: i32, value: i32) -> bool {
+        if !self.valid_item(group, item) {
+            return false;
+        }
+        let extended = self.extended;
+        let Some(region) = self.region_mut(group, item) else {
+            return false;
+        };
+        match (extended, field) {
+            (true, 0) | (false, 0) => region.normal_resource = value,
+            (true, 1) | (false, 1) => region.hover_resource = value,
+            (true, 2) | (false, 2) => region.selected_resource = value,
+            (true, 3) => region.hover_selected_resource = value,
+            (_, 4) => region.mask_resource = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// vtable+0x3C (sub_44C4A0): move a DCIPIconEx item and give its sprite
+    /// depth `z`; `position` None keeps the item's own x/y (sub_44A600).
+    fn message_place_item(&mut self, group: i32, item: i32, position: Option<(i32, i32)>, z: i32) -> bool {
+        if !self.valid_item(group, item) {
+            return false;
+        }
+        if let Some((x, y)) = position
+            && let Some(region) = self.region_mut(group, item)
+        {
+            region.x = x;
+            region.y = y;
+        }
+        self.item_depths.insert((group, item), z);
+        true
     }
 
     pub(crate) fn state_record(&self) -> [i32; 6] {
@@ -566,4 +799,64 @@ mod tests {
         input.clear_deferred_pointer_activation();
         assert_eq!(input.deferred_pointer_activation(), None);
     }
+
+    fn message_processor(extended: bool) -> RuntimeGraphInputObject {
+        let group = |index, key| GraphInputGroup {
+            index,
+            initial_current_item: -1,
+            selection_enabled: true,
+            pointer_selection_enabled: true,
+            pointer_activation_enabled: false,
+            selection_exclusion_key: key,
+            extended_flags: 0,
+        };
+        let item = |group, index| GraphInputRegion { group, index, ..region() };
+        let mut input = if extended {
+            RuntimeGraphInputObject::new_extended(1)
+        } else {
+            RuntimeGraphInputObject::new(1)
+        };
+        input.configure(GraphInputDescriptor {
+            groups: vec![group(0, 7), group(1, 7)],
+            regions: vec![item(0, 0), item(0, 1), item(1, 0)],
+            ..GraphInputDescriptor::default()
+        });
+        input
+    }
+
+    #[test]
+    fn messages_select_activate_and_edit_items_like_sub_44a250() {
+        let none = |_: i32, _: i32| (0, 0);
+        let mut input = message_processor(false);
+        // 0x10000002 selects; the shared exclusion key clears group 1.
+        assert!(input.handle_message(&[0x1000_0002, 1, 0], &none));
+        assert!(input.handle_message(&[0x1000_0002, 0, 1], &none));
+        assert_eq!(input.selected_region_values(), [1, -1]);
+        assert!(!input.handle_message(&[0x1000_0002, 0, 1], &none), "unchanged");
+        assert!(!input.handle_message(&[0x1000_0002, 0, 5], &none), "out of range");
+        // Wrong word counts are ignored.
+        assert!(!input.handle_message(&[0x1000_0002, 0], &none));
+        // 0x10000000 records the activation and stops a base processor.
+        input.handle_message(&[0x1000_0000, 0x0000_0001, 9], &none);
+        assert_eq!(input.state_record(), [0, 0, 1, 9, 0, 0]);
+        // 0x10000004 field 2 replaces the selected bitmap.
+        assert!(input.handle_message(&[0x1000_0004, 0, 1, 2, 4321], &none));
+        assert_eq!(input.descriptor.regions[1].selected_resource, 4321);
+        // Base processors ignore item depth.
+        assert!(!input.handle_message(&[0x1000_0005, 0, 1, 30], &none));
+
+        let mut ex = message_processor(true);
+        let local = |group: i32, item: i32| if (group, item) == (1, 0) { (3, 4) } else { (0, 0) };
+        ex.handle_message(&[0x1000_0000, 0x0001_0000, 1], &local);
+        assert_eq!(ex.pop_event(), Some([0x1000_0007, 0x0001_0000, 3 | (4 << 16)]));
+        assert_eq!(ex.pop_event(), Some([0x1000_0006, 0x0001_0000, 1]));
+        assert!(ex.state_record()[0] != 0, "DCIPIconEx keeps running");
+        assert!(ex.handle_message(&[0x1000_0004, 0, 0, 3, 77], &none));
+        assert_eq!(ex.descriptor.regions[0].hover_selected_resource, 77);
+        assert!(ex.handle_message(&[0x1000_0005, 0, 1, -50], &none));
+        assert_eq!(ex.item_depths[&(0, 1)], -50);
+        assert!(ex.handle_message(&[0x1000_0007, 1, 0, 40, 50, 5], &none));
+        assert_eq!((ex.descriptor.regions[2].x, ex.descriptor.regions[2].y), (40, 50));
+    }
 }
+

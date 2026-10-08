@@ -59,3 +59,80 @@ int Graph90_B9_ReleaseIconInputProcessor(struct CThread *t)
     push(t, icon_registry_remove(pop(t)));
     return 0;
 }
+
+// ---------------------------------------- DCIndProc state and messages ---
+// DCIndProc (sub_4476D0): +0x04 handle (++dword_565D74), +0x08 128,
+// +0x0C window, +0x10 enabled (1), +0x18..+0x20 message queue
+// {count, words, next} (sub_4477E0 appends, sub_447930 pops).
+
+// sub_48A1B0. Script order (handle, value). Pushes whether it exists.
+int Sys80_A8_SetRegisteredObjectState(struct CThread *t)
+{
+    uint32_t value = pop(t);
+    struct DCIndProc *p = icon_registry_find(pop(t));     // sub_46C4D0
+    if (p) p->enabled = value;                           // sub_41ADE0
+    push(t, p != 0);
+    return 0;
+}
+
+// sub_48A200. Script order (handle, out). Writes +0x10, pushes existence.
+int Sys80_A9_GetRegisteredObjectState(struct CThread *t)
+{
+    uint32_t *out = pop_ptr(t);
+    struct DCIndProc *p = icon_registry_find(pop(t));
+    if (p) *out = p->enabled;                            // sub_4477B0
+    push(t, p != 0);
+    return 0;
+}
+
+// sub_48A250. Script order (handle, count, words). A count outside 1..256
+// queues nothing; the result only reports whether the handle exists.
+int Sys80_AC_QueueRegisteredObjectMessage(struct CThread *t)
+{
+    const uint32_t *words = pop_ptr(t);
+    uint32_t count = pop(t);
+    struct DCIndProc *p = icon_registry_find(pop(t));
+    if (p && count - 1 <= 0xFF)
+        indproc_queue_message(p, count, words);
+    push(t, p != 0);
+    return 0;
+}
+
+// Main loop, after the scheduler: sub_46C570 (or sub_46C5B0) walks the
+// registry newest first and, for each processor with enabled != 0, drains
+// its queue (sub_447860): a message whose first word is 0 sets `enabled`
+// from word 1 when it has two words; any other goes to vtable+8.
+static void indproc_drain(struct DCIndProc *p)
+{
+    uint32_t words[256];
+    int count;
+    while ((count = indproc_pop_message(p, words)) > 0) {
+        if (words[0])
+            p->vtbl->message(p, count, words);
+        else if (count == 2)
+            p->enabled = words[1];
+    }
+}
+
+// sub_44A250, DCIPIcon(Ex) vtable+8. Word counts must match exactly.
+//   0x10000000 (3) vt+0x2C(group = (short)(w1 >> 16), item = (short)w1, w2):
+//        sub_44A000 stores +0x68/+0x6C/+0x70 (the Graph90:BC record); Ex
+//        (sub_44C230) queues 0x10000007 {packed, pointer offset} when w2 != 0
+//        and 0x10000006 {packed or -1, w2}; then vt+0x14 (1 base, 0 Ex)
+//        clears +0x30 (running).
+//   0x10000001 (2) sub_449A60(w1): current group +0x3C when the group's
+//        selection flag (+0x0C) is set; exclusion via sub_449D60.
+//   0x10000002 (3) vt+0x24(group, item): set the group's current item
+//        (-1 clears); unchanged -> 0; exclusion clears peer groups with the
+//        same key (+0x18). Base stops before the exclusion when the item's
+//        normal bitmap is -1.
+//   0x10000003 (2) +0x88 = w1 (pointer processing).
+//   0x10000004 (5) vt+0x38(group, item, field, value): Ex fields 0..3 =
+//        item +0x20/+0x24/+0x28/+0x2C (normal, hover, selected,
+//        hover-selected); base fields 0 normal, 1 hover, 2 selected,
+//        4 hit mask (-2 sub_41BDD0, -1 clear, else bitmap).
+//   0x10000005 (4) sub_44A600 -> vt+0x3C(group, item, item x, item y, z).
+//   0x10000006 (5) vt+0x40: Ex item +0x18/+0x1C = w3/w4.
+//   0x10000007 (6) vt+0x3C(group, item, x, y, z): Ex moves the item and
+//        sets its sprite to ((x + ox - sw/2) << 16, ..., z << 16)
+//        (sub_42C0D0); the base class only validates.

@@ -5325,6 +5325,7 @@ impl RuntimeTraceApi {
         for update in self.graph_effects.tick_movies(movie_elapsed_ms) {
             self.store_movie_frame(update);
         }
+        self.drain_graph_input_messages();
         // Target sub_496430 samples each registered Sprite once per main-loop
         // pass and stores only bit zero of the primary-input query. The portable
         // backend uses the same per-frame latching point with its current
@@ -16633,7 +16634,10 @@ impl RuntimeTraceApi {
         let objects = self
             .graph_input_objects
             .iter()
-            .filter_map(|(&object, input)| (!input.descriptor.regions.is_empty()).then_some(object))
+            .filter_map(|(&object, input)| {
+                // sub_46C570 skips a processor whose DCIndProc+0x10 is 0.
+                (input.enabled != 0 && !input.descriptor.regions.is_empty()).then_some(object)
+            })
             .collect::<Vec<_>>();
 
         for object in objects {
@@ -17171,11 +17175,72 @@ impl RuntimeTraceApi {
         }
     }
 
+    /// Icon item sprites are mode-5 sprites placed at (item - screen/2) with
+    /// the screen half width as perspective (sub_42BED0); a depth set by
+    /// messages 0x10000005/7 scales them by sub_41AAA0 around the centre.
+    fn icon_item_projection(&self, x: i32, y: i32, z: i32) -> (f32, f32, f32) {
+        if z == 0 {
+            return (x as f32, y as f32, 1.0);
+        }
+        let (width, height) = if self.screen_width > 0 && self.screen_height > 0 {
+            (self.screen_width, self.screen_height)
+        } else {
+            (1280, 720)
+        };
+        let perspective = (width / 2) as i64;
+        let z16 = i64::from(z) << 16;
+        let scale16 = if z16 < 0 {
+            ((perspective << 16) - z16) / perspective
+        } else {
+            (perspective << 32) / (z16 + (perspective << 16))
+        };
+        let scale = scale16 as f32 / 65536.0;
+        let (cx, cy) = ((width / 2) as f32, (height / 2) as f32);
+        (cx + (x as f32 - cx) * scale, cy + (y as f32 - cy) * scale, scale)
+    }
+
+    /// Per-frame message drain of the DCIPIcon registry (sub_46C570 /
+    /// sub_46C5B0 -> sub_447860), newest registration first. Only enabled
+    /// processors drain; `[0, value]` sets the enabled flag, other messages
+    /// go to sub_44A250.
+    fn drain_graph_input_messages(&mut self) {
+        let objects = self.graph_input_objects.keys().rev().copied().collect::<Vec<_>>();
+        for object in objects {
+            let hit = self
+                .mouse_pos
+                .and_then(|point| self.hit_test_graph_input_object(object, point))
+                .map(|(region, x, y)| ((region.group, region.index), (x, y)));
+            let pointer_local = move |group: i32, item: i32| match hit {
+                Some((key, local)) if key == (group, item) => local,
+                _ => (0, 0),
+            };
+            let mut refresh = false;
+            while let Some(input) = self.graph_input_objects.get_mut(&object) {
+                if input.enabled == 0 || !input.is_live() {
+                    break;
+                }
+                let Some(words) = input.indirect_messages.pop_front() else {
+                    break;
+                };
+                if words.first() == Some(&0) {
+                    if words.len() == 2 {
+                        input.enabled = words[1];
+                    }
+                    continue;
+                }
+                refresh |= input.handle_message(&words, &pointer_local);
+            }
+            if refresh {
+                self.refresh_graph_input_control_layers(object);
+            }
+        }
+    }
+
     fn refresh_graph_input_control_layers(&mut self, object: i32) {
         // Visual state changes are also a natural point to retry any logical
         // items whose child Sprite could not be materialized during configure.
         self.ensure_graph_input_control_layers(object);
-        let Some((surface, descriptor, hovered, selections, extended)) =
+        let Some((surface, descriptor, hovered, selections, extended, depths)) =
             self.graph_input_objects.get(&object).map(|input| {
                 (
                     input.layer,
@@ -17183,6 +17248,7 @@ impl RuntimeTraceApi {
                     input.hovered,
                     input.selected_region_values(),
                     input.extended,
+                    input.item_depths.clone(),
                 )
             })
         else {
@@ -17242,23 +17308,29 @@ impl RuntimeTraceApi {
                 let height = source.height;
                 let (control_x, control_y) =
                     self.surface_control_region_position(surface, &descriptor, region);
+                let (control_x, control_y, scale) = self.icon_item_projection(
+                    control_x,
+                    control_y,
+                    depths.get(&(region.group, region.index)).copied().unwrap_or(0),
+                );
                 Some((
                     layer_id,
                     resource_id,
                     key.to_string(),
                     source,
-                    control_x as f32,
-                    control_y as f32,
+                    control_x,
+                    control_y,
                     width,
                     height,
                     layer.z,
                     selected,
                     is_hovered,
+                    scale,
                 ))
             })
             .collect::<Vec<_>>();
 
-        for (layer_id, resource_id, key, source, x, y, width, height, z, selected, hovered) in
+        for (layer_id, resource_id, key, source, x, y, width, height, z, selected, hovered, scale) in
             updates
         {
             let changed = self.graph_layers.get(&layer_id).is_some_and(|layer| {
@@ -17269,6 +17341,7 @@ impl RuntimeTraceApi {
                     || layer.y != y
                     || layer.width != width
                     || layer.height != height
+                    || layer.scale_x != scale
             });
             if !changed {
                 continue;
@@ -17281,6 +17354,8 @@ impl RuntimeTraceApi {
                 layer.y = y;
                 layer.width = width;
                 layer.height = height;
+                layer.scale_x = scale;
+                layer.scale_y = scale;
             }
             // Keep the native control layer identity stable. Only its bitmap is
             // changed, matching sub_4497A0/sub_449BC0 instead of destroying and
@@ -17965,16 +18040,16 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn registered_object_value(&mut self, object: i32) -> Option<i32> {
-        self.graph_input_objects
-            .get(&object)
-            .map(|input| input.registered_state)
+        // sub_4477B0: DCIndProc+0x10.
+        self.graph_input_objects.get(&object).map(|input| input.enabled)
     }
 
     fn set_registered_object_value(&mut self, object: i32, value: i32) -> bool {
         let Some(input) = self.graph_input_objects.get_mut(&object) else {
             return false;
         };
-        input.registered_state = value;
+        // DCIndProc+0x10 (sub_41ADE0), not the DCIPIcon current group.
+        input.enabled = value;
         true
     }
 
@@ -19265,7 +19340,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 let state = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
                 if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                    input.registered_state = state;
+                    input.enabled = state;
                 }
                 tracing::debug!(object, state, "SetRegisteredObjectState");
                 return Ok(ethornell_vm::Value::Int(i32::from(
@@ -24429,3 +24504,62 @@ fn push_fit_texture_command(
 
 #[cfg(test)]
 mod save_repro;
+
+#[cfg(test)]
+mod selector_audit {
+    use ethornell_script::{BpInstruction, BpOpcode};
+    use ethornell_vm::{Value, Vm};
+
+    /// Sends every selector registered in the target dispatch tables through
+    /// `Vm::dispatch` with the real API and zero arguments, and lists the
+    /// ones that end in the generic "runtime stub" fallback. Errors are fine:
+    /// they mean a handler ran and rejected the dummy arguments.
+    #[test]
+    #[ignore = "audit over all 695 selectors (~4 min): cargo test -- --ignored"]
+    fn every_registered_selector_reaches_a_handler() {
+        let groups = [
+            (0x80u8, "sys1"),
+            (0x81, "sys2"),
+            (0x90, "grp1"),
+            (0x91, "grp2"),
+            (0x92, "grp3"),
+            (0xA0, "snd1"),
+            (0xB0, "usr1"),
+            (0xC0, "usr2"),
+        ];
+        let mut stubbed = Vec::new();
+        for (group, name) in groups {
+            for id in 0..=255u16 {
+                let Some(abi) = ethornell_script::native_abi::lookup(group, id) else {
+                    continue;
+                };
+                let manager =
+                    ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap();
+                let mut api = super::RuntimeTraceApi::new(manager);
+                let mut vm = Vm::new();
+                vm.stack.extend(std::iter::repeat_n(Value::Int(0), abi.argc));
+                let instruction = BpInstruction {
+                    offset: 0,
+                    opcode: BpOpcode::Known { code: group, name },
+                    opcode_hex: format!("0x{group:02X}"),
+                    opcode_name: name.into(),
+                    operands: Vec::new(),
+                    known_call: None,
+                    raw: vec![group, id as u8],
+                    warning: None,
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = vm.dispatch(&instruction, &mut api);
+                    !vm.stubs.is_empty()
+                }));
+                match outcome {
+                    Ok(true) => stubbed.push(format!("0x{group:02X}:0x{id:02X}")),
+                    Ok(false) => {}
+                    Err(_) => stubbed.push(format!("0x{group:02X}:0x{id:02X}(panic)")),
+                }
+            }
+        }
+        assert!(stubbed.is_empty(), "{} selectors reach the stub: {}", stubbed.len(), stubbed.join(" "));
+    }
+}
