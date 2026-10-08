@@ -74,8 +74,8 @@ use graph::{
     RuntimeUserControl, apply_alpha_mask, backf_mask_weight, blit_decoded_image,
     blit_decoded_image_format1_to_format2, blit_decoded_image_format2_source_over,
     blit_decoded_image_parameter, blit_decoded_image_raw_copy, crop_decoded_image,
-    crossfade_decoded_images, crossfade_decoded_images_straight_alpha, fit_decoded_image_canvas,
-    fixed_16_to_f32, native_draw_order, scale_decoded_image_fixed,
+    crossfade_decoded_images, fit_decoded_image_canvas, fixed_16_to_f32, native_draw_order,
+    scale_decoded_image_fixed,
 };
 use graph_defaults::{GraphRuntimeDefaults, SurfaceTextState};
 use graph_group::GraphGroupState;
@@ -1628,9 +1628,10 @@ impl RuntimeTraceApi {
     }
 
     fn cached_file_size(&mut self, archive: &str, file: &str) -> i32 {
-        if let Some(size) = find_runtime_file_from_root(&self.manager, &self.native_root, archive, file)
-            .and_then(|path| std::fs::metadata(path).ok())
-            .filter(|meta| meta.is_file())
+        if let Some(size) =
+            find_runtime_file_from_root(&self.manager, &self.native_root, archive, file)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .filter(|meta| meta.is_file())
         {
             return size.len() as i32;
         }
@@ -1655,7 +1656,12 @@ impl RuntimeTraceApi {
     /// becomes the image; every later one is blitted onto it through
     /// sub_40A530 at (x, y), else at its embedded point, else at (0, 0), with
     /// mode `m + 0x20` (0x80 for m > 7, 0 when absent) and param <= 256.
-    fn synthesize_graph_image(&mut self, archive_name: &str, resource_name: &str, key: &str) -> bool {
+    fn synthesize_graph_image(
+        &mut self,
+        archive_name: &str,
+        resource_name: &str,
+        key: &str,
+    ) -> bool {
         struct Element {
             name: String,
             position: Option<(i32, i32)>,
@@ -1669,11 +1675,16 @@ impl RuntimeTraceApi {
             if name.is_empty() {
                 return false;
             }
-            let mut number = || fields.next().map(|field| field.trim().parse::<i32>().unwrap_or(0));
+            let mut number = || {
+                fields
+                    .next()
+                    .map(|field| field.trim().parse::<i32>().unwrap_or(0))
+            };
             let x = number();
             let y = number();
             let mode = number().map_or(0, |mode| if mode as u32 > 7 { 128 } else { mode + 32 });
-            let parameter = number().map_or(0, |value| if value as u32 <= 0x100 { value } else { 0 });
+            let parameter =
+                number().map_or(0, |value| if value as u32 <= 0x100 { value } else { 0 });
             elements.push(Element {
                 name,
                 position: x.zip(y),
@@ -1690,7 +1701,11 @@ impl RuntimeTraceApi {
             let Some(image) = self.graph_images.get(&element_key).cloned() else {
                 return false;
             };
-            let format = self.graph_image_formats.get(&element_key).copied().unwrap_or(2);
+            let format = self
+                .graph_image_formats
+                .get(&element_key)
+                .copied()
+                .unwrap_or(2);
             match result.as_mut() {
                 None => result = Some((image, format)),
                 Some((base, base_format)) => {
@@ -2736,8 +2751,15 @@ impl RuntimeTraceApi {
     /// suppressed, mask alpha below 256 and a non-zero alpha multiplier.
     fn graph_object_is_drawable(&self, object: i32) -> bool {
         let properties = self.graph_object_properties.get(&object);
-        self.graph_object_enabled.get(&object).copied().unwrap_or(true)
-            && self.graph_object_draw_enabled.get(&object).copied().unwrap_or(true)
+        self.graph_object_enabled
+            .get(&object)
+            .copied()
+            .unwrap_or(true)
+            && self
+                .graph_object_draw_enabled
+                .get(&object)
+                .copied()
+                .unwrap_or(true)
             && !properties.is_some_and(|p| p.native.suppress_draw != 0)
             && properties.is_none_or(|p| p.mask_alpha < 256 && p.alpha_multiplier != 0)
     }
@@ -4321,7 +4343,8 @@ impl RuntimeTraceApi {
                 }
                 backf.mask_control_enabled = value;
                 backf.mask_control_mode = extra;
-                self.graph90_refresh_backf_primary(target).map_err(|_| 254)?;
+                self.graph90_refresh_backf_primary(target)
+                    .map_err(|_| 254)?;
                 return Ok(());
             }
             // CDspObjBackML (sub_41E060), BackRPL (sub_41ED70: 255 -> +0x164,
@@ -4366,12 +4389,18 @@ impl RuntimeTraceApi {
             }
             2 => self.set_graph_object_alpha_recursive_raw(target, value),
             0xc0 => {
-                self.graph_object_properties.entry(target).or_default().native.property_c0_value =
-                    value as u32
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .property_c0_value = value as u32
             }
             0xc1 => {
-                self.graph_object_properties.entry(target).or_default().native.property_c1_value =
-                    value as u32
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .property_c1_value = value as u32
             }
             0xc4 => {
                 self.graph_object_properties
@@ -4381,25 +4410,44 @@ impl RuntimeTraceApi {
                     .global_display_offset_enabled = value as u32
             }
             0x8000 => {
-                let native = &mut self.graph_object_properties.entry(target).or_default().native;
+                let native = &mut self
+                    .graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native;
                 native.fixed_position_rounding_enabled = value as u32;
                 native.fixed_position_rounding_mode = extra as u32;
             }
             0x8001 => {
-                self.graph_object_properties.entry(target).or_default().native.property_8001_value =
-                    value as u32
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .property_8001_value = value as u32
             }
-            0x8100 => self.graph_object_properties.entry(target).or_default().native.sort_bias = value,
+            0x8100 => {
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .sort_bias = value
+            }
             0x7fff_0000 => {
-                self.graph_object_properties.entry(target).or_default().native.auto_update =
-                    value as u32
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .auto_update = value as u32
             }
             0x7fff_ffff => {
                 let Some(slot) = usize::try_from(value).ok().filter(|index| *index < 16) else {
                     return Err(254);
                 };
-                self.graph_object_properties.entry(target).or_default().native.user_slots[slot] =
-                    extra;
+                self.graph_object_properties
+                    .entry(target)
+                    .or_default()
+                    .native
+                    .user_slots[slot] = extra;
             }
             _ => return Err(5),
         }
@@ -4475,7 +4523,9 @@ impl RuntimeTraceApi {
                 .and_then(|index| native.user_slots.get(index))
                 .map(|value| vec![*value])
                 .ok_or(254),
-            0xffff_fffe => Ok(vec![self.graph90_native_sort_key(object).unwrap_or(0) as i32]),
+            0xffff_fffe => Ok(vec![
+                self.graph90_native_sort_key(object).unwrap_or(0) as i32
+            ]),
             0xffff_ffff => Ok(vec![i32::from_le_bytes(native.unknown_104_to_107)]),
             _ => Err(5),
         }
@@ -8630,12 +8680,20 @@ mod input_tests {
         assert_eq!(SysApi::input_message_serial(&mut api), 0);
         super::apply_runtime_input_event(
             &mut api,
-            super::RuntimeInputEvent::ButtonPress { button: 2, x: 10.0, y: 20.0 },
+            super::RuntimeInputEvent::ButtonPress {
+                button: 2,
+                x: 10.0,
+                y: 20.0,
+            },
         );
         assert_eq!(SysApi::input_message_serial(&mut api), 1);
         super::apply_runtime_input_event(
             &mut api,
-            super::RuntimeInputEvent::ButtonRelease { button: 2, x: 10.0, y: 20.0 },
+            super::RuntimeInputEvent::ButtonRelease {
+                button: 2,
+                x: 10.0,
+                y: 20.0,
+            },
         );
         assert_eq!(SysApi::input_message_serial(&mut api), 1);
         assert_eq!(SysApi::poll_queued_event(&mut api), Some([3, 2, 0]));
@@ -9364,7 +9422,10 @@ mod input_tests {
             font(surface, 0, 3, 100, 0),
             font(surface, 1, 28, 201, 0),
         ] {
-            assert!(call_graph(&mut api, 0x91, 0x88, &mut bad.clone()).is_err(), "{bad:?}");
+            assert!(
+                call_graph(&mut api, 0x91, 0x88, &mut bad.clone()).is_err(),
+                "{bad:?}"
+            );
         }
         call_graph(&mut api, 0x91, 0x88, &mut font(surface, 0, 28, 100, 0)).unwrap();
         assert_eq!(api.graph_surfaces[&surface].valid_right, 389);
@@ -9671,13 +9732,12 @@ mod input_tests {
         call_graph(&mut api, 0x90, 0x11, &mut create).unwrap();
         assert_eq!(api.bitmap_dimensions[&0], (4, 2));
         assert_eq!(api.bitmap_formats[&0], 1);
-        for args in [
-            [0x4000, 4, 2, 2],
-            [1, 4, 2, 8],
-            [1, -1, 2, 2],
-        ] {
+        for args in [[0x4000, 4, 2, 2], [1, 4, 2, 8], [1, -1, 2, 2]] {
             let mut stack = args.iter().copied().map(Value::Int).collect::<Vec<_>>();
-            assert!(call_graph(&mut api, 0x90, 0x11, &mut stack).is_err(), "{args:?}");
+            assert!(
+                call_graph(&mut api, 0x90, 0x11, &mut stack).is_err(),
+                "{args:?}"
+            );
         }
     }
 
@@ -9703,7 +9763,10 @@ mod input_tests {
             call_graph(api, 0x92, 0x1E, &mut stack)
         };
         // Full cell 12 + half cell 6, each followed by the spacing.
-        assert_eq!(draw(&mut api, 5, 0, 12).unwrap(), Value::Int(12 + 2 + 6 + 2));
+        assert_eq!(
+            draw(&mut api, 5, 0, 12).unwrap(),
+            Value::Int(12 + 2 + 6 + 2)
+        );
         let image = api.graph_bitmap_image(5).unwrap();
         let colors = image
             .rgba
@@ -9717,9 +9780,9 @@ mod input_tests {
         assert_eq!(colors, [[0, 0, 0, 0], [255, 0, 0, 0]].into());
         {
             // Nothing is drawn below the cell height.
-            assert!((12..16).all(|row| (0..64).all(|col| {
-                image.rgba[((row * 64 + col) * 4) as usize] == 0
-            })));
+            assert!((12..16).all(|row| {
+                (0..64).all(|col| image.rgba[((row * 64 + col) * 4) as usize] == 0)
+            }));
         }
         assert!(draw(&mut api, 0x4000, 0, 12).is_err());
         assert!(draw(&mut api, 6, 0, 12).is_err());
@@ -11418,7 +11481,10 @@ mod input_tests {
         api.engine_time_ms += 50;
         ethornell_vm::GraphApi::poll_native_graph_control_procedure(
             &mut api,
-            ethornell_vm::NativeOpcode { group: 0x90, id: 0x20 },
+            ethornell_vm::NativeOpcode {
+                group: 0x90,
+                id: 0x20,
+            },
             sprite,
             control_id,
         );
@@ -11497,21 +11563,22 @@ mod input_tests {
         let properties = &api.graph_object_properties[&sprite];
         assert_eq!(properties.format_resource, Some(bitmap));
         assert_eq!(properties.named_properties["target-object-mode"], 5);
-        assert_eq!(properties.native.position_x, 0);
-        assert_eq!(properties.native.position_y, 200 << 16);
+        // sub_429AF0 passes (fixed + screen centre) >> 16 to vtable+40.
+        assert_eq!(properties.native.position_x, 640);
+        assert_eq!(properties.native.position_y, 560);
         assert_eq!(properties.native.fixed_position_updates_integer_position, 0);
         assert_eq!(
             api.graph90_native_sort_key(sprite),
             api.display_tree.native_sort_key(sprite)
         );
-        assert_eq!(
-            properties.named_properties["target-position-z-16-16"],
-            -128 << 16
-        );
+        assert_eq!(properties.native.fixed_position_z_16_16, -128 << 16);
         assert_eq!(properties.alpha_parameter(), 256);
         assert!(api.graph_draw_items().is_empty());
         let layer_position = (layer.x, layer.y);
 
+        // The constructor clears the draw gate; Graph90:54 opens it.
+        let mut draw_on = vec![Value::Int(sprite), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x54, &mut draw_on).unwrap();
         api.set_graph_object_alpha_recursive(sprite, 0);
         let draw_items = api.graph_draw_items();
         assert_eq!(draw_items.len(), 1);
@@ -11553,6 +11620,8 @@ mod input_tests {
             api.layer_world_transform(sprite, layer),
             (-231.0, 264.0, 261)
         );
+        // The resync passed alpha 256 again (vtable+72): make it visible.
+        api.set_graph_object_alpha_recursive(sprite, 0);
 
         let backf_bitmap = 128;
         let backf_key = "test:backf".to_string();
@@ -12302,7 +12371,8 @@ mod input_tests {
                 clip: None,
             },
         );
-        api.graph_object_layers.insert(object, [object].into_iter().collect());
+        api.graph_object_layers
+            .insert(object, [object].into_iter().collect());
         let packed = 0x0007_ffff;
         api.registered_pointer_input_scopes.register(packed);
         api.pointer_object_nodes.push((0x0008_0000, object));
@@ -15825,15 +15895,38 @@ struct RuntimeWindowMessage {
 
 #[derive(Clone, Copy, Debug)]
 enum RuntimeInputEvent {
-    MouseMove { x: f32, y: f32 },
-    MousePress { x: f32, y: f32 },
-    MouseRelease { x: f32, y: f32 },
-    MouseWheel { delta_y: f32 },
-    KeyPress { descriptor: i32 },
-    KeyRelease { descriptor: i32 },
+    MouseMove {
+        x: f32,
+        y: f32,
+    },
+    MousePress {
+        x: f32,
+        y: f32,
+    },
+    MouseRelease {
+        x: f32,
+        y: f32,
+    },
+    MouseWheel {
+        delta_y: f32,
+    },
+    KeyPress {
+        descriptor: i32,
+    },
+    KeyRelease {
+        descriptor: i32,
+    },
     /// Right (2), middle (4) and X1/X2 (5/6) buttons, as target descriptors.
-    ButtonPress { button: i32, x: f32, y: f32 },
-    ButtonRelease { button: i32, x: f32, y: f32 },
+    ButtonPress {
+        button: i32,
+        x: f32,
+        y: f32,
+    },
+    ButtonRelease {
+        button: i32,
+        x: f32,
+        y: f32,
+    },
 }
 
 fn queue_runtime_input_event(queue: &mut VecDeque<RuntimeInputEvent>, event: RuntimeInputEvent) {
@@ -16206,7 +16299,10 @@ fn native_pointer_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
     }
     let packed = packed as u32;
     let on_screen = api.mouse_pos.is_some_and(|(x, y)| {
-        x >= 0.0 && y >= 0.0 && x < api.screen_width.max(1) as f32 && y < api.screen_height.max(1) as f32
+        x >= 0.0
+            && y >= 0.0
+            && x < api.screen_width.max(1) as f32
+            && y < api.screen_height.max(1) as f32
     });
     let mut nodes = api
         .pointer_object_nodes
@@ -16225,7 +16321,8 @@ fn native_pointer_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
                 if !on_screen || !api.graph_object_is_drawable(object) {
                     continue;
                 }
-                api.graph_object_pointer_hit(object).is_some_and(|hit| hit != 0)
+                api.graph_object_pointer_hit(object)
+                    .is_some_and(|hit| hit != 0)
             }
             None => true,
         };
@@ -19707,7 +19804,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             .iter()
             .any(|(id, _)| *id == control_id);
         if payload != 0 || input_enabled {
-            self.layer_animations.request_native_control_completion(control_id);
+            self.layer_animations
+                .request_native_control_completion(control_id);
         }
     }
 
@@ -20107,7 +20205,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         // the target's DIB byte order and fails when the buffer is smaller.
         let image = self.graph_bitmap_image(bitmap)?;
         let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
-        let bytes_per_pixel = [2usize, 3, 4, 1].get(usize::try_from(format).ok()?).copied()?;
+        let bytes_per_pixel = [2usize, 3, 4, 1]
+            .get(usize::try_from(format).ok()?)
+            .copied()?;
         let required = image.width as usize * image.height as usize * bytes_per_pixel;
         if capacity < required {
             return None;
@@ -20116,7 +20216,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         for [r, g, b, a] in image.rgba.as_chunks::<4>().0.iter().copied() {
             match format {
                 0 => {
-                    let word = (u16::from(r >> 3) << 10) | (u16::from(g >> 3) << 5) | u16::from(b >> 3);
+                    let word =
+                        (u16::from(r >> 3) << 10) | (u16::from(g >> 3) << 5) | u16::from(b >> 3);
                     out.extend_from_slice(&word.to_le_bytes());
                 }
                 1 => out.extend_from_slice(&[b, g, r]),
@@ -21397,7 +21498,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             )));
                         }
                     }
-                    if !matches!(mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xc0 | 0xc1 | 0xf0 | 0xff) {
+                    if !matches!(mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xc0 | 0xc1 | 0xf0 | 0xff)
+                    {
                         return Err(ethornell_vm::VmError::Runtime(format!(
                             "Graph90:18 blit mode {mode:#x} is invalid"
                         )));

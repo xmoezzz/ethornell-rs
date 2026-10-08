@@ -1784,9 +1784,10 @@ impl RuntimeTraceApi {
                 );
                 return false;
             }
-            let Some(cache_image) = crossfade_decoded_images_straight_alpha(
+            let Some(cache_image) = crate::bitmap_blend::crossfade_cache(
                 &primary_image,
                 &secondary_image,
+                primary_format.unwrap_or_default(),
                 transition_value,
             ) else {
                 return false;
@@ -1937,7 +1938,11 @@ impl RuntimeTraceApi {
     fn graph90_mode5_projection(
         &self,
         object: i32,
-    ) -> Option<(NativeMode5NodeArgs, NativeMode5DynamicState, crate::graph::NativeMode5Geometry)> {
+    ) -> Option<(
+        NativeMode5NodeArgs,
+        NativeMode5DynamicState,
+        crate::graph::NativeMode5Geometry,
+    )> {
         let properties = self.graph_object_properties.get(&object)?;
         let mut args = self.graph90_recorded_source_args(object, 0x5C, 17)?;
         args[1] = properties.native.fixed_position_x_16_16;
@@ -2054,7 +2059,9 @@ impl RuntimeTraceApi {
         bitmaps: &[i32],
     ) -> std::result::Result<(), ethornell_vm::VmError> {
         let fail = |what: String| {
-            Err(ethornell_vm::VmError::Runtime(format!("Graph90:{selector:02X} {what}")))
+            Err(ethornell_vm::VmError::Runtime(format!(
+                "Graph90:{selector:02X} {what}"
+            )))
         };
         if priority as u32 >= 0x1_0000 {
             return fail(format!("priority {priority} is out of range"));
@@ -2062,7 +2069,8 @@ impl RuntimeTraceApi {
         if alpha as u32 > 0x100 {
             return fail(format!("alpha {alpha} exceeds 256"));
         }
-        if !matches!(blend_mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xC0 | 0xC1 | 0xF0 | 0xFF) {
+        if !matches!(blend_mode, 0..=9 | 0x20..=0x27 | 0x40 | 0x41 | 0x80 | 0xC0 | 0xC1 | 0xF0 | 0xFF)
+        {
             return fail(format!("blend mode {blend_mode:#x} is invalid"));
         }
         for bitmap in bitmaps {
@@ -2825,13 +2833,21 @@ impl RuntimeTraceApi {
                         "Graph90:56 expected seven arguments".into(),
                     )));
                 }
-                if let Err(error) =
-                    Self::graph90_validate_sprite_arguments(id, args[6], args[5], args[4], &[args[3]])
-                {
+                if let Err(error) = Self::graph90_validate_sprite_arguments(
+                    id,
+                    args[6],
+                    args[5],
+                    args[4],
+                    &[args[3]],
+                ) {
                     return Some(Err(error));
                 }
-                if !self.graph90_object_matches(args[0], GRAPH90_SPRITE_TAG, 512, GRAPH90_CLASS_SPRITE)
-                {
+                if !self.graph90_object_matches(
+                    args[0],
+                    GRAPH90_SPRITE_TAG,
+                    512,
+                    GRAPH90_CLASS_SPRITE,
+                ) {
                     return Some(Err(ethornell_vm::VmError::Runtime(format!(
                         "Graph90:56 #{} is not a sprite object",
                         args[0]
@@ -3339,13 +3355,67 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x5C) => {
                 let args = Self::graph90_source_args(stack, 17);
-                if args.len() == 17
-                    && self.graph90_object_matches(
+                if args.len() != 17 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:5C expected seventeen arguments".into(),
+                    )));
+                }
+                // sub_47CC10: primary < 0x4000, transition <= 0x100, blend
+                // mode, alpha <= 0x100, priority < 0x10000.
+                if args[6] as u32 > 0x100 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:5C transition value {} exceeds 256",
+                        args[6]
+                    ))));
+                }
+                if let Err(error) = Self::graph90_validate_sprite_arguments(
+                    id,
+                    args[16],
+                    args[15],
+                    args[14],
+                    &[args[4]],
+                ) {
+                    return Some(Err(error));
+                }
+                // sub_43EAB0 / sub_427AA0 result codes: 255 missing sprite,
+                // 0x80000001/2 missing primary/secondary bitmap (fatal),
+                // 0x80000003 secondary of another size or format (silent,
+                // after the common state was applied), 0x80000004 projected
+                // extent below 2 (fatal).
+                if !self.graph90_object_matches(
+                    args[0],
+                    GRAPH90_SPRITE_TAG,
+                    512,
+                    GRAPH90_CLASS_SPRITE,
+                ) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:5C #{} is not a sprite object",
+                        args[0]
+                    ))));
+                }
+                let primary = self.query_bitmap_info(args[4]);
+                let secondary = (args[5] != -1).then(|| self.query_bitmap_info(args[5]));
+                if primary.is_none() || secondary.as_ref().is_some_and(Option::is_none) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:5C bitmap {} / {} does not exist",
+                        args[4], args[5]
+                    ))));
+                }
+                if let (Some(primary), Some(Some(secondary))) = (&primary, &secondary)
+                    && (primary.width, primary.height, primary.format)
+                        != (secondary.width, secondary.height, secondary.format)
+                {
+                    self.graph90_set_fixed_common_state(
                         args[0],
-                        GRAPH90_SPRITE_TAG,
-                        512,
-                        GRAPH90_CLASS_SPRITE,
-                    )
+                        args[1],
+                        args[2],
+                        args[3],
+                        Some(args[14]),
+                        Some(args[15]),
+                        Some(args[16]),
+                    );
+                    return Some(Ok(ethornell_vm::Value::None));
+                }
                 {
                     self.graph90_begin_sprite_configuration(args[0], 5);
                     self.graph90_set_fixed_common_state(
@@ -3500,6 +3570,14 @@ impl RuntimeTraceApi {
                         "GraphConfigureSpriteMode5"
                     );
                     self.graph90_record_call(args[0], id, &args);
+                    if let Some((width, height)) = self.graph90_sprite_projected_extent(args[0])
+                        && (width < 2 || height < 2)
+                    {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph90:5C projected size {width}x{height} is too small (perspective {})",
+                            args[11]
+                        ))));
+                    }
                 }
                 ethornell_vm::Value::None
             }

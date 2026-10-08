@@ -747,46 +747,6 @@ pub(crate) fn blit_decoded_image_raw_copy(
     }
 }
 
-/// Alpha-aware mode-5 dual-bitmap cache corresponding to the format-2
-/// `sub_40C0F0 -> sub_40C430` path. `transition_value=0` selects primary and
-/// `256` selects secondary. RGB remains straight/unpremultiplied.
-pub(crate) fn crossfade_decoded_images_straight_alpha(
-    primary: &DecodedImage,
-    secondary: &DecodedImage,
-    transition_value: i32,
-) -> Option<DecodedImage> {
-    if (primary.width, primary.height) != (secondary.width, secondary.height) {
-        return None;
-    }
-    let secondary_weight = transition_value.clamp(0, 256) as u32;
-    let primary_weight = 256 - secondary_weight;
-    let mut rgba = vec![0; primary.width as usize * primary.height as usize * 4];
-
-    for pixel_index in 0..(primary.width as usize * primary.height as usize) {
-        let offset = pixel_index * 4;
-        let primary_alpha = u32::from(primary.rgba[offset + 3]);
-        let secondary_alpha = u32::from(secondary.rgba[offset + 3]);
-        let primary_coverage = primary_weight * primary_alpha;
-        let secondary_coverage = secondary_weight * secondary_alpha;
-        let total_coverage = primary_coverage + secondary_coverage;
-        if total_coverage == 0 {
-            continue;
-        }
-        for channel in 0..3 {
-            let mixed = u64::from(primary.rgba[offset + channel]) * u64::from(primary_coverage)
-                + u64::from(secondary.rgba[offset + channel]) * u64::from(secondary_coverage);
-            rgba[offset + channel] = (mixed / u64::from(total_coverage)).min(255) as u8;
-        }
-        rgba[offset + 3] = ((total_coverage >> 8).min(255)) as u8;
-    }
-
-    Some(DecodedImage {
-        width: primary.width,
-        height: primary.height,
-        rgba,
-    })
-}
-
 pub(crate) fn crossfade_decoded_images(
     primary: &DecodedImage,
     secondary: &DecodedImage,
@@ -1151,8 +1111,13 @@ impl NativeMode5NodeArgs {
 
         let perspective_scale_fixed = self.perspective_scale_fixed();
         let perspective_scale = perspective_scale_fixed as f64 / 65_536.0;
-        let [offset_x_16_16, offset_y_16_16, rotation, scale_x_fixed, scale_y_fixed] =
-            self.mode5_transform_parameters(dynamic);
+        let [
+            offset_x_16_16,
+            offset_y_16_16,
+            rotation,
+            scale_x_fixed,
+            scale_y_fixed,
+        ] = self.mode5_transform_parameters(dynamic);
         let (scale_x_fixed, scale_y_fixed) = (scale_x_fixed as u32, scale_y_fixed as u32);
 
         // sub_429220.  BGI uses bottom-up DIB coordinates and deliberately

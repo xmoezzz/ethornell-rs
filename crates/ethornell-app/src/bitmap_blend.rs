@@ -861,6 +861,64 @@ pub(crate) fn blit_mode(
     }
 }
 
+/// sub_40C0F0: the Sprite mode-5/6 two-bitmap cache at sprite+0x220,
+/// `primary` faded towards `secondary` by `transition` (0..=256). Both
+/// bitmaps must have the cache format, 1 or 2; the result covers their
+/// common size.
+///
+/// Format 1 (sub_40C1B0) mixes all four bytes:
+/// `p + floor((s - p) * t / 256)`. Format 2 (sub_40C430) weights the
+/// colour by alpha: with `wp = (256 - t) * ap` and `total = wp + t * as`,
+/// the colour is `s + ((p - s) * (wp * 128 / total) >> 7)` and the alpha
+/// `total >> 8`; a zero total gives a zero pixel.
+pub(crate) fn crossfade_cache(
+    primary: &DecodedImage,
+    secondary: &DecodedImage,
+    format: i32,
+    transition: i32,
+) -> Option<DecodedImage> {
+    if !matches!(format, 1 | 2) {
+        return None;
+    }
+    let width = primary.width.min(secondary.width);
+    let height = primary.height.min(secondary.height);
+    let t = transition;
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let p = &primary.rgba[(y * primary.width as usize + x) * 4..][..4];
+            let s = &secondary.rgba[(y * secondary.width as usize + x) * 4..][..4];
+            let out = &mut rgba[(y * width as usize + x) * 4..][..4];
+            if format == 1 {
+                for lane in 0..4 {
+                    // pmulhw((s - p) << 4, t << 4): an arithmetic >> 16.
+                    let delta = ((i32::from(s[lane]) - i32::from(p[lane])) << 4) as i16;
+                    let product = (i32::from(delta) * i32::from((t << 4) as i16)) >> 16;
+                    out[lane] = (i32::from(p[lane]) + product).clamp(0, 255) as u8;
+                }
+            } else {
+                let weighted_primary = (256 - t) * i32::from(p[3]);
+                let total = (weighted_primary + t * i32::from(s[3])) as u32;
+                if total == 0 {
+                    continue;
+                }
+                let weight = ((weighted_primary << 7) as u32 / total) as i32;
+                for lane in 0..3 {
+                    let delta = i32::from(p[lane]) - i32::from(s[lane]);
+                    let mixed = ((delta * weight) as i16 >> 7) as i32 + i32::from(s[lane]);
+                    out[lane] = mixed.clamp(0, 255) as u8;
+                }
+                out[3] = (total >> 8).min(255) as u8;
+            }
+        }
+    }
+    Some(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,5 +1194,28 @@ mod tests {
         let src = image(&[[0, 0, 100, 0]]);
         blit_interpolate(&mut dst, &src, 0, 0, 128);
         assert_eq!(&dst.rgba[0..3], &[100, 0, 50]);
+    }
+
+    #[test]
+    fn crossfade_cache_matches_the_integer_kernels() {
+        let image = |px: [u8; 4]| DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: px.to_vec(),
+        };
+        let p = image([200, 10, 100, 0]);
+        let s = image([0, 255, 101, 255]);
+        let f1 = crossfade_cache(&p, &s, 1, 64).unwrap().rgba;
+        // 200 + floor(-200 * 64 / 256), 10 + floor(245 / 4), 100 + 0, 0 + 63.
+        assert_eq!(f1, [150, 71, 100, 63]);
+        assert_eq!(crossfade_cache(&p, &s, 1, 0).unwrap().rgba, p.rgba);
+        // Format 2: a transparent primary contributes nothing.
+        let f2 = crossfade_cache(&p, &s, 2, 64).unwrap().rgba;
+        assert_eq!(f2, [0, 255, 101, 63]);
+        let half = crossfade_cache(&image([200, 0, 0, 255]), &image([0, 0, 0, 255]), 2, 128)
+            .unwrap()
+            .rgba;
+        assert_eq!(half, [100, 0, 0, 255]);
+        assert!(crossfade_cache(&p, &s, 3, 64).is_none());
     }
 }
