@@ -16676,7 +16676,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_OBJECT_POSITION_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target dispatches through vtable+44. Base sub_41B1B0/+40 writes CDspObj+0x30/+0x34 and recursively adds child-link offsets; several Back subclasses and Landscape override the slot.",
+        notes: "sub_47B1B0 -> sub_4434C0: a missing object is fatal; vtable+44 (base sub_41B1B0 -> sub_41B1D0) stores +0x30/+0x34, rewrites the parent's member offset for the named object (sub_41C130) and moves every member to parent + offset with relink off. Back*/Landscape overrides are handled in graph90_set_specialized_position.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_OBJECT_MASK_ALPHA,
@@ -20915,6 +20915,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH92_DRAW_BITMAP_TEXT,
     opcodes::GRAPH91_CONFIGURE_WINDOW_FONT,
     opcodes::SYS_LOAD_PROGRAM_THREAD,
+    opcodes::GRAPH90_SET_OBJECT_POSITION,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21049,7 +21050,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_START_OBJECT_MOTION_CONTROL,
     opcodes::GRAPH90_START_SPLINE_OBJECT_CONTROL,
     opcodes::GRAPH90_START_SHAKE_OBJECT_CONTROL,
-    opcodes::GRAPH90_SET_OBJECT_POSITION,
     opcodes::GRAPH90_SET_OBJECT_PROPERTY,
     opcodes::GRAPH90_SET_OBJECT_HIT_MASK_BITMAP,
     opcodes::GRAPH90_HIT_TEST_OBJECT_AT_POINTER,
