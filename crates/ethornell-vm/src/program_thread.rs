@@ -62,9 +62,14 @@ impl Vm {
                 let file = self.pop_string_lossy()?;
                 let archive = self.pop_string_lossy()?;
                 let parameters = [data_bytes, code_bytes, operand_slots];
-                let mut program = api
-                    .load_program_ex(&archive, &file, &parameters)
-                    .unwrap_or_else(|| super::empty_loaded_program(format!("{archive}:{file}")));
+                // sub_48D080: a file sub_465AB0 cannot read is a script
+                // error, as is a module that does not fit the code region
+                // (sub_444CE0 returns 0x80000000).
+                let Some(mut program) = api.load_program_ex(&archive, &file, &parameters) else {
+                    return Err(VmError::Runtime(format!(
+                        "LoadProgramThread cannot read {archive}:{file}"
+                    )));
+                };
                 self.assign_program_instance(&mut program);
                 let region = |value: &Value| u32::try_from(value.as_i32()).unwrap_or(0);
                 let (data_bytes, code_bytes, slots) = (

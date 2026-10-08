@@ -16815,6 +16815,22 @@ mod tests {
             )
             .is_err()
         );
+        // sub_48D080 reports an unreadable thread file as well.
+        vm.stack.extend([
+            Value::Str("none.arc".into()),
+            Value::Str("none._bp".into()),
+            Value::Int(256),
+            Value::Int(0x10000),
+            Value::Int(0x10000),
+        ]);
+        assert!(
+            vm.dispatch_program_thread_opcode(
+                &mut TraceApi,
+                native_call::opcodes::SYS_LOAD_PROGRAM_THREAD,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

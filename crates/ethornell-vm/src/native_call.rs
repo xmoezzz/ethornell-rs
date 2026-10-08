@@ -15316,7 +15316,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: LOAD_PROGRAM_THREAD_PARAMETERS,
         returns: "integer CThread identifier",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target creates a child CThread, allocates its regions, appends the initial module and returns CThread+8.",
+        notes: "sub_488D00 pops region p1, region p2, operand slots, file, archive. sub_48D080 reads the file (sub_465AB0; unreadable is fatal), appends a CThread at the end of the thread chain (sub_444A70 -> sub_4447C0: 4*slots operand bytes, p2 code region, p1 second region), loads the module into the code region (sub_444CE0; a module that does not fit is fatal) and returns the new thread id (CThread+8).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_RTC_NOOP,
@@ -20914,6 +20914,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
     opcodes::GRAPH92_DRAW_BITMAP_TEXT,
     opcodes::GRAPH91_CONFIGURE_WINDOW_FONT,
+    opcodes::SYS_LOAD_PROGRAM_THREAD,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21159,7 +21160,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_READ_FILE_BYTES,
     opcodes::SYS_READ_FILE_RANGE,
     opcodes::SYS_SET_VALIDATED_FILE_ROOT,
-    opcodes::SYS_LOAD_PROGRAM_THREAD,
     opcodes::SYS_FILE_SIZE,
     opcodes::SYS_GET_CONFIGURED_ROOT,
     opcodes::SYS_SET_PRIMARY_ROOT,
