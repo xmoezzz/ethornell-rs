@@ -248,3 +248,20 @@ int Graph90_53_RefreshSpriteRect(struct CThread *t)
     }
     return 0;
 }
+
+// ------------------------------------------- Graph90:28 motion control ---
+
+// sub_47AC80 (12 pops; the object travels in ecx). Script order: object,
+// x, y, position_curve, alpha, alpha_curve, fixed_param, duration_ms,
+// divisor, numerator, input_enabled, input_priority. Checks: priority <
+// 0x10000, fixed_param in -1..256, alpha <= 256. sub_491D60: divisor 0
+// (0x80000001) and a missing object (-1) are fatal; it builds a
+// CProcCtrlDspObj (sub_431BD0) and sub_431D90 stores the start values
+// (vtbl+48 position, vtbl+76 alpha, sub_41B740 fixed parameter) and the
+// deltas (fixed_param -1 keeps the current value), the duration (0 -> 1)
+// and the update interval 1000 * numerator / divisor; sub_431E80 registers
+// the input scope. Returns 2 (procedure installed).
+// Tick (sub_432160): with a non-zero numerator the elapsed time is capped
+// at the next deadline, which then advances by the interval; progress
+// (t << 24) / duration goes through the curve (sub_41A690, linear = / 256)
+// and each value = start + (delta * p >> 16).

@@ -23346,6 +23346,16 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
 
             (0x90, 0x28) => {
                 let args = pop_args(stack, 12);
+                // sub_47AC80 also checks the fixed-parameter target with
+                // sub_497D50 (-1..=256) before sub_491D60.
+                if let Some(schedule) = animation::ScheduledObjectControl::from_popped_args(&args)
+                    && !(-1..=256).contains(&schedule.fixed_parameter_target)
+                {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:28 fixed parameter {} is outside -1..=256",
+                        schedule.fixed_parameter_target
+                    )));
+                }
                 let procedure_object = animation::ScheduledObjectControl::from_popped_args(&args)
                     .map(|schedule| schedule.target_object);
                 let control_id = self.apply_graph_object_effect(&args)?;

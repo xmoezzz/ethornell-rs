@@ -16636,7 +16636,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_START_OBJECT_MOTION_CONTROL_PARAMETERS,
         returns: "CProcCtrlDspObj completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
-        notes: "Target installs the motion-control CProcCtrlDspObj path through sub_491D60.",
+        notes: "sub_47AC80 -> sub_491D60/sub_431D90: priority >= 0x10000, fixed parameter outside -1..256, alpha > 256, divisor 0 and a missing object are fatal; installs a CProcCtrlDspObj moving position/alpha/fixed parameter from the current values with the given curves, duration and update interval 1000*numerator/divisor (sub_432160 caps each poll at the next deadline).",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_START_SPLINE_OBJECT_CONTROL,
@@ -20945,6 +20945,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
     opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
+    opcodes::GRAPH90_START_OBJECT_MOTION_CONTROL,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21068,7 +21069,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_TRANSFORM_BITMAP,
     opcodes::GRAPH90_BLIT_BITMAP_REGION,
     opcodes::GRAPH90_START_SPECIAL_OBJECT_CONTROL,
-    opcodes::GRAPH90_START_OBJECT_MOTION_CONTROL,
     opcodes::GRAPH90_START_SPLINE_OBJECT_CONTROL,
     opcodes::GRAPH90_START_SHAKE_OBJECT_CONTROL,
     opcodes::GRAPH90_SET_OBJECT_PROPERTY,

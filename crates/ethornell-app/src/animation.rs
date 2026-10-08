@@ -2459,16 +2459,18 @@ mod tests {
         // deadline even when the host arrives 500 ms late.  The scheduler may
         // poll the procedure again, but the subclass itself must not collapse
         // those missing polls into one call.
+        // Progress (4 << 24) / 1000 through the linear curve (sub_41A690:
+        // a1 / 256 = 262) gives 1000 * 262 >> 16 = 3.
         let first = animations.tick_native_object_controls(500);
         assert!(first.iter().any(|event| matches!(
             event,
-            LayerAnimationEvent::NativeObjectControlUpdated { x: 4, .. }
+            LayerAnimationEvent::NativeObjectControlUpdated { x: 3, .. }
         )));
         assert!(animations.has_native_control(control));
         let second = animations.tick_native_object_controls(500);
         assert!(second.iter().any(|event| matches!(
             event,
-            LayerAnimationEvent::NativeObjectControlUpdated { x: 8, .. }
+            LayerAnimationEvent::NativeObjectControlUpdated { x: 7, .. }
         )));
         assert!(animations.has_native_control(control));
     }
