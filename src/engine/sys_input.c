@@ -47,3 +47,22 @@ int Sys80_08_ReadCursorPoint(struct CThread *t)
     push(t, p[1]);
     return 0;
 }
+
+// sub_488320 -> sub_48E780 (duration travels in edi). Script order: x, y,
+// curve, duration_ms, updates_per_second, cancel_on_user_move. Nothing
+// happens while the window is minimised. The start is the current cursor
+// (sub_48E680); steps = max(ups * duration / 1000, 1); step k is due at
+// start_tick + duration * k / steps. sub_48E930 (every frame, while the app
+// is active) cancels when cancel_on_user_move is set and the cursor moved
+// more than one scaled pixel from the last generated point, else advances:
+//   linear: start + (delta * ((k << 16) / steps) >> 16)        (32-bit)
+//   curve 1: f = (int)((cos(a * pi / 46080) + 1) * 32768),
+//            a = 46080 - 46080 * k / steps (integer); start + (delta * f >> 16)
+// and moves the OS cursor there (sub_48E640); the last step lands on target.
+int Sys80_1F_ConfigureCursorMotion(struct CThread *t)
+{
+    uint32_t cancel = pop(t), ups = pop(t), duration = pop(t), curve = pop(t);
+    int y = pop(t), x = pop(t);
+    cursor_motion_start(duration, x, y, curve, ups, cancel);
+    return 0;
+}

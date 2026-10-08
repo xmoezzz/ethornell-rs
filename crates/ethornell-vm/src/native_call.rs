@@ -15436,7 +15436,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: CONFIGURE_CURSOR_MOTION_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target handler 0x00488320 forwards six native pops to sub_48E780. The helper captures the current cursor, derives max(updates_per_second * duration_ms / 1000, 1) steps, and advances a linear or cosine interpolation from the per-frame sub_48E930 tick.",
+        notes: "sub_488320 -> sub_48E780/sub_48E930: glides the cursor from its current point to (x, y) in max(ups*duration/1000, 1) timed steps, linear or integer-angle cosine (sub_48E8D0, 32-bit fixed point); optionally cancelled when the user moves the cursor away from the last generated point; ignored while minimised.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_SET_MESSAGE_AUXILIARY_INPUT_MASK,
@@ -20947,6 +20947,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_START_OBJECT_MOTION_CONTROL,
     opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
+    opcodes::SYS_CONFIGURE_CURSOR_MOTION,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21173,7 +21174,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_SET_PRIMARY_ROOT,
     opcodes::SYS_QUERY_INPUT_EVENT_BITS,
     opcodes::SYS_QUERY_SCOPED_INPUT_EVENT,
-    opcodes::SYS_CONFIGURE_CURSOR_MOTION,
     opcodes::SYS_WAIT_WINDOW_MESSAGE,
     opcodes::SYS_SET_THREAD_TIMER,
     opcodes::SYS_WAIT_THREAD_TIMER,

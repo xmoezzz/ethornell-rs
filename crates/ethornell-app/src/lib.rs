@@ -316,18 +316,17 @@ impl RuntimeCursorMotion {
         // sub_48E930 performs the interpolation in signed 16.16 fixed point.
         // Preserve its arithmetic-right-shift rounding for negative deltas
         // instead of relying on floating-point truncation toward zero.
+        // sub_48E8D0: mode 1 quantizes the angle to an integer before cos;
+        // both modes multiply in 32 bits and shift arithmetically.
         let factor_fixed = if self.interpolation_mode == 1 {
-            let progress = step as f64 / self.steps as f64;
-            (((1.0 - (std::f64::consts::PI * progress).cos()) * 32_768.0) as i64).clamp(0, 65_536)
+            let angle = 46_080 - (46_080 * step as i64 / i64::from(self.steps)) as i32;
+            ((f64::from(angle) * std::f64::consts::PI / 46_080.0).cos() + 1.0) * 32_768.0
         } else {
-            (i64::from(step) << 16) / i64::from(self.steps)
-        };
+            (((step as i64) << 16) / i64::from(self.steps)) as f64
+        } as i32;
         let interpolate = |start: i32, target: i32| {
-            let delta = i64::from(target) - i64::from(start);
-            let offset = delta.saturating_mul(factor_fixed) >> 16;
-            i64::from(start)
-                .saturating_add(offset)
-                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            let delta = target.wrapping_sub(start);
+            start.wrapping_add(delta.wrapping_mul(factor_fixed) >> 16)
         };
         (
             interpolate(self.start.0, self.target.0),
@@ -8037,9 +8036,10 @@ impl RuntimeTraceApi {
             self.cursor_motion = None;
             return;
         }
+        // sub_48E680 truncates like Sys80:08.
         let start = self
             .mouse_pos
-            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .map(|(x, y)| (x as i32, y as i32))
             .unwrap_or_default();
         self.cursor_motion = Some(RuntimeCursorMotion::new(
             start,
