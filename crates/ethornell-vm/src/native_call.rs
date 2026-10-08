@@ -18844,7 +18844,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH92_RENDER_TEXT_PARAMETERS,
         returns: "updated x/cursor i32",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4867D0 pops source args 20..0, builds style state from args 15..19, resolves font size/scale from source args 9/10, then sub_403B10/sub_434BA0/sub_434C50 rasterizes directly into the destination bitmap and publishes output X/Y. Portable rendering now mutates bitmap pixels; advanced GDI style/font details remain partial.",
+        notes: "sub_4867D0 pops 21 values (the first is discarded): bitmap, x, y, text, colour, flag, ruby text, colour 2, font id, size, scale %, style, vertical, kinsoku, line spacing, then shadow mode / x% / y% / colour / concentration (sub_434E30: mode <= 2, offsets <= 100, concentration <= 256). Exact: bitmap >= 0x4000, unregistered font, missing bitmap, size outside 4..=200 and scale outside 25..=200 are fatal; each character is a record (sub_435290) holding the shadow - mode 1 recoloured glyph at (size*x%/100, size*y%/100) (sub_4188D0), mode 2 clamped box-sum glow of that radius (sub_433180) with the glyph moved by it - blended with parameter 256-concentration, then the glyph; records are blitted with mode 0 (sub_437940). Partial: the sub_435290 layout (GDI metrics, ruby records, the shadow advance term) is the portable text_layout approximation.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH92_CONFIGURE_FONT_OVERRIDE,

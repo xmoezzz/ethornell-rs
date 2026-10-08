@@ -830,6 +830,135 @@ pub(crate) fn rasterize_placed_glyphs(
     }
 }
 
+/// The shadow style of the target text layout (`sub_434E30`): `mode` 1 is a
+/// drop shadow offset by (`dx`, `dy`), mode 2 a glow of radius (`dx`, `dy`);
+/// both use `rgb` and are blended with parameter `256 - concentration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextShadow {
+    pub mode: i32,
+    pub dx: i32,
+    pub dy: i32,
+    pub rgb: u32,
+    pub concentration: i32,
+}
+
+/// One glyph as a format-2 image (straight alpha = coverage) and its
+/// top-left position.
+fn glyph_cell(
+    font: &FontArc,
+    ch: char,
+    x: f32,
+    y: f32,
+    size: f32,
+    rgb: [u8; 3],
+) -> Option<(DecodedImage, i32, i32)> {
+    let scale = PxScale::from(size);
+    let baseline = y + font.as_scaled(scale).ascent();
+    let outlined = font.outline_glyph(font.glyph_id(ch).with_scale_and_position(scale, point(x, baseline)))?;
+    let bounds = outlined.px_bounds();
+    let (left, top) = (bounds.min.x as i32, bounds.min.y as i32);
+    let width = (bounds.max.x as i32 - left).max(1) as u32;
+    let height = (bounds.max.y as i32 - top).max(1) as u32;
+    let mut cell = DecodedImage {
+        width,
+        height,
+        rgba: vec![0; (width * height * 4) as usize],
+    };
+    outlined.draw(|gx, gy, coverage| {
+        if gx < width && gy < height {
+            let at = ((gy * width + gx) * 4) as usize;
+            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+            if alpha > cell.rgba[at + 3] {
+                cell.rgba[at..at + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+            }
+        }
+    });
+    Some((cell, left, top))
+}
+
+/// sub_435290's per-character records, blitted onto `dst` (format
+/// `dst_format`) in order by sub_437940 with mode 0. With a shadow, each
+/// record is a transparent format-2 image holding the shadow (blend mode 1,
+/// parameter 256 - concentration) and then the glyph (mode 0): mode 1 puts
+/// the recoloured glyph (sub_4188D0) at (+dx, +dy); mode 2 draws the glyph
+/// at (+dx, +dy) over a glow whose alpha is the clamped box sum of glyph
+/// coverage within (dx, dy) (sub_433180).
+pub(crate) fn rasterize_placed_glyph_records(
+    dst: &mut DecodedImage,
+    dst_format: i32,
+    glyphs: &[crate::text_layout::PlacedGlyph],
+    size: f32,
+    color: [f32; 4],
+    color_of: &dyn Fn(usize) -> Option<[f32; 4]>,
+    shadow: Option<TextShadow>,
+) {
+    let Some(font) = snapshot_font() else {
+        rasterize_placed_glyphs(dst, glyphs, size, color, color_of);
+        return;
+    };
+    let size = size.max(1.0);
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let shadow = shadow.filter(|shadow| matches!(shadow.mode, 1 | 2));
+    for glyph in glyphs {
+        let color = color_of(glyph.index).unwrap_or(color);
+        let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
+        let Some((cell, left, top)) = glyph_cell(font, glyph.ch, glyph.x, glyph.y, size, rgb) else {
+            continue;
+        };
+        let Some(shadow) = shadow else {
+            crate::bitmap_blend::blit_mode(dst, dst_format, &cell, 2, left, top, 0, 0);
+            continue;
+        };
+        let (dx, dy) = (shadow.dx.max(0), shadow.dy.max(0));
+        let shadow_rgb = [(shadow.rgb >> 16) as u8, (shadow.rgb >> 8) as u8, shadow.rgb as u8];
+        let parameter = 256 - shadow.concentration;
+        let (spread_x, spread_y) = if shadow.mode == 1 { (dx, dy) } else { (2 * dx, 2 * dy) };
+        let width = cell.width + spread_x as u32;
+        let height = cell.height + spread_y as u32;
+        let mut record = DecodedImage {
+            width,
+            height,
+            rgba: vec![0; (width * height * 4) as usize],
+        };
+        if shadow.mode == 1 {
+            let mut tinted = cell.clone();
+            for pixel in tinted.rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].copy_from_slice(&shadow_rgb);
+            }
+            crate::bitmap_blend::blit_mode(&mut record, 2, &tinted, 2, dx, dy, 1, parameter);
+            crate::bitmap_blend::blit_mode(&mut record, 2, &cell, 2, 0, 0, 0, 0);
+        } else {
+            let mut glow = record.clone();
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    let mut sum = 0u32;
+                    for sy in (y - 2 * dy)..=y {
+                        for sx in (x - 2 * dx)..=x {
+                            if (0..cell.width as i32).contains(&sx)
+                                && (0..cell.height as i32).contains(&sy)
+                            {
+                                sum += u32::from(
+                                    cell.rgba[((sy as u32 * cell.width + sx as u32) * 4 + 3) as usize],
+                                );
+                            }
+                        }
+                    }
+                    let at = ((y as u32 * width + x as u32) * 4) as usize;
+                    glow.rgba[at..at + 4].copy_from_slice(&[
+                        shadow_rgb[0],
+                        shadow_rgb[1],
+                        shadow_rgb[2],
+                        sum.min(255) as u8,
+                    ]);
+                }
+            }
+            crate::bitmap_blend::blit_mode(&mut record, 2, &glow, 2, 0, 0, 1, parameter);
+            crate::bitmap_blend::blit_mode(&mut record, 2, &cell, 2, dx, dy, 0, 0);
+        }
+        crate::bitmap_blend::blit_mode(dst, dst_format, &record, 2, left, top, 0, 0);
+    }
+}
+
 pub(crate) fn measure_text_advance(text: &str, size: f32, spacing: f32) -> i32 {
     let glyph_count = text.chars().count();
     if glyph_count == 0 {
@@ -1431,6 +1560,75 @@ mod styled_text_snapshot_tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod glyph_record_tests {
+    use super::{TextShadow, rasterize_placed_glyph_records};
+    use crate::text_layout::PlacedGlyph;
+    use ethornell_image::DecodedImage;
+
+    fn render(shadow: Option<TextShadow>) -> DecodedImage {
+        let mut image = DecodedImage {
+            width: 40,
+            height: 40,
+            rgba: vec![0; 40 * 40 * 4],
+        };
+        let glyph = PlacedGlyph {
+            ch: '■',
+            index: 0,
+            x: 5.0,
+            y: 5.0,
+        };
+        rasterize_placed_glyph_records(&mut image, 2, &[glyph], 20.0, [1.0; 4], &|_| None, shadow);
+        image
+    }
+
+    fn ink(image: &DecodedImage) -> Vec<(u32, u32, [u8; 4])> {
+        (0..image.height)
+            .flat_map(|y| (0..image.width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let at = ((y * image.width + x) * 4) as usize;
+                let pixel: [u8; 4] = image.rgba[at..at + 4].try_into().unwrap();
+                (x, y, pixel)
+            })
+            .filter(|(_, _, pixel)| pixel[3] != 0)
+            .collect()
+    }
+
+    #[test]
+    fn drop_shadow_and_glow_extend_the_glyph_in_the_shadow_colour() {
+        let plain = ink(&render(None));
+        if plain.is_empty() {
+            return; // no system font
+        }
+        let max_x = plain.iter().map(|p| p.0).max().unwrap();
+        let max_y = plain.iter().map(|p| p.1).max().unwrap();
+        let blue = |dx, dy, mode| {
+            ink(&render(Some(TextShadow {
+                mode,
+                dx,
+                dy,
+                rgb: 0x0000FF,
+                concentration: 128,
+            })))
+        };
+        // Mode 1: blue at half strength right of and below the glyph.
+        let drop = blue(2, 2, 1);
+        let edge = drop
+            .iter()
+            .filter(|p| p.0 > max_x && p.1 <= max_y)
+            .max_by_key(|p| p.2[3])
+            .expect("shadow edge");
+        assert_eq!(&edge.2[..3], &[0, 0, 255]);
+        assert!((120..=135).contains(&edge.2[3]), "{:?}", edge.2);
+        // Mode 2: the glyph moves by (dx, dy) and the glow surrounds it.
+        let glow = blue(2, 2, 2);
+        assert!(glow.iter().any(|p| p.0 == max_x + 4 && p.2[2] == 255));
+        let min_x = plain.iter().map(|p| p.0).min().unwrap();
+        // The glow reaches dx left of the moved glyph, i.e. the old edge.
+        assert_eq!(glow.iter().map(|p| p.0).min().unwrap(), min_x);
     }
 }
 

@@ -336,6 +336,7 @@ impl RuntimeTraceApi {
         pitch_percent: i32,
         kinsoku: bool,
         color: [f32; 4],
+        shadow: Option<crate::snapshot::TextShadow>,
     ) -> Option<(i32, (i32, i32))> {
         let link_color = (self.system92_text_render_override != -1)
             .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
@@ -373,7 +374,16 @@ impl RuntimeTraceApi {
                     ]
                 })
         };
-        crate::snapshot::rasterize_placed_glyphs(&mut image, &layout.glyphs, size, color, &color_of);
+        let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+        crate::snapshot::rasterize_placed_glyph_records(
+            &mut image,
+            format,
+            &layout.glyphs,
+            size,
+            color,
+            &color_of,
+            shadow,
+        );
         // `<l>` fragments feed Graph92:9E with the position the layout gave
         // the first glyph of each link.
         self.system92_text_fragment_records = parsed
@@ -430,6 +440,7 @@ impl RuntimeTraceApi {
                     at(1),
                     at(2) != 0,
                     color,
+                    None,
                 )
                 .map_or(1, |(lines, _)| lines),
             None => 1,

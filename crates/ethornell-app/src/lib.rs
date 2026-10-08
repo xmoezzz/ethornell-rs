@@ -22628,43 +22628,76 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::debug!(object, enabled, "GraphSetObjectUpdateFlag");
             }
             (0x92, 0x9c) => {
-                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values and calls
-                // sub_403B10 -> sub_434BA0 -> sub_434C50 -> sub_435290, which
-                // lays the markup text out inside the target bitmap and draws
-                // it there; no display node is created. In pop order:
+                // sub_4867D0 pops 21 values (the first is discarded) and
+                // calls sub_403B10 -> sub_434BA0 -> sub_434C50 -> sub_435290,
+                // which lays the markup text out inside the target bitmap
+                // and draws it there; no display node is created. In pop
+                // order:
                 //   [20] target bitmap   [19] x   [18] y   [17] text
                 //   [16] colour          [14] ruby-record text
-                //   [11] font height     [10] horizontal percent
+                //   [12] font id         [11] font height
+                //   [10] horizontal percent   [9] font style
                 //   [8]  vertical flag   [7]  kinsoku flag
                 //   [6]  line-spacing percent
-                //   [4]..[0] shadow style (mode, x%, y%, colour, concentration)
+                //   [5]..[1] shadow: mode, x%, y%, colour, concentration
                 // The value pushed back is the number of lines (sub_435290
                 // stores 1 through its first argument and counts every wrap).
                 let args = pop_args(stack, 21);
-                let target = args.get(20).map(value_to_i32).unwrap_or_default();
-                let x = args.get(19).map(value_to_i32).unwrap_or_default();
-                let y = args.get(18).map(value_to_i32).unwrap_or_default();
+                let int = |index: usize| args.get(index).map(value_to_i32).unwrap_or_default();
+                let target = int(20);
+                let x = int(19);
+                let y = int(18);
                 let text = args.get(17).and_then(value_to_string);
                 let auxiliary_text = args.get(14).and_then(value_to_string);
-                let size = args
-                    .get(11)
-                    .map(value_to_i32)
-                    .filter(|size| (4..=256).contains(size))
-                    .unwrap_or(self.text_state.font_size.max(1.0) as i32);
-                let packed_color = args.get(16).map(value_to_i32).unwrap_or_default();
+                let font = int(12);
+                let size = int(11);
+                let horizontal_scale = int(10);
+                let fail = |what: String| {
+                    Err(ethornell_vm::VmError::Runtime(format!("Graph92:9C {what}")))
+                };
+                // sub_497B60, sub_497AF0, then sub_403B10 (bitmap) and the
+                // font checks of sub_42EAB0 reached through sub_4035A0.
+                if target as u32 >= 0x4000 {
+                    return fail(format!("bitmap handle {target} is out of range"));
+                }
+                if self.native_user.font_face(font).is_none() {
+                    return fail(format!("font {font} is not registered"));
+                }
+                if self.query_bitmap_info(target).is_none() {
+                    return fail(format!("bitmap {target} does not exist"));
+                }
+                if !(4..=200).contains(&size) {
+                    return fail(format!("font size {size} is out of range"));
+                }
+                if !(25..=200).contains(&horizontal_scale) {
+                    return fail(format!("font scale {horizontal_scale}% is out of range"));
+                }
+                // sub_434E30 keeps a valid style (mode <= 2, offsets <= 100%,
+                // concentration <= 256); an invalid one leaves the local
+                // style uninitialised, which we treat as no shadow.
+                let (mode, x_percent, y_percent) = (int(5), int(4), int(3));
+                let concentration = int(1);
+                let shadow = (matches!(mode, 1 | 2)
+                    && (0..=100).contains(&x_percent)
+                    && (0..=100).contains(&y_percent)
+                    && (0..=256).contains(&concentration))
+                .then(|| snapshot::TextShadow {
+                    mode,
+                    // sub_435290: size * percent / 100, at least 1.
+                    dx: (size * x_percent / 100).max(1),
+                    dy: (size * y_percent / 100).max(1),
+                    rgb: int(2) as u32 & 0x00ff_ffff,
+                    concentration,
+                });
+                let packed_color = int(16);
                 let color = [
                     ((packed_color >> 16) & 0xff) as f32 / 255.0,
                     ((packed_color >> 8) & 0xff) as f32 / 255.0,
                     (packed_color & 0xff) as f32 / 255.0,
                     1.0,
                 ];
-                let horizontal_scale = args
-                    .get(10)
-                    .map(value_to_i32)
-                    .filter(|value| *value > 0)
-                    .unwrap_or(100);
-                let pitch_percent = args.get(6).map(value_to_i32).unwrap_or_default();
-                let kinsoku = args.get(7).map(value_to_i32).unwrap_or_default() != 0;
+                let pitch_percent = int(6);
+                let kinsoku = int(7) != 0;
                 self.system92_text_fragment_records.clear();
                 let (lines, end) = match text.as_deref().filter(|text| !text.is_empty()) {
                     Some(text) => self
@@ -22678,6 +22711,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             pitch_percent,
                             kinsoku,
                             color,
+                            shadow,
                         )
                         .unwrap_or((1, (x, y))),
                     None => (1, (x, y)),
@@ -22691,6 +22725,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     horizontal_scale,
                     pitch_percent,
                     kinsoku,
+                    ?shadow,
                     packed_color = format_args!("0x{packed_color:06X}"),
                     lines,
                     end = ?end,
