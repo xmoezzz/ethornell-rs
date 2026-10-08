@@ -3213,13 +3213,42 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x58) => {
                 let args = Self::graph90_source_args(stack, 9);
-                if args.len() == 9
-                    && self.graph90_object_matches(
-                        args[0],
-                        GRAPH90_SPRITE_TAG,
-                        512,
-                        GRAPH90_CLASS_SPRITE,
-                    )
+                // sub_47C470: bitmap handles < 0x4000, transition and value
+                // <= 256, priority < 0x10000; sub_462390 then fails on a
+                // missing sprite (255), a missing bitmap (1) and bitmaps of
+                // different sizes (2) -- all script errors.
+                if args.len() != 9 {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:58 expected nine arguments".into(),
+                    )));
+                }
+                let fail = |what: String| {
+                    Some(Err(ethornell_vm::VmError::Runtime(format!("Graph90:58 {what}"))))
+                };
+                for bitmap in [args[3], args[4]] {
+                    if bitmap as u32 >= 0x4000 {
+                        return fail(format!("bitmap handle {bitmap} is out of range"));
+                    }
+                }
+                if args[5] as u32 > 0x100 || args[6] as u32 > 0x100 {
+                    return fail(format!("value {} / {} exceeds 256", args[5], args[6]));
+                }
+                if args[7] as u32 >= 0x1_0000 {
+                    return fail(format!("priority {} is out of range", args[7]));
+                }
+                if !self.graph90_object_matches(args[0], GRAPH90_SPRITE_TAG, 512, GRAPH90_CLASS_SPRITE)
+                {
+                    return fail(format!("#{} is not a sprite object", args[0]));
+                }
+                let sizes = [args[3], args[4]].map(|bitmap| {
+                    self.query_bitmap_info(bitmap).map(|info| (info.width, info.height))
+                });
+                if sizes.iter().any(Option::is_none) {
+                    return fail(format!("bitmap {} / {} does not exist", args[3], args[4]));
+                }
+                if sizes[0] != sizes[1] {
+                    return fail(format!("bitmaps {} / {} differ in size", args[3], args[4]));
+                }
                 {
                     self.graph90_begin_sprite_configuration(args[0], 1);
                     self.graph90_set_common_state(

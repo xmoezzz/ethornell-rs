@@ -6405,7 +6405,28 @@ impl RuntimeTraceApi {
         // CDspObjSprite mode 1 stores the cross-fade control at +0x240
         // (this[144]). The ordinary CDspObj alpha at +0xAC is a separate
         // transparency gate applied after the two bitmaps are combined.
-        let image = crossfade_decoded_images(&primary, &secondary, transition.alpha_multiplier);
+        // The mode-1 draw (sub_4258D0 case 1) mixes through sub_40C0F0 with
+        // +0x240, the same integer kernel as the mode-5/6 cache. Bitmaps of
+        // an untracked format keep the portable mix.
+        let format = self
+            .bitmap_formats
+            .get(&transition.primary_resource)
+            .copied()
+            .filter(|format| {
+                self.bitmap_formats.get(&transition.secondary_resource) == Some(format)
+            });
+        let image = format
+            .and_then(|format| {
+                bitmap_blend::crossfade_cache(
+                    &primary,
+                    &secondary,
+                    format,
+                    transition.alpha_multiplier.clamp(0, 256),
+                )
+            })
+            .unwrap_or_else(|| {
+                crossfade_decoded_images(&primary, &secondary, transition.alpha_multiplier)
+            });
         let width = image.width as f32;
         let height = image.height as f32;
         let key = format!("runtime:transition:{node}");
@@ -11538,6 +11559,8 @@ mod input_tests {
         assert!(api.graph_object_layers[&sprite].contains(&sprite));
         assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 64);
         assert!(api.graph_layers[&sprite].enabled);
+        // The Sprite constructor clears the draw gate; Graph90:54 opens it.
+        call_graph(&mut api, 0x90, 0x54, &mut vec![Value::Int(sprite), Value::Int(1)]).unwrap();
         api.sync_display_tree_from_runtime();
         assert!(api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
         let item = api

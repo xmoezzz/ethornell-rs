@@ -16932,7 +16932,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C470/sub_462390 configures an existing CDspObjSprite as mode 1. It does not allocate a generic transition node.",
+        notes: "sub_47C470 -> sub_462390: bitmap handles >= 0x4000, transition/value > 256, priority >= 0x10000, a missing sprite, a missing bitmap and bitmaps of different sizes are fatal; mode 1 mixes primary and secondary with the sub_40C0F0 integer kernel at the +0x240 transition, then applies the object alpha.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_SPRITE_SCALED_BITMAP,
@@ -20946,6 +20946,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_COUNT_TEXT_SUBSTITUTION_MATCHES,
     opcodes::GRAPH90_REFRESH_SPRITE_OBJECT,
     opcodes::GRAPH90_START_OBJECT_MOTION_CONTROL,
+    opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21085,7 +21086,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BITMAP_SIZE,
     opcodes::GRAPH90_CONFIGURE_CURRENT_OBJECT_BLIT_SOURCES,
     opcodes::GRAPH90_SET_SPRITE_AUX_BITMAP,
-    opcodes::GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_SCALED_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_MASKED_BITMAP,
     opcodes::GRAPH90_CONFIGURE_SPRITE_VM_EFFECT,

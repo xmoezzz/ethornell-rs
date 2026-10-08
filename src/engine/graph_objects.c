@@ -265,3 +265,14 @@ int Graph90_53_RefreshSpriteRect(struct CThread *t)
 // at the next deadline, which then advances by the interval; progress
 // (t << 24) / duration goes through the curve (sub_41A690, linear = / 256)
 // and each value = start + (delta * p >> 16).
+
+// ------------------------------------------- Graph90:58 sprite mode 1 ---
+
+// sub_47C470. Script order: sprite, x, y, primary, secondary, transition,
+// value, priority, blend. Checks: both bitmaps < 0x4000, transition <= 256
+// (sub_497E00), value <= 256 (sub_497E50), priority < 0x10000.
+// sub_462390: missing sprite 255, either bitmap missing 1 (byte_4E94B8),
+// different sizes 2 (byte_4E94F0) -- all fatal. Mode 1 stores the
+// transition at +0x240; the draw (sub_4258D0 case 1) mixes primary and
+// secondary through sub_40C0F0 (see the kernels above) before applying the
+// object's own alpha.
