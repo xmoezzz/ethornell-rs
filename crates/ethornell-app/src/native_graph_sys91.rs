@@ -1201,6 +1201,12 @@ impl RuntimeTraceApi {
             0x33 => {
                 let args = Self::graph91_source_ints(stack, 4);
                 if let [object, x, y, z] = args.as_slice() {
+                    // A missing object is a script error (byte_4E8BC0).
+                    if !self.graph_handle_exists(*object) {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph91:33 #{object} is not a display object"
+                        ))));
+                    }
                     self.graph91_set_object_fixed_position(*object, *x, *y, *z);
                 }
                 ethornell_vm::Value::None
@@ -1208,6 +1214,12 @@ impl RuntimeTraceApi {
             0x36 => {
                 let args = Self::graph91_source_ints(stack, 4);
                 if let [object, x, y, z] = args.as_slice() {
+                    // A missing object is a script error (byte_4E8BC0).
+                    if !self.graph_handle_exists(*object) {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph91:36 #{object} is not a display object"
+                        ))));
+                    }
                     self.graph91_set_object_secondary_vector(*object, *x, *y, *z);
                 }
                 ethornell_vm::Value::None
@@ -1215,6 +1227,12 @@ impl RuntimeTraceApi {
             0x37 => {
                 let args = Self::graph91_source_ints(stack, 4);
                 if let [object, x, y, z] = args.as_slice() {
+                    // A missing object is a script error (byte_4E8BC0).
+                    if !self.graph_handle_exists(*object) {
+                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                            "Graph91:37 #{object} is not a display object"
+                        ))));
+                    }
                     self.graph91_set_object_primary_vector(*object, *x, *y, *z);
                 }
                 ethornell_vm::Value::None
@@ -1607,7 +1625,14 @@ impl RuntimeTraceApi {
         for child in children {
             self.graph91_set_object_secondary_vector(child, x, y, z);
         }
-        let _ = self.graph90_resync_fixed_sprite_geometry(object);
+        // ... then calls vtable+0x44 with this object's own primary vector,
+        // which re-propagates that vector to every member (sub_41B520).
+        let primary = self
+            .graph91_object_transforms
+            .get(&object)
+            .map(|transform| transform.primary_vector)
+            .unwrap_or_default();
+        self.graph91_set_object_primary_vector(object, primary[0], primary[1], primary[2]);
     }
 
     fn graph91_set_object_primary_vector(&mut self, object: i32, x: i32, y: i32, z: i32) {

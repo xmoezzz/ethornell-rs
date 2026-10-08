@@ -13116,10 +13116,12 @@ mod input_tests {
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
         let parent = api.alloc_window_surface(320, 180).unwrap();
-        let child = 0x8000_0043_u32 as i32;
-        api.display_tree
-            .register(child, super::NativeDisplayKind::Sprite);
-        api.display_tree.set_parent(child, parent).unwrap();
+        let Value::Int(child) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() else {
+            panic!("no sprite");
+        };
+        // A real member link (Graph91:3E / sub_41AB40).
+        let mut attach = [parent, child, 0, 0].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x91, 0x3e, &mut attach).unwrap();
 
         let mut secondary = vec![Value::Int(parent), Value::Int(-17), Value::Int(23)];
         call_graph(&mut api, 0x90, 0x36, &mut secondary).unwrap();
@@ -13138,7 +13140,8 @@ mod input_tests {
             );
         }
 
-        api.display_tree.set_parent(child, 0).unwrap();
+        let mut detach = vec![Value::Int(parent), Value::Int(child)];
+        call_graph(&mut api, 0x91, 0x3f, &mut detach).unwrap();
         let child_native = api.graph_object_properties[&child].native;
         assert_eq!(
             (

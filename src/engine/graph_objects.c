@@ -214,3 +214,20 @@ int Graph90_05_CreatePrioritizedWorkBitmap(struct CThread *t)
     work_bitmap_render_through(bitmap, priority);
     return 0;
 }
+
+// ------------------------------------- Graph91:33/36/37 fixed vectors ---
+
+// sub_4819A0 -> sub_443520. Script order (object, x16, y16, z16). Missing
+// object is fatal. vtbl+60 (base sub_41B370): when +0x80 (and z == 0 or
+// +0x84 == 1) round x/y to whole pixels ((v + 0x8000) & ~0xFFFF); store
+// +0x4C/+0x50/+0x54; with +0x7C also vtbl+40 (x >> 16, y >> 16, 1, 1);
+// then every member gets vtbl+60(member fixed + new - old). Sprite
+// (sub_4282B0) reprojects modes 5/6; BackML (sub_41E000) re-lays out.
+// A changed sort key re-sorts the object (sub_443300).
+
+// sub_481A40 -> vtbl+68 (base sub_41B520): primary vector +0x5C..+0x64,
+// copied to every member recursively. Missing object is fatal.
+
+// sub_4819F0 -> sub_41B580: secondary vector +0x6C..+0x74, recursively for
+// members, then vtbl+68 with this object's own primary vector -- so every
+// descendant ends with the root's primary vector. Missing object is fatal.

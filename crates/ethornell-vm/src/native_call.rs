@@ -18100,7 +18100,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_OBJECT_FIXED_POSITION_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4819A0 invokes vtable+60. Base sub_41B370 consults +0x80/+0x84 first: when +0x80!=0 and (Z==0 or +0x84==1), X/Y are rounded as (v+0x8000)&0xFFFF0000 with 32-bit wrapping. It stores signed 16.16 X/Y/Z at +0x4C/+0x50/+0x54; if +0x7C!=0 it mirrors arithmetic X>>16/Y>>16 through vtable+0x28. Base construction sets +0x7C=1 and +0x80/+0x84=0/0; Sprite modes 5/6 and BackML clear +0x7C. The setter then eagerly propagates child base-vector deltas. sub_41B4C0 resolves one object by adding its three fixed-vector banks without traversing parents.",
+        notes: "sub_4819A0 -> vtable+60 (sub_41B370 and the Sprite/BackML overrides): missing object fatal; optional whole-pixel rounding, fixed x/y/z stored, integer position mirrored when +0x7C is set, members moved by the same delta; projected sprites are rebuilt.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_SET_OBJECT_SECONDARY_VECTOR,
@@ -18108,7 +18108,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_OBJECT_VECTOR_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4819F0 reaches sub_41B580 and stores signed 16.16 X/Y/Z at CDspObj+0x6C/+0x70/+0x74, propagates the bank to children, then reapplies the primary vector through vtable slot +68. sub_41B4C0 adds this bank to +0x4C/+0x50/+0x54 and +0x5C/+0x60/+0x64 before mode-5 projection.",
+        notes: "sub_4819F0 -> sub_41B580: missing object fatal; stores the secondary vector recursively on members, then re-applies the object's own primary vector (vtable+68), which overwrites every member's primary vector.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
@@ -18116,7 +18116,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_OBJECT_VECTOR_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_481A40 invokes vtable slot +68; sub_41B520 stores signed 16.16 X/Y/Z at CDspObj+0x5C/+0x60/+0x64 and propagates them to children. sub_41B4C0 adds this bank to +0x4C/+0x50/+0x54 and +0x6C/+0x70/+0x74 before mode-5 projection.",
+        notes: "sub_481A40 -> vtable+68 (sub_41B520 / Sprite sub_428310): missing object fatal; stores the primary vector and copies it to every member; projected sprites are rebuilt.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_GET_OBJECT_PROPERTY,
@@ -20940,6 +20940,9 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_POP_ICON_INPUT_EVENT,
     opcodes::SOUND_CONTROL_BGM,
     opcodes::SOUND_SET_BGM_VOLUME,
+    opcodes::GRAPH91_SET_OBJECT_FIXED_POSITION,
+    opcodes::GRAPH91_SET_OBJECT_SECONDARY_VECTOR,
+    opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21038,9 +21041,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_SET_LANDSCAPE_CELL_COLUMN,
     opcodes::GRAPH91_GET_LANDSCAPE_CELL_VALUE,
     opcodes::GRAPH91_COPY_LANDSCAPE_CELL_IMAGE,
-    opcodes::GRAPH91_SET_OBJECT_FIXED_POSITION,
-    opcodes::GRAPH91_SET_OBJECT_SECONDARY_VECTOR,
-    opcodes::GRAPH91_SET_OBJECT_PRIMARY_VECTOR,
     opcodes::GRAPH91_GET_OBJECT_PROPERTY,
     opcodes::GRAPH91_INITIALIZE_MULTILAYER_BACKGROUND,
     opcodes::GRAPH91_SELECT_MULTILAYER_LAYER,
