@@ -13147,6 +13147,28 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_81_refuses_attached_and_missing_windows() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut window = |api: &mut super::RuntimeTraceApi| {
+            let mut create = vec![Value::Int(32), Value::Int(32)];
+            match call_graph(api, 0x90, 0x80, &mut create).unwrap() {
+                Value::Int(handle) => handle,
+                value => panic!("unexpected window handle {value:?}"),
+            }
+        };
+        let (parent, child) = (window(&mut api), window(&mut api));
+        let mut attach = [parent, child, 0, 0].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x91, 0x3e, &mut attach).unwrap();
+        assert!(call_graph(&mut api, 0x90, 0x81, &mut vec![Value::Int(child)]).is_err());
+        let mut detach = vec![Value::Int(parent), Value::Int(child)];
+        call_graph(&mut api, 0x91, 0x3f, &mut detach).unwrap();
+        call_graph(&mut api, 0x90, 0x81, &mut vec![Value::Int(child)]).unwrap();
+        assert!(call_graph(&mut api, 0x90, 0x81, &mut vec![Value::Int(child)]).is_err());
+    }
+
+    #[test]
     fn window_constructor_starts_draw_enabled_like_target() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -21125,11 +21147,32 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0x81) => {
+                // sub_47DB60: a window still locked by an input processor
+                // (+0x130, sub_46C5E0) or attached to a parent (+0x11C,
+                // sub_462060), or one that does not exist (sub_440700), is
+                // a script error.
                 let window = pop_int_value(stack).unwrap_or_default();
-                let removed =
-                    Self::is_window_surface_handle(window) && self.remove_graph_surface(window);
-                tracing::debug!(window, removed, "GraphReleaseWindowObject");
-                trace_graph!(self, "release window #{window} removed={removed}");
+                let fail = |what: &str| {
+                    Err(ethornell_vm::VmError::Runtime(format!("Graph90:81 window #{window} {what}")))
+                };
+                let exists =
+                    Self::is_window_surface_handle(window) && self.graph_surfaces.contains_key(&window);
+                if exists
+                    && self
+                        .graph_input_objects
+                        .values()
+                        .any(|processor| processor.is_live() && processor.layer == window)
+                {
+                    return fail("is still used by an input processor");
+                }
+                if exists && self.graph_native_owners.contains_key(&window) {
+                    return fail("is still attached to a parent object");
+                }
+                if !exists || !self.remove_graph_surface(window) {
+                    return fail("is not a window object");
+                }
+                tracing::debug!(window, "GraphReleaseWindowObject");
+                trace_graph!(self, "release window #{window}");
             }
             (0x90, 0x84) => {
                 let enabled = pop_int_value(stack).unwrap_or_default() != 0;

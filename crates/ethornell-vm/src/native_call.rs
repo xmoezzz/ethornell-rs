@@ -17092,7 +17092,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_WINDOW_HANDLE_PARAMETER,
         returns: "void; target errors for invalid, procedure-bound, or owned windows",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DB60 checks CDspObjWindow cooperative-procedure and owner links before sub_462980 releases the tagged slot.",
+        notes: "sub_47DB60: a window still locked by an input processor (+0x130), attached to a parent (+0x11C) or missing (sub_440700) is fatal; otherwise sub_440700 unlinks and deletes it.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_WINDOW_COMPOSITION_ORDER,
@@ -20916,6 +20916,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH91_CONFIGURE_WINDOW_FONT,
     opcodes::SYS_LOAD_PROGRAM_THREAD,
     opcodes::GRAPH90_SET_OBJECT_POSITION,
+    opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21080,7 +21081,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_UPLOAD_MAP_TILE_DATA,
     opcodes::GRAPH90_SET_MAP_VIEWPORT,
     opcodes::GRAPH90_REPLACE_MAP_TILE_ID,
-    opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
     opcodes::GRAPH90_CONFIGURE_WINDOW_OBJECT,
     opcodes::GRAPH90_SET_WINDOW_VALID_REGION,
     opcodes::GRAPH90_START_WINDOW_MESSAGE_PROCEDURE,
