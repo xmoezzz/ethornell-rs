@@ -19099,9 +19099,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x08) => {
+                // sub_487E50 -> sub_48E680: the active touch contact
+                // (dword_56669C) or the cursor mapped back through the
+                // display transform (sub_45E8D0 converts with (int), i.e.
+                // truncation); pushes x then y.
                 let (x, y) = self
                     .mouse_pos
-                    .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                    .map(|(x, y)| (x as i32, y as i32))
                     .unwrap_or_default();
                 stack.push(ethornell_vm::Value::Int(x));
                 stack.push(ethornell_vm::Value::Int(y));

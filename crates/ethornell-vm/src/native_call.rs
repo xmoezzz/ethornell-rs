@@ -14972,7 +14972,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "two values: client-space x, then y",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target 0x00487E50 calls sub_48E680, which prefers captured coordinates and otherwise converts the Win32 cursor position through the active display-mode transform.",
+        notes: "sub_487E50 -> sub_48E680: (0,0) before the window exists, else the first touch contact or the cursor mapped from client to game coordinates by sub_45E8D0 (integer truncation); pushes x then y.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_QUERY_PRESENTATION_STATE,
@@ -20917,6 +20917,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_LOAD_PROGRAM_THREAD,
     opcodes::GRAPH90_SET_OBJECT_POSITION,
     opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
+    opcodes::SYS_READ_CURSOR_POINT,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21147,7 +21148,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::SYS_GET_REGISTERED_OBJECT_STATE,
     opcodes::SYS_QUEUE_REGISTERED_OBJECT_MESSAGE,
     opcodes::SYS_WAIT_EXCLUSION_SECTION,
-    opcodes::SYS_READ_CURSOR_POINT,
     opcodes::SYS_QUERY_WINDOW_MINIMIZE_LATCH,
     opcodes::SYS_COUNT_FILES,
     opcodes::SYS_ENUMERATE_FILES,
