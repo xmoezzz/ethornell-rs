@@ -30,3 +30,32 @@ int Graph90_81_ReleaseWindowObject(struct CThread *t)
         script_error("invalid window", t);  // manager (sub_430770), delete, --count
     return 0;
 }
+
+// -------------------------------------------- DCIPIcon input processors ---
+// Handle registry: list dword_5667E8 of {handle, object, next}, count
+// dword_5667E0 (sub_46C4A0 registers, sub_46C4F0 removes).
+
+// sub_47EEA0 -> sub_46C630(window, 0): DCIPIcon (0xA4 bytes, sub_447990);
+// kind 1 is DCIPIconEx (0xD8 bytes, sub_44A7C0). The constructor locks the
+// window (+0x130), creates the overlay child (sub_42AC50) and links it to
+// the window at (0, 0) (sub_41AB40). A non-window handle passes NULL.
+int Graph90_B8_CreateIconInputProcessor(struct CThread *t)
+{
+    struct CDspObjWindow *w = find_window(pop(t));
+    struct DCIPIcon *p = DCIPIcon_new(w);
+    push(t, p ? icon_registry_add(p) : 0);
+    return 0;
+}
+
+// sub_47EED0 -> sub_46C4F0. Pushes 1 if the handle was registered.
+//   ~DCIPIcon (sub_447B10): sub_44A050 drops the window/overlay input scopes
+//   (sub_46DF00), unlinks (sub_41AC40) and deletes every item sprite and its
+//   pointer node (sub_46D800); when active (+0x40) it also removes its
+//   keyboard-chain, pointer-chain and scope nodes (sub_46D7A0, sub_46D7B0,
+//   sub_46E550); then the overlay child is unlinked and deleted and the
+//   window lock is cleared (sub_447740 -> sub_41AD10).
+int Graph90_B9_ReleaseIconInputProcessor(struct CThread *t)
+{
+    push(t, icon_registry_remove(pop(t)));
+    return 0;
+}

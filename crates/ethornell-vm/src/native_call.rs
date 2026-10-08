@@ -17332,7 +17332,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_PROCESSOR_HANDLE_PARAMETER,
         returns: "one when released",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_46C4F0 resolves and removes exactly one dynamic processor object. Base destruction reaches DCIPIcon::~DCIPIcon/sub_447B10, which releases that processor's own per-item child/Virtual table and window attachment through sub_44A050 and sub_41AC40. The table belongs to the processor, not globally to the referenced Window, so releasing one of two processors sharing a Window must preserve the other's children. Newly constructed LoadProgramEx CThreads first execute on the next scheduler pass; only explicit status-3 thread switches are immediate, so presentation filtering must not be implemented by eagerly running new CThreads in their creation pass.",
+        notes: "sub_47EED0 -> sub_46C4F0: unlinks the handle record and deletes the DCIPIcon(Ex) (sub_447B10 / sub_44A8A0: unregisters its keyboard/pointer chain and scope nodes, unlinks and deletes the item sprites and the overlay child, clears the window lock); pushes 1 when the handle existed, else 0.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_ICON_INPUT_PROCESSOR,
@@ -20918,6 +20918,7 @@ const PORTABLE_EQUIVALENT_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_SET_OBJECT_POSITION,
     opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
     opcodes::SYS_READ_CURSOR_POINT,
+    opcodes::GRAPH90_RELEASE_ICON_INPUT_PROCESSOR,
 ];
 
 const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
@@ -21099,7 +21100,6 @@ const PARTIAL_IMPLEMENTATION_OPCODES: &[NativeOpcode] = &[
     opcodes::GRAPH90_DRAW_EXTENDED_ICON_BATCH,
     opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT,
     opcodes::GRAPH90_CREATE_ICON_INPUT_PROCESSOR,
-    opcodes::GRAPH90_RELEASE_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_CONFIGURE_ICON_INPUT_PROCESSOR,
     opcodes::GRAPH90_GET_ICON_INPUT_STATE,
     opcodes::GRAPH90_GET_ICON_INPUT_CURRENT_GROUP,
