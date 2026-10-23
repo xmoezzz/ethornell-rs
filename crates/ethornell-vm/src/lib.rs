@@ -1895,6 +1895,12 @@ pub trait SoundApi {
         String::new()
     }
 
+    /// B0:C4 enumerates these Shift-JIS font families in this order.
+    /// Keep the list stable between the size query and the buffer write.
+    fn user_font_families(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn show_user_dialog(&mut self, _request: UserDialogRequest) -> Option<UserDialogResponse> {
         None
     }
@@ -5594,7 +5600,28 @@ impl Vm {
                     return Ok(());
                 }
                 self.normalize_user_string_args(code, id)?;
-                let direct_result = if (code, id) == (0xb0, 0x27) {
+                let direct_result = if (code, id) == (0xb0, 0xc4) {
+                    // sub_479D60 -> sub_4694B0 -> sub_42DEB0/sub_42F030:
+                    // null queries the byte count, including each terminator.
+                    // A buffer receives consecutive C strings and returns
+                    // the family count, without an extra list terminator.
+                    let destination = self.pop_ptr()?;
+                    let families = api.user_font_families();
+                    let mut bytes = Vec::new();
+                    for family in &families {
+                        bytes.extend_from_slice(&encoding_rs::SHIFT_JIS.encode(family).0);
+                        bytes.push(0);
+                    }
+                    let result = if destination == 0 {
+                        bytes.len()
+                    } else {
+                        let range = self.resolve_write_range(destination, bytes.len())?;
+                        self.memory[range].copy_from_slice(&bytes);
+                        self.clear_shadow_values(destination, bytes.len());
+                        families.len()
+                    };
+                    Some(Value::Int(result as i32))
+                } else if (code, id) == (0xb0, 0x27) {
                     let destination = self.pop_ptr()?;
                     let text = api.current_user_text();
                     let bytes_written = self.write_c_string_bounded(destination, &text, 255)?;
@@ -11437,10 +11464,6 @@ impl Vm {
                 let _font_name = self.pop_string_lossy()?;
                 let _slot = self.pop_int()?;
             }
-            (0xb0, 0xc4) => {
-                let _value = self.pop_int()?;
-                self.push_value(Value::Int(0));
-            }
             (0xb0, 0xc1) => {
                 let _font = self.pop_int()?;
                 let _text = self.pop_string_lossy()?;
@@ -11625,7 +11648,7 @@ impl Vm {
             (0xb0, 0x86) => &[2, 3],
             (0xb0, 0x87) => &[2, 3, 6, 7, 8],
             (0xb0, 0x8C) => &[0, 1, 2],
-            (0xb0, 0xC0) | (0xb0, 0xC2) | (0xb0, 0xC4) => &[0],
+            (0xb0, 0xC0) | (0xb0, 0xC2) => &[0],
             (0xb0, 0xC1) => &[1],
             (0xb0, 0xC3) | (0xb0, 0xC6) | (0xb0, 0xC7) => &[0, 1],
             (0xb0, 0xF0) => &[2],
@@ -13651,6 +13674,7 @@ mod tests {
     #[derive(Default)]
     struct SchedulingApi {
         game_id: Option<String>,
+        font_families: Vec<String>,
         host_sys_calls: usize,
         system_events: std::collections::VecDeque<[i32; 3]>,
         bitmap_dimensions: std::collections::BTreeMap<i32, (u32, u32)>,
@@ -14060,6 +14084,10 @@ mod tests {
     }
 
     impl SoundApi for SchedulingApi {
+        fn user_font_families(&self) -> Vec<String> {
+            self.font_families.clone()
+        }
+
         fn register_memory_sound(
             &mut self,
             channel: i32,
@@ -14940,6 +14968,76 @@ mod tests {
         vm.dispatch(&sprintf, &mut api).unwrap();
 
         assert_eq!(vm.read_c_string(destination).unwrap(), "[ ｱ]");
+        assert!(vm.stack.is_empty());
+    }
+
+    #[test]
+    fn user_font_enumeration_queries_bytes_and_writes_names_before_allocating_records() {
+        // amachoco ipl._bp: B0:C4(0), Alloc(bytes), B0:C4(buffer),
+        // then Alloc(40 * count). A boolean result makes count zero.
+        let mut vm = Vm::new();
+        let mut api = SchedulingApi {
+            font_families: vec!["ＭＳ ゴシック".into(), "@ＭＳ 明朝".into(), "System".into()],
+            ..SchedulingApi::default()
+        };
+        let enumerate = test_instruction(0x10, 0xb0, "usr1", vec![0xb0, 0xc4], Vec::new());
+        let allocate = test_instruction(0x12, 0x80, "sys1", vec![0x80, 0x20], Vec::new());
+        let mut expected = Vec::new();
+        for name in &api.font_families {
+            expected.extend_from_slice(&encoding_rs::SHIFT_JIS.encode(name).0);
+            expected.push(0);
+        }
+
+        vm.stack.extend([Value::Int(12345), Value::Int(0)]);
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(
+            vm.stack,
+            [Value::Int(12345), Value::Int(expected.len() as i32)]
+        );
+        // Japanese byte counts must use Shift-JIS, not UTF-8 or characters.
+        assert_eq!(expected.len(), 32);
+        vm.dispatch(&allocate, &mut api).unwrap();
+        let destination = vm.stack.pop().unwrap();
+        let pointer = destination.as_i32() as u32;
+        vm.write_int(pointer + expected.len() as u32, 0, 0x7f)
+            .unwrap();
+        vm.stack.push(destination);
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(3)]);
+        let range = vm.resolve_range(pointer, expected.len()).unwrap();
+        assert_eq!(&vm.memory[range], expected.as_slice());
+        assert_eq!(
+            vm.read_int(pointer + expected.len() as u32, 0).unwrap(),
+            0x7f
+        );
+        assert_eq!(vm.read_c_string(pointer).unwrap(), api.font_families[0]);
+
+        let count = vm.stack.pop().unwrap().as_i32();
+        vm.stack.push(Value::Int(40 * count));
+        vm.dispatch(&allocate, &mut api).unwrap();
+        assert_ne!(vm.stack.pop().unwrap().as_i32(), 0);
+        assert_eq!(vm.stack, [Value::Int(12345)]);
+    }
+
+    #[test]
+    fn user_font_enumeration_preserves_empty_results_and_rejects_invalid_output() {
+        let mut vm = Vm::new();
+        let mut api = SchedulingApi::default();
+        let enumerate = test_instruction(0x10, 0xb0, "usr1", vec![0xb0, 0xc4], Vec::new());
+        vm.stack.push(Value::Int(0));
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(0)));
+
+        let destination = vm.alloc_heap(4);
+        vm.write_int(destination, 2, 0x12345678).unwrap();
+        vm.stack.push(Value::Ptr(destination));
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(0)));
+        assert_eq!(vm.read_int(destination, 2).unwrap(), 0x12345678);
+
+        api.font_families.push("ＭＳ ゴシック".into());
+        vm.stack.push(Value::Ptr(0xfc00_0000));
+        assert!(vm.dispatch(&enumerate, &mut api).is_err());
         assert!(vm.stack.is_empty());
     }
 

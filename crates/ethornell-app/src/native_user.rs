@@ -1453,22 +1453,6 @@ impl RuntimeTraceApi {
                 }
                 ethornell_vm::Value::Int(i32::from(available))
             }
-            0xC4 => {
-                let name = pop_string_value(stack).unwrap_or_default();
-                let resolved = self
-                    .native_user
-                    .font_aliases
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or(name);
-                let available = self.native_user.fonts.contains_key(&resolved)
-                    || self
-                        .native_user
-                        .font_resources
-                        .iter()
-                        .any(|entry| entry.ends_with(&resolved));
-                ethornell_vm::Value::Int(i32::from(available))
-            }
             0xC6 => {
                 let second = pop_string_value(stack).unwrap_or_default();
                 let first = pop_string_value(stack).unwrap_or_default();

@@ -18954,9 +18954,11 @@ pub mod opcodes {
     };
     /// `B0:C4` — `UserB0_C4_QueryFontAvailable`, BGI 1.622 handler `sub_479D60`.
     ///
-    /// Query whether a Shift-JIS font family exists.
+    /// Enumerate Shift-JIS font family names.
     ///
-    /// EnumFontFamiliesExA with charset 128; the result is the enumeration callback's (sub_42F030, unrecovered) result.
+    /// sub_42DEB0 uses EnumFontFamiliesExA with charset 128. Its callback
+    /// sub_42F030 counts families and bytes, including each NUL terminator.
+    /// A non-null destination receives consecutive NUL-terminated names.
     ///
     /// # ABI
     ///
@@ -18964,15 +18966,17 @@ pub mod opcodes {
     ///
     /// | # | Name | Type | Meaning | Range |
     /// |---|---|---|---|---|
-    /// | 0 | `name` | string | Font family name | any |
+    /// | 0 | `destination` | ptr\|null | Output buffer, or null for a size query | writable buffer of the queried size |
     ///
-    /// Returns: i32: callback result (nonzero = found)
+    /// Returns: i32: required bytes for null, otherwise the number of families.
     ///
     /// Scheduling: continue
     ///
     /// # Port
     ///
-    /// Audit status: verified (ADR 0003). Known approximation: checks interned names, aliases and registered resources instead of host enumeration.
+    /// Audit status: verified (ADR 0003). The VM writes the host-provided list.
+    /// The portable app enumerates its two stock faces through the CJK font substitute.
+    /// The constant retains its historical name for API compatibility.
     pub const USER_QUERY_FONT_AVAILABLE: NativeOpcode = NativeOpcode {
         group: 0xB0,
         id: 0xC4,
@@ -31717,9 +31721,9 @@ const USER_REGISTER_ARCHIVE_FONT_RESOURCE_PARAMETERS: &[NativeParameterSpec] = &
     },
 ];
 const USER_QUERY_FONT_AVAILABLE_PARAMETERS: &[NativeParameterSpec] = &[NativeParameterSpec {
-    name: "name",
-    kind: "Shift-JIS font family",
-    description: "Family enumerated through the target Shift-JIS font callback.",
+    name: "destination",
+    kind: "ptr | null",
+    description: "Output buffer for consecutive Shift-JIS C strings, or null to query the required byte count.",
 }];
 const USER_QUERY_FONT_CAPABILITY_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
@@ -37489,9 +37493,9 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         opcode: opcodes::USER_QUERY_FONT_AVAILABLE,
         symbol: "UserB0_C4_QueryFontAvailable",
         parameters: USER_QUERY_FONT_AVAILABLE_PARAMETERS,
-        returns: "availability/count",
+        returns: "required bytes for null, otherwise family count",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_479D60 -> sub_42DEB0 (host font query).",
+        notes: "sub_479D60 -> sub_4694B0 -> sub_42DEB0/sub_42F030: enumerate charset-128 font names into an optional output buffer.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::USER_QUERY_FONT_CAPABILITY,

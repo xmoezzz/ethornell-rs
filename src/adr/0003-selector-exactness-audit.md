@@ -424,3 +424,14 @@ and 92:15 empties. Status: 701 verified, 40 deferred: the ADR 0004 file
 layer (80:3A, 80:F0..FC, 81:28..3E, 81:F2/F7, 90:C4/C5, 92:1F) and 80:60
 (graph reset on a screen-size change, sub_443100: filters +537, effectors
 +547, windows +573 re-centred).
+
+2026-10-24, issue #87: corrected B0:C4 after checking sub_42DEB0 and
+sub_42F030 in both exports. The argument is an optional output buffer.
+Null returns the total Shift-JIS byte count, including each NUL terminator.
+A buffer receives consecutive names and returns the family count.
+The earlier availability query returned zero and caused amachoco's
+`system.arc:ipl._bp` to call Alloc(0) at 0x182. The VM now owns the writes.
+The portable app supplies its two stock faces through its CJK font substitute.
+It does not enumerate installed host fonts. The cleaned reference is
+`src/engine/font_enumeration.c`. Regression tests cover the allocation
+sequence, encoded lengths, output limits, empty lists, and invalid pointers.

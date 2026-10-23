@@ -10477,6 +10477,20 @@ mod input_tests {
     }
 
     #[test]
+    fn font_enumeration_keeps_stock_faces_stable_after_interning() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let families = ethornell_vm::SoundApi::user_font_families(&api);
+        assert_eq!(families, ["ＭＳ ゴシック", "ＭＳ 明朝"]);
+
+        let mut args = vec![Value::Str("another face".into()), Value::Int(0)];
+        call_user(&mut api, 0xb0, 0xc1, &mut args).unwrap();
+        assert!(args.is_empty());
+        assert_eq!(ethornell_vm::SoundApi::user_font_families(&api), families);
+    }
+
+    #[test]
     fn request_window_close_posts_through_native_close_gate_instead_of_quitting_immediately() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -28815,6 +28829,15 @@ impl ethornell_vm::SoundApi for RuntimeTraceApi {
 
     fn current_user_text(&self) -> String {
         self.native_user.text.clone()
+    }
+
+    fn user_font_families(&self) -> Vec<String> {
+        // The portable renderer substitutes its CJK font for these two
+        // stock faces. Interned names do not imply installed host fonts.
+        // Enumerate only the stock faces, independently of registry changes.
+        (0..2)
+            .filter_map(|id| self.native_user.font_face(id).map(str::to_owned))
+            .collect()
     }
 
     fn show_user_dialog(
