@@ -4276,12 +4276,27 @@ impl Vm {
                 self.note_call("graph", code, id);
                 api.observe_dispatch(NativeOpcode { group: code, id });
                 if fail_on_stub
-                    && !native_call::is_strictly_supported(NativeOpcode { group: code, id })
+                    && !self.effective_strict_support(NativeOpcode { group: code, id })
                 {
                     self.note_stub("graph", code, id);
                     return Err(VmError::UnknownDispatch { group: code, id });
                 }
-                let result = if (code, id) == (0x90, 0xa1) {
+                let result = if self.native_abi_profile == NativeAbiProfile::Amachoco
+                    && (code, id) == (0x91, 0x09)
+                {
+                    // amachoco.exe sub_48AB80 -> sub_464380.
+                    let mode = self.pop_int()?;
+                    let valid = (0..=1).contains(&mode);
+                    if valid {
+                        self.system81_shared.lock().expect("system81 state poisoned")
+                            .graph91_resource_mode = mode;
+                    }
+                    Value::Int(i32::from(valid))
+                } else if self.native_abi_profile == NativeAbiProfile::Amachoco
+                    && (code, id) == (0x92, 0x99)
+                {
+                    self.handle_character_widths_call(api)?
+                } else if (code, id) == (0x90, 0xa1) {
                     // sub_47F0F0 pops colour, layout, column count, the item
                     // string table, item count and the Window. sub_491F30
                     // checks the count (1..=16) before the column count (at
@@ -6702,6 +6717,9 @@ impl Vm {
         native_abi::lookup_profile(self.native_abi_profile,group,id).map(|a|a.installs_procedure).unwrap_or_else(||native_abi::installs_procedure(group,id))
     }
     fn effective_strict_support(&self,opcode:NativeOpcode)->bool {
+        if self.native_abi_profile == NativeAbiProfile::Amachoco
+            && matches!((opcode.group, opcode.id), (0x81, 0x00) | (0x91, 0x09) | (0x92, 0x99))
+        { return true; }
         if self.native_abi_profile==NativeAbiProfile::Amachoco && opcode.group==0x81 && matches!(opcode.id,0x21|0xD8|0xDA) {return true;}
         native_call::is_strictly_supported(opcode)
     }
@@ -7871,14 +7889,85 @@ impl Vm {
         let cell = font_size * width_percent / 100;
         let spacing = api.text_character_spacing();
         let mut width = 0i32;
+        if self.native_utf8_enabled() {
+            // BP code literals still contain CP932 bytes in the Japanese release.
+            let text = std::str::from_utf8(&text)
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|_| encoding_rs::SHIFT_JIS.decode(&text).0);
+            for unit in text.encode_utf16() {
+                let narrow = unit < 0x80 || (0xff61..=0xff9f).contains(&unit);
+                width = width
+                    .wrapping_add(if narrow { cell / 2 } else { cell })
+                    .wrapping_add(spacing);
+            }
+            self.write_int(dest, 2, width.wrapping_sub(spacing) as u32)?;
+            return Ok(Value::Int(0));
+        }
         let mut index = 0;
         while index < text.len() {
             let double = is_sjis_lead_byte(text[index]) && text.get(index + 1).is_some_and(|&b| b != 0);
-            width = width.wrapping_add(if double { cell } else { cell / 2 }).wrapping_add(spacing);
+            width = width
+                .wrapping_add(if double { cell } else { cell / 2 })
+                .wrapping_add(spacing);
             index += if double { 2 } else { 1 };
         }
         self.write_int(dest, 2, width.wrapping_sub(spacing) as u32)?;
         Ok(Value::Int(0))
+    }
+
+    fn handle_character_widths_call<A: GraphApi + ?Sized>(&mut self, api: &mut A) -> VmResult<Value> {
+        // amachoco.exe sub_490540 -> sub_4041C0: optional ABC-width array,
+        // optional UTF-16 character count, text, font, size, width%, style.
+        let _style = self.pop_int()?;
+        let width_percent = self.pop_int()?;
+        let font_size = self.pop_int()?;
+        let font = self.pop_int()?;
+        let text = self.pop_string_lossy()?;
+        let count_destination = self.pop_ptr()?;
+        let destination = self.pop_ptr()?;
+        if !api.native_font_registered(font) {
+            return Ok(Value::Int(0x8000_0003_u32 as i32));
+        }
+        if !(4..=200).contains(&font_size) {
+            return Ok(Value::Int(0x8000_0001_u32 as i32));
+        }
+        if !(25..=200).contains(&width_percent) {
+            return Ok(Value::Int(0x8000_0002_u32 as i32));
+        }
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if destination != 0 {
+            self.resolve_write_range(destination, units.len() * 12)?;
+        }
+        if count_destination != 0 {
+            self.resolve_write_range(count_destination, 4)?;
+        }
+        // Use the same cell approximation as Graph91:9B. Native GDI returns
+        // the left bearing, black-box width, and right bearing for each unit.
+        let cell = font_size * width_percent / 100;
+        if destination != 0 {
+            for (index, unit) in units.iter().enumerate() {
+                let narrow = *unit < 0x80 || (0xff61..=0xff9f).contains(unit);
+                let width = if narrow { cell / 2 } else { cell };
+                let address = destination.wrapping_add((index * 12) as u32);
+                for (offset, value) in [0, width, 0].into_iter().enumerate() {
+                    self.write_int(address.wrapping_add((offset * 4) as u32), 2, value as u32)?;
+                }
+            }
+            self.clear_shadow_values(destination, units.len() * 12);
+        }
+        if count_destination != 0 {
+            self.write_int(count_destination, 2, units.len() as u32)?;
+            self.clear_shadow_values(count_destination, 4);
+        }
+        Ok(Value::Int(0))
+    }
+
+    fn native_utf8_enabled(&self) -> bool {
+        self.system81_shared
+            .lock()
+            .expect("system81 state poisoned")
+            .native_utf8_override
+            .unwrap_or(self.native_abi_profile == NativeAbiProfile::Amachoco)
     }
 
     fn write_value(&mut self, ptr: u32, width: u8, value: &Value) -> VmResult<()> {
@@ -8158,7 +8247,7 @@ impl Vm {
         // produce UTF-8 buffers. Raw memcpy/strcpy may intentionally drop the
         // synthetic String shadow; preserve the actual native bytes rather
         // than reinterpret valid UTF-8 as legacy CP932/graph GBK mojibake.
-        if self.native_abi_profile==NativeAbiProfile::Amachoco {
+        if self.native_utf8_enabled() {
             if let Ok(text)=std::str::from_utf8(&bytes) {return Ok(text.to_owned());}
         }
         let bytes = if encoding == encoding_rs::SHIFT_JIS {
@@ -8254,7 +8343,7 @@ impl Vm {
     /// Write native bytes, keeping the String path (and its script-record
     /// restore) for anything that round-trips through the native encoding.
     fn write_c_string_native_bytes(&mut self, ptr: u32, bytes: &[u8]) -> VmResult<()> {
-        let text = if self.native_abi_profile == NativeAbiProfile::Amachoco {
+        let text = if self.native_utf8_enabled() {
             String::from_utf8_lossy(bytes)
         } else {
             encoding_rs::SHIFT_JIS.decode(bytes).0
@@ -8272,7 +8361,7 @@ impl Vm {
     }
 
     fn write_c_string_raw(&mut self, ptr: u32, text: &str) -> VmResult<()> {
-        let encoded=if self.native_abi_profile==NativeAbiProfile::Amachoco {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0};
+        let encoded=if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0};
         let bytes = encoded.as_ref();
         let range = self.resolve_write_range(ptr, bytes.len().saturating_add(1))?;
         let start = range.start;
@@ -8282,10 +8371,10 @@ impl Vm {
         Ok(())
     }
     fn encode_native_string<'a>(&self,text:&'a str)->std::borrow::Cow<'a,[u8]> {
-        if self.native_abi_profile==NativeAbiProfile::Amachoco {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0}
+        if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0}
     }
     fn decode_native_string_lossy(&self, bytes: &[u8]) -> String {
-        if self.native_abi_profile == NativeAbiProfile::Amachoco {
+        if self.native_utf8_enabled() {
             String::from_utf8_lossy(bytes).into_owned()
         } else {
             encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned()
@@ -9116,6 +9205,16 @@ impl Vm {
         id: u16,
     ) -> VmResult<Option<Value>> {
         let result = match (group, id) {
+            (0x81, 0x00) if self.native_abi_profile == NativeAbiProfile::Amachoco => {
+                // sub_494EF0 -> sub_49EA60: 0 selects CP932, 1 selects UTF-8.
+                let mode = self.pop_int()?;
+                let valid = (0..=1).contains(&mode);
+                if valid {
+                    self.system81_shared.lock().expect("system81 state poisoned")
+                        .native_utf8_override = Some(mode == 1);
+                }
+                Value::Int(i32::from(valid))
+            }
             (0x80, 0x53) => {
                 // sub_489070 -> sub_48D190 arms the one-shot global gate.
                 // Sys81:30 and Graph90:F6 consume and clear it when choosing
@@ -11932,7 +12031,7 @@ impl Vm {
     fn value_as_fixed_bytes(&self, value: Value, size: usize) -> VmResult<Vec<u8>> {
         match value {
             Value::Str(text) => {
-                let encoded=if self.native_abi_profile==NativeAbiProfile::Amachoco {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(&text).0};
+                let encoded=if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(&text).0};
                 let mut bytes = Vec::with_capacity(size);
                 bytes.extend_from_slice(&encoded);
                 bytes.push(0);
@@ -16888,6 +16987,112 @@ mod tests {
     }
 
     #[test]
+    fn amachoco_modes_preserve_arguments_and_reject_invalid_values() {
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::Amachoco);
+        let sys = test_instruction(0, 0x81, "sys2", vec![0x81, 0x00], Vec::new());
+        let graph = test_instruction(0, 0x91, "grp2", vec![0x91, 0x09], Vec::new());
+        for mode in [0, 1, 2, -1] {
+            vm.stack = vec![Value::Int(123), Value::Int(mode)];
+            vm.dispatch(&sys, &mut TraceApi).unwrap();
+            assert_eq!(
+                vm.stack,
+                [
+                    Value::Int(123),
+                    Value::Int(i32::from((0..=1).contains(&mode)))
+                ]
+            );
+            assert_eq!(vm.native_utf8_enabled(), mode != 0);
+            vm.stack = vec![Value::Int(123), Value::Int(mode)];
+            vm.dispatch(&graph, &mut TraceApi).unwrap();
+            assert_eq!(
+                vm.stack,
+                [
+                    Value::Int(123),
+                    Value::Int(i32::from((0..=1).contains(&mode)))
+                ]
+            );
+            assert_eq!(
+                vm.system81_shared.lock().unwrap().graph91_resource_mode,
+                i32::from(mode != 0)
+            );
+        }
+        for mode in [0, 1] {
+            vm.stack = vec![Value::Int(mode)];
+            vm.dispatch(&sys, &mut TraceApi).unwrap();
+            vm.write_c_string(0x3000, "きゃべつそふと").unwrap();
+            let expected = if mode == 0 {
+                encoding_rs::SHIFT_JIS
+                    .encode("きゃべつそふと")
+                    .0
+                    .into_owned()
+            } else {
+                "きゃべつそふと".as_bytes().to_vec()
+            };
+            assert_eq!(vm.read_c_string_bytes(0x3000).unwrap(), expected);
+            assert_eq!(vm.read_c_string(0x3000).unwrap(), "きゃべつそふと");
+        }
+        let mut old = Vm::new();
+        assert_eq!(
+            old.try_builtin_sys_with_api(&mut TraceApi, 0x81, 0x00)
+                .unwrap(),
+            None
+        );
+        assert_eq!(old.effective_arg_count(0x91, 0x09), None);
+        assert_eq!(old.effective_arg_count(0x92, 0x99), None);
+    }
+
+    #[test]
+    fn amachoco_character_widths_write_records_and_count() {
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::Amachoco);
+        let instruction = test_instruction(0, 0x92, "grp3", vec![0x92, 0x99], Vec::new());
+        for (destination, count) in [(0x3000, 0x3100), (0, 0x3100), (0x3000, 0), (0, 0)] {
+            vm.stack = vec![
+                Value::Int(123),
+                Value::Ptr(destination),
+                Value::Ptr(count),
+                Value::Str("Aあｱ".into()),
+                Value::Int(0),
+                Value::Int(28),
+                Value::Int(100),
+                Value::Int(0),
+            ];
+            vm.dispatch(&instruction, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(123), Value::Int(0)]);
+        }
+        assert_eq!(vm.read_int(0x3100, 2).unwrap(), 3);
+        let actual: Vec<_> = (0..9)
+            .map(|i| vm.read_int(0x3000 + i * 4, 2).unwrap())
+            .collect();
+        assert_eq!(actual, [0, 14, 0, 0, 28, 0, 0, 14, 0]);
+        let measure = test_instruction(0, 0x91, "grp2", vec![0x91, 0x9b], Vec::new());
+        vm.memory[0x3300..0x3305].copy_from_slice(&[b'A', 0x82, 0xa0, 0xb1, 0]);
+        for text in [Value::Str("Aあｱ".into()), Value::Ptr(0x3300)] {
+            vm.stack = vec![
+                Value::Ptr(0x3200), text, Value::Int(0), Value::Int(28),
+                Value::Int(100), Value::Int(0), Value::Int(0),
+            ];
+            vm.dispatch(&measure, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(0)]);
+            assert_eq!(vm.read_int(0x3200, 2).unwrap(), 56);
+        }
+        vm.write_int(0x3100, 2, 123).unwrap();
+        vm.stack = vec![
+            Value::Ptr(0),
+            Value::Ptr(0x3100),
+            Value::Str("あ".into()),
+            Value::Int(0),
+            Value::Int(3),
+            Value::Int(100),
+            Value::Int(0),
+        ];
+        vm.dispatch(&instruction, &mut TraceApi).unwrap();
+        assert_eq!(vm.stack, [Value::Int(0x8000_0001_u32 as i32)]);
+        assert_eq!(vm.read_int(0x3100, 2).unwrap(), 123);
+    }
+
+    #[test]
     fn system81_utf8_copy_materializes_shadowed_scenario_strings() {
         let source = 0x3000;
         let destination = 0x3100;
@@ -19140,6 +19345,48 @@ mod tests {
     }
 
     #[test]
+    fn sys80_save_paths_preserve_absolute_names() {
+        let mut vm = Vm::new();
+        let source = vm.alloc_heap(4);
+        let bytes = vm.resolve_write_range(source, 4).unwrap();
+        vm.memory[bytes].copy_from_slice(b"save");
+        let mut api = WriteFileApi {
+            success: true,
+            primary_root: Some("/game/きゃべつそふと/".into()),
+            ..WriteFileApi::default()
+        };
+        for (file, expected) in [
+            (
+                "/game/きゃべつそふと/UserData/slot.sud",
+                "/game/きゃべつそふと/UserData/slot.sud",
+            ),
+            (
+                "UserData/slot.sud",
+                "/game/きゃべつそふと/UserData/slot.sud",
+            ),
+            (
+                "C:\\game\\UserData\\slot.sud",
+                "C:\\game\\UserData\\slot.sud",
+            ),
+            ("\\\\server\\game\\slot.sud", "\\\\server\\game\\slot.sud"),
+        ] {
+            vm.stack = vec![Value::Str(file.into()), Value::Ptr(source), Value::Int(4)];
+            assert_eq!(vm.sys80_32_write_file(&mut api).unwrap(), Value::Int(1));
+            assert_eq!(
+                api.writes.last(),
+                Some(&(expected.into(), b"save".to_vec()))
+            );
+            let mut reader = RootFileBytesApi {
+                expected_file: expected.into(),
+                bytes: b"save".to_vec(),
+                primary_root: api.primary_root.clone(),
+            };
+            vm.stack = vec![Value::Int(0), Value::Str(file.into())];
+            assert_eq!(vm.sys80_35_file_size(&mut reader).unwrap(), Value::Int(4));
+        }
+    }
+
+    #[test]
     fn sys80_32_writes_caller_bytes_and_returns_host_status() {
         let instruction =
             test_instruction(0, 0x80, "sys1", vec![0x80, 0x32], vec![BpOperand::U8(0x32)]);
@@ -19195,9 +19442,14 @@ mod tests {
     struct WriteFileApi {
         success: bool,
         writes: Vec<(String, Vec<u8>)>,
+        primary_root: Option<String>,
     }
 
     impl SysApi for WriteFileApi {
+        fn primary_resource_root(&mut self) -> Option<String> {
+            self.primary_root.clone()
+        }
+
         fn call_sys(&mut self, _call: &mut NativeCallFrame) -> super::VmResult<Value> {
             panic!("WriteFileBytes must not fall through to host dispatch");
         }
