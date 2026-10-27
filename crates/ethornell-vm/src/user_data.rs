@@ -821,6 +821,15 @@ use std::collections::BTreeMap;
     }
 
     #[test]
+    fn empty_struct_array_preserves_destination() {
+        let mut vm = Vm::new();
+        vm.write_int(0x8000, 2, 0x12345678).unwrap();
+        assert_eq!(vm.encode_user_data_structs(0x4000, 0, 300, 0).unwrap(), 32);
+        assert_eq!(vm.decode_sdc_struct_array(0x4000, 0x8000).unwrap(), 0);
+        assert_eq!(vm.read_int(0x8000, 2).unwrap(), 0x12345678);
+    }
+
+    #[test]
     fn dcfs_struct_encoder_round_trips_through_native_decoder() {
         let mut vm = Vm::new();
         let source = 0x2000;

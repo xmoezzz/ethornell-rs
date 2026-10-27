@@ -212,6 +212,11 @@ impl Vm {
         const STRUCT_MAGIC: &[u8; 16] = b"DCFS FORMAT 1.00";
 
         let decoded_len = self.read_int(src.saturating_add(24), 2)? as usize;
+        // Sys80:C4 writes a 32-byte SDC header when the record count is zero.
+        // A fresh game can pass this empty history to Sys80:C5.
+        if decoded_len == 0 {
+            return Ok(0);
+        }
         if decoded_len < 24 {
             tracing::warn!(
                 src = format_args!("0x{src:08X}"),

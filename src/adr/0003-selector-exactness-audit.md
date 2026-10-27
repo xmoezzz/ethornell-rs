@@ -435,3 +435,35 @@ The portable app supplies its two stock faces through its CJK font substitute.
 It does not enumerate installed host fonts. The cleaned reference is
 `src/engine/font_enumeration.c`. Regression tests cover the allocation
 sequence, encoded lengths, output limits, empty lists, and invalid pointers.
+
+2026-10-25, issue #89: Japanese Amachoco and portable save paths.
+
+The Japanese retail resources select the Amachoco ABI profile with two fingerprints.
+The bootstrap has 7536 bytes and FNV64 `aa1f17da017b7c27`.
+The title has 24368 bytes and FNV64 `e221d8b4be4f097a`.
+An unknown resource pair retains the default profile.
+
+The supplied `amachoco.exe` confirms these additional contracts:
+
+* `81:00`, `sub_494EF0 -> sub_49EA60`: one argument and one result.
+  Mode 0 selects CP932. Mode 1 selects UTF-8. Invalid modes return 0.
+  Threads share the selected mode.
+* `91:09`, `sub_48AB80 -> sub_498ED0 -> sub_464380`: one argument and one result.
+  The handler stores graphics resource mode 0 or 1. Invalid modes return 0.
+* `92:99`, `sub_490540 -> sub_4041C0`: seven arguments and one result.
+  Script order is ABC output, count output, text, font, size, width percentage, and style.
+  Each output pointer can be null. Each UTF-16 unit receives three signed widths.
+  The portable implementation uses the existing `91:9B` cell approximation instead of GDI glyph metrics.
+  `91:9B` also counts UTF-8 characters correctly in this profile.
+
+`userdata._bp` builds an absolute save path from `80:3D`.
+The absolute-path check previously accepted only Windows paths.
+On Linux, `80:32` added the game root twice and failed to write the save.
+The shared check now accepts POSIX absolute paths for writes, reads, size checks, and existence checks.
+Empty `80:C4` streams remain valid zero-record inputs for `80:C5` and no longer produce a warning.
+
+Regression tests check path handling, call arguments, mode changes, character widths, and empty record arrays.
+The game reproduction uses a temporary copy with Japanese directory names.
+It reaches dialogue and writes quick-save slots 102 and 103.
+Quick-load in a new session reads slot 102 and restores the saved scenario.
+The app, script, and VM suites pass 832 tests. The CLI build also passes.
