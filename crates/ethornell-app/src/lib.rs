@@ -21940,7 +21940,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         if file_policy::restricted() {
             return Some("bgi-resource\\".into());
         }
-        Some(self.native_root.to_string_lossy().into_owned())
+        Some(user_files::script_game_root(&self.native_root))
     }
 
     fn directory_exists(&mut self, path: &str) -> bool {
@@ -21952,12 +21952,8 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             return result;
         }
-        let normalized = path.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let candidate = Path::new(&normalized);
-        let path = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.native_root.join(candidate)
+        let Some(path) = runtime_file_path_from_root(&self.manager, &self.native_root, path) else {
+            return false;
         };
         let exists = path.is_dir();
         tracing::debug!(path = %path.display(), exists, "DirectoryExists");

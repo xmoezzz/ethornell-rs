@@ -94,7 +94,14 @@ filesystem; on Windows the real Win32 services are used unchanged.
 
 ## Progress / next step
 
-Proposed; nothing implemented yet. Selectors waiting on it: 80:3A (host side:
+Partial implementation (2026-10-27): the non-Windows standalone runtime
+exposes the primary root as `C:\Game\`. The shared path helpers map that
+root to the native game directory. This prevents Unicode host names from
+changing when the VM writes a Shift-JIS path buffer. Absolute host paths
+remain accepted. Restricted hosts still use the `bgi-resource\` alias.
+The prefix, special folders, and other Windows path rules remain pending.
+
+Selectors waiting on it: 80:3A (host side:
 modes 0/4/5 currently return "no path"; under this ADR they return the
 emulated paths and mode 0/4 keep reporting 1).
 
