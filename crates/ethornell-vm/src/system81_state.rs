@@ -64,6 +64,8 @@ impl BlobTable {
 
 #[derive(Debug)]
 pub(crate) struct System81SharedState {
+    pub(crate) native_utf8_override: Option<bool>,
+    pub(crate) graph91_resource_mode: i32,
     pub(crate) sentence_table: crate::sentence_table::SentenceTable,
     pub(crate) clock_jump_threshold_ms: i32,
     pub(crate) input_binding_values: [i32; 256],
@@ -93,6 +95,8 @@ pub(crate) struct System81SharedState {
 impl Default for System81SharedState {
     fn default() -> Self {
         Self {
+            native_utf8_override: None,
+            graph91_resource_mode: 0,
             sentence_table: crate::sentence_table::SentenceTable::default(),
             // dword_503DE8
             clock_jump_threshold_ms: 500,

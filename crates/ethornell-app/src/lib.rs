@@ -237,9 +237,15 @@ fn confirmed_native_profile(
             (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
         })
     }
-    if bootstrap.len() == 10176 && fingerprint(bootstrap) == CONFIRMED_BOOTSTRAP_FNV {
+    let expected_title = match (bootstrap.len(), fingerprint(bootstrap)) {
+        (10176, CONFIRMED_BOOTSTRAP_FNV) => Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV)),
+        // Japanese retail release, system.arc dated 2019-12-10.
+        (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a)),
+        _ => None,
+    };
+    if let Some((title_len, title_hash)) = expected_title {
         if let Ok(title) = manager.read_decoded_from_archive("sysprg.arc", "title._bp") {
-            if title.len() == CONFIRMED_TITLE_LEN && fingerprint(&title) == CONFIRMED_TITLE_FNV {
+            if title.len() == title_len && fingerprint(&title) == title_hash {
                 return ethornell_vm::NativeAbiProfile::Amachoco;
             }
         }
