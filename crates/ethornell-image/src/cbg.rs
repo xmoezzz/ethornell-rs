@@ -1,6 +1,8 @@
 use crate::{DecodedImage, parse_cbg_metadata};
 use ethornell_core::{EthornellError, Result};
 
+pub(crate) mod bf_movie;
+
 pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
     let meta = parse_cbg_metadata(data)?;
     let version = meta.version.unwrap_or(0);
@@ -20,6 +22,39 @@ pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
 
     let mut decoder = CbgV2Decoder::new(data)?;
     decoder.unpack()
+}
+
+/// sub_465880's decoded CBG buffer: the original 16-byte image descriptor
+/// followed by native BGR/word/gray bytes. This deliberately avoids a display
+/// RGBA round-trip for 16-bit data.
+pub fn decode_native_buffer(data: &[u8]) -> Result<Vec<u8>> {
+    let meta = parse_cbg_metadata(data)?;
+    let mut decoder = CbgV2Decoder::new(data)?;
+    let pixels = if meta.version.unwrap_or(0) < 2 {
+        let raw = decoder.unpack_v1_pixels()?;
+        if meta.bpp == 24 {
+            raw.chunks_exact(3).flat_map(|p| [p[0],p[1],p[2],0]).collect()
+        } else { raw }
+    } else {
+        let image = decode_cbg(data)?;
+        match meta.bpp {
+            8 => image.rgba.chunks_exact(4).map(|p| p[0]).collect(),
+            24 => image.rgba.chunks_exact(4).flat_map(|p| [p[2],p[1],p[0]]).collect(),
+            32 => image.rgba.chunks_exact(4).flat_map(|p| [p[2],p[1],p[0],p[3]]).collect(),
+            _ => unreachable!("decode_cbg validates bit depth"),
+        }
+    };
+    let mut output = data[16..32].to_vec();
+    if meta.version.unwrap_or(0) < 2 && meta.bpp == 24 {
+        output[4..6].copy_from_slice(&32u16.to_le_bytes());
+        output[8..10].copy_from_slice(&7u16.to_le_bytes());
+    }
+    output.extend_from_slice(&pixels);
+    // The v2 24-bit target reports a four-byte allocation even though its
+    // decoder writes packed BGR. Its uninitialized tail is zero-filled here.
+    let bytes_per_pixel = if meta.bpp == 24 { 4 } else { meta.bpp / 8 };
+    output.resize(16 + meta.width as usize * meta.height as usize * bytes_per_pixel as usize, 0);
+    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +107,7 @@ impl<'a> CbgV2Decoder<'a> {
         self.unpack_v2()
     }
 
-    fn unpack_v1(&mut self) -> Result<DecodedImage> {
+    fn unpack_v1_pixels(&mut self) -> Result<Vec<u8>> {
         let encoded = self.read_encoded()?;
         let mut encoded_reader = Reader::new(&encoded);
         let weights = Self::read_weight_table(&mut encoded_reader, 0x100)?;
@@ -97,6 +132,11 @@ impl<'a> CbgV2Decoder<'a> {
             stride,
             pixel_size,
         );
+        Ok(sampled)
+    }
+
+    fn unpack_v1(&mut self) -> Result<DecodedImage> {
+        let sampled = self.unpack_v1_pixels()?;
         let mut rgba = vec![0u8; self.header.width as usize * self.header.height as usize * 4];
         match self.header.bpp {
             32 => {
@@ -163,13 +203,16 @@ impl<'a> CbgV2Decoder<'a> {
         let width = ((self.header.width as i32 + 7) & !7).max(8);
         let height = ((self.header.height as i32 + 7) & !7).max(8);
         let y_blocks = height / 8;
-        let input_base = (self.input.pos + ((y_blocks + 1) as usize * 4) - base_offset) as i32;
 
+        // sub_49D7B0 reads y_blocks + 1 offsets, counted from the start of
+        // the weight tables. The engine's own encoder (sub_49C200) writes
+        // only y_blocks of them for 24-bit images, so strips are addressed
+        // from that start rather than from the end of the table.
         let mut offsets = Vec::with_capacity((y_blocks + 1) as usize);
         for _ in 0..=y_blocks {
-            offsets.push(self.input.read_i32()? - input_base);
+            offsets.push(self.input.read_i32()?);
         }
-        let input = self.input.remaining().to_vec();
+        let input = self.input.data[base_offset..].to_vec();
         let pad_skip = ((width >> 3) + 7) >> 3;
         let mut output = vec![0u8; (width * height * 4) as usize];
         let block_decoder = BlockDecoder {
@@ -378,10 +421,14 @@ impl BlockDecoder<'_> {
             )));
         }
 
+        // The codes run to the strip's last bit, as the target reads them
+        // (sub_49FB40, sub_49FD70): the reader may already hold the last byte
+        // while bits of it are still unread.
+        let strip_bits = reader.input.data.len() * 8;
         let mut color_data = vec![0i16; block_size as usize];
         let mut acc = 0i32;
         let mut i = 0i32;
-        while i < block_size && reader.input.pos < reader.input.data.len() {
+        while i < block_size && reader.bits_used() < strip_bits {
             let count = self.tree1.decode_token(&mut reader)?;
             if count != 0 {
                 let mut v = reader.get_bits(count as u32)? as i32;
@@ -398,9 +445,9 @@ impl BlockDecoder<'_> {
         }
 
         i = 0;
-        while i < block_size && reader.input.pos < reader.input.data.len() {
+        while i < block_size && reader.bits_used() < strip_bits {
             let mut index = 1usize;
-            while index < 64 && reader.input.pos < reader.input.data.len() {
+            while index < 64 && reader.bits_used() < strip_bits {
                 let code = self.tree2.decode_token(&mut reader)?;
                 if code == 0 {
                     break;
@@ -849,6 +896,11 @@ impl<'a> MsbBitStream<'a> {
         Ok((self.bits >> self.cached_bits) & mask)
     }
 
+    /// The bits taken so far: `get_bits` fetches whole bytes ahead of them.
+    fn bits_used(&self) -> usize {
+        self.input.pos * 8 - self.cached_bits as usize
+    }
+
     fn get_next_bit(&mut self) -> Result<bool> {
         if self.cached_bits == 0 {
             self.bits = (self.bits << 8) | self.input.read_u8()? as u32;
@@ -875,3 +927,102 @@ const BLOCK_FILL_ORDER: [u8; 64] = [
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MSB-first bit writer, the inverse of `MsbBitStream`.
+    #[derive(Default)]
+    struct Bits {
+        bytes: Vec<u8>,
+        used: usize,
+    }
+
+    impl Bits {
+        fn put(&mut self, value: u32, count: u32) {
+            for shift in (0..count).rev() {
+                if self.used.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                let bit = ((value >> shift) & 1) as u8;
+                *self.bytes.last_mut().unwrap() |= bit << (7 - self.used % 8);
+                self.used += 1;
+            }
+        }
+
+        /// A symbol's code, read off the decoder's own tree, then its value
+        /// bits.
+        fn token(&mut self, tree: &HuffmanTree, symbol: usize, value: u32, bits: u32) {
+            let mut pending = vec![(tree.nodes.len() - 1, 0, 0)];
+            while let Some((index, code, length)) = pending.pop() {
+                let node = &tree.nodes[index];
+                if node.is_parent {
+                    pending.push((node.left_index, code << 1, length + 1));
+                    pending.push((node.right_index, code << 1 | 1, length + 1));
+                } else if index == symbol {
+                    self.put(code, length);
+                    self.put(value, bits);
+                    return;
+                }
+            }
+            panic!("no code for symbol {symbol}");
+        }
+
+        fn align(&mut self) {
+            self.used = self.used.next_multiple_of(8);
+        }
+    }
+
+    #[test]
+    fn a_strip_decodes_the_codes_in_its_last_byte() {
+        // One 8x8 block of a 24-bit image: grey, with a horizontal Cr
+        // coefficient that makes it redder on the left.
+        let mut dc_weights = vec![0u32; 0x10];
+        let mut ac_weights = vec![0u32; 0xb0];
+        (dc_weights[0], dc_weights[1]) = (2, 1);
+        (ac_weights[0], ac_weights[0x40]) = (3, 1);
+        let tree1 = HuffmanTree::new(&dc_weights, true);
+        let tree2 = HuffmanTree::new(&ac_weights, true);
+        let mut bits = Bits::default();
+        // DC differences of Y, Cb and Cr (symbol: the value's size).
+        bits.token(&tree1, 1, 1, 1);
+        bits.token(&tree1, 0, 0, 0);
+        bits.token(&tree1, 0, 0, 0);
+        bits.align();
+        // AC codes, one byte: Y and Cb end at once, Cr has 15 at zigzag
+        // position 1 (size 4, no zero run) and ends.
+        bits.token(&tree2, 0, 0, 0);
+        bits.token(&tree2, 0, 0, 0);
+        bits.token(&tree2, 0x40, 15, 4);
+        bits.token(&tree2, 0, 0, 0);
+        assert_eq!(bits.used, 16);
+        let mut strip = vec![0xc0, 0x01]; // 192 coefficients
+        strip.extend(&bits.bytes);
+
+        let decode = |strip: &[u8]| {
+            let decoder = BlockDecoder {
+                input: strip,
+                bpp: 24,
+                width: 8,
+                tree1: HuffmanTree::new(&dc_weights, true),
+                tree2: HuffmanTree::new(&ac_weights, true),
+                dct: [DCT_TABLE; 2],
+            };
+            let mut bgra = vec![0u8; 8 * 8 * 4];
+            decoder
+                .unpack_block(0, strip.len() as i32, 0, &mut bgra)
+                .unwrap();
+            bgra
+        };
+        let bgra = decode(&strip);
+        // The strip's last byte was fetched for Y's end code; Cb's end code
+        // and Cr's coefficient follow in it.
+        let red = |x: usize| bgra[x * 4 + 2];
+        assert!(red(0) > red(7) + 4, "red {} .. {}", red(0), red(7));
+        // Bytes after the strip's codes change nothing.
+        let mut padded = strip.clone();
+        padded.push(0);
+        assert_eq!(bgra, decode(&padded));
+    }
+}

@@ -44,6 +44,44 @@ pub(crate) struct SoundSlot {
     pub(crate) needs_restart: bool,
 }
 
+/// BGI 1.622 `sub_4A2DF0`: a target sound-record envelope. Values are
+/// committed by the sound poll, so replacing a ramp uses its last sample.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeSoundRamp {
+    start: u32,
+    duration: i32,
+    from: i32,
+    to: i32,
+}
+
+impl NativeSoundRamp {
+    pub(crate) fn new(now: u32, duration: i32, from: u8, to: u8) -> Self {
+        Self {
+            start: now,
+            duration,
+            from: i32::from(from),
+            to: i32::from(to),
+        }
+    }
+
+    pub(crate) fn sample(self, now: u32) -> (u8, bool) {
+        let elapsed = now.wrapping_sub(self.start) as i32;
+        let t = if self.duration > 0 {
+            f64::from(elapsed) / f64::from(self.duration)
+        } else {
+            1.0
+        };
+        if t < 1.0 {
+            (
+                (t * f64::from(self.to - self.from) + f64::from(self.from)) as u8,
+                false,
+            )
+        } else {
+            (self.to as u8, true)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NativeAudioClock {
     position_ms: f64,
@@ -139,7 +177,25 @@ pub(crate) enum AudioCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeAudioClock;
+    use super::{NativeAudioClock, NativeSoundRamp};
+
+    #[test]
+    fn sound_ramp_uses_signed_wrapping_ticks_and_truncates_each_sample() {
+        let ramp = NativeSoundRamp::new(u32::MAX - 49, 100, 128, 0);
+        assert_eq!(ramp.sample(u32::MAX - 49), (128, false));
+        assert_eq!(ramp.sample(0), (64, false));
+        assert_eq!(ramp.sample(49), (1, false));
+        assert_eq!(ramp.sample(50), (0, true));
+        assert_eq!(NativeSoundRamp::new(100, 0, 128, 0).sample(100), (0, true));
+        assert_eq!(NativeSoundRamp::new(100, -1, 128, 0).sample(100), (0, true));
+        assert_eq!(
+            NativeSoundRamp::new(100, i32::MIN, 0, 128).sample(100),
+            (128, true)
+        );
+        // This cast truncates the final interpolated value, not its delta.
+        assert_eq!(NativeSoundRamp::new(0, 3, 128, 0).sample(1), (85, false));
+        assert_eq!(NativeSoundRamp::new(0, 3, 0, 128).sample(1), (42, false));
+    }
 
     #[test]
     fn native_audio_clock_follows_virtual_frame_time() {

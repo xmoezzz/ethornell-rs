@@ -17,10 +17,15 @@ impl RuntimeTraceApi {
 
         let value = match id {
             0x8A => {
-                // sub_440B50 resolves the text object and forwards the value
-                // to sub_42B3C0 (native object substructure at +0x164).
+                // sub_486D20 -> sub_440F10 -> sub_42B7B0: fills the window
+                // buffer (sub_40A700) with the value; a window without a
+                // buffer is left alone.
                 let value = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
+                if let Err(error) = self.graph92_require_window(object) {
+                    return Some(Err(error));
+                }
+                self.clear_bitmap_text(object);
                 self.graph_object_properties
                     .entry(object)
                     .or_default()
@@ -29,68 +34,70 @@ impl RuntimeTraceApi {
                 tracing::debug!(object, value, "GraphSetTextObjectAuxiliaryValue");
                 ethornell_vm::Value::None
             }
-            // sub_432E40 configures one of the fixed font/image atlas slots.
+            // sub_487150 -> sub_433210: a glyph image for a character code
+            // in 0xFF01..=0xFFFF (sub_433200). Bitmap -1 clears it; otherwise
+            // the bitmap must exist and the size be nonzero. The image is the
+            // (x, y, width, height) crop of the bitmap.
             0x98 => {
                 let args = pop_args(stack, 6);
                 let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                if let [height, width, y, x, source, slot] = values.as_slice() {
-                    if *source == -1 {
-                        self.graphic_resource_keys.remove(&(*slot, 0));
-                    } else if *width > 0 && *height > 0 {
-                        if let Some(key) = self.resolve_resource_key(*source).map(str::to_string) {
-                            self.graphic_resource_keys.insert((*slot, 0), key);
-                        }
-                        self.bitmap_dimensions
-                            .insert(*slot, (*width as u32, *height as u32));
+                if let [height, width, y, x, source, code] = values.as_slice() {
+                    let fail = |text: String| Some(Err(ethornell_vm::VmError::Runtime(text)));
+                    if (*code as u32).wrapping_sub(0xFF01) > 0xFE {
+                        return fail(format!("無効な文字コード [ {code} ] が指定されました"));
                     }
-                    tracing::debug!(slot, source, x, y, width, height, "GraphConfigureFontAtlas");
+                    if *source == -1 {
+                        self.graphic_resource_keys.remove(&(*code, 0));
+                    } else {
+                        let Some(key) = self.resolve_resource_key(*source).map(str::to_string)
+                        else {
+                            return fail(format!("無効なビットマップ [ {source} ] が指定されました"));
+                        };
+                        if *width == 0 || *height == 0 {
+                            return fail(format!(
+                                "無効なイメージサイズ [ {width} , {height} ] が指定されました"
+                            ));
+                        }
+                        self.graphic_resource_keys.insert((*code, 0), key);
+                    }
+                    tracing::debug!(code, source, x, y, width, height, "GraphConfigureGlyphImage");
                 }
                 ethornell_vm::Value::None
             }
             0x9B => {
                 unreachable!("Graph92:9B is handled by the VM output-pair pointer bridge")
             }
-            // sub_486A50 pops italic, registry/context, creation field,
-            // height and face selector. sub_463350 resolves the face from the
-            // final selector plus registry/context before sub_437FA0 performs
-            // platform-native font validation.
+            // sub_487550 -> sub_4638B0 -> sub_438360: the face comes from a
+            // font number (sub_469110; none clears it); sub_42EE90 runs with
+            // zero allowed, so only a nonzero height outside 4..=200 (2) or
+            // width outside 25..=200 (3) is refused, before anything is
+            // stored.
             0x9D => {
                 let args = pop_args(stack, 5);
                 let italic = args.first().map(value_to_i32).unwrap_or_default();
-                let registry_context = args.get(1).map(value_to_i32).unwrap_or_default();
-                let creation_field = args.get(2).map(value_to_i32).unwrap_or_default();
+                let field_565d34 = args.get(1).map(value_to_i32).unwrap_or_default();
+                let width_percent = args.get(2).map(value_to_i32).unwrap_or_default();
                 let height = args.get(3).map(value_to_i32).unwrap_or_default();
-                let face_selector = args.get(4).cloned().unwrap_or(ethornell_vm::Value::None);
-                match &face_selector {
-                    ethornell_vm::Value::Str(name) => {
-                        self.graph_defaults.text_font_override.face_name =
-                            (!name.is_empty()).then(|| name.clone());
+                let font = args.get(4).map(value_to_i32).unwrap_or_default();
+                let status = if height != 0 && !(4..=200).contains(&height) {
+                    2
+                } else if width_percent != 0 && !(25..=200).contains(&width_percent) {
+                    3
+                } else {
+                    let face = self.native_user.font_face(font).map(str::to_string);
+                    let defaults = &mut self.graph_defaults.text_font_override;
+                    defaults.face_name = face.filter(|name| !name.is_empty());
+                    defaults.height = height;
+                    defaults.creation_field_0 = width_percent;
+                    defaults.creation_field_1 = field_565d34;
+                    defaults.italic = italic != 0;
+                    if (1..=200).contains(&height) {
+                        self.text_state.font_size = height as f32;
                     }
-                    ethornell_vm::Value::Int(0)
-                    | ethornell_vm::Value::Ptr(0)
-                    | ethornell_vm::Value::None => {
-                        self.graph_defaults.text_font_override.face_name = None;
-                    }
-                    _ => {}
-                }
-                if (1..=200).contains(&height) {
-                    self.text_state.font_size = height as f32;
-                }
-                self.graph_defaults.text_font_override.height = height;
-                self.graph_defaults.text_font_override.creation_field_0 = creation_field;
-                self.graph_defaults.text_font_override.creation_field_1 = registry_context;
-                self.graph_defaults.text_font_override.italic = italic != 0;
-                tracing::debug!(
-                    ?face_selector,
-                    height,
-                    creation_field,
-                    registry_context,
-                    italic,
-                    "GraphConfigureFontOverride"
-                );
-                // Exact GDI face lookup and HRESULT-to-script status mapping
-                // remain platform-specific, so this stays Partial.
-                ethornell_vm::Value::Int(0)
+                    0
+                };
+                tracing::debug!(font, height, width_percent, field_565d34, italic, status, "GraphConfigureFontOverride");
+                ethornell_vm::Value::Int(status)
             }
             // The VM owns the destination record buffer and exact 128-byte
             // serialization. Reaching host dispatch would double-pop.
@@ -104,15 +111,6 @@ impl RuntimeTraceApi {
                     "GraphSetTextRenderOverride"
                 );
                 ethornell_vm::Value::None
-            }
-            0xF6 => {
-                let bitmap = pop_int_value(stack).unwrap_or_default();
-                let _mode = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(if self.query_bitmap_info(bitmap).is_some() {
-                    0
-                } else {
-                    4
-                })
             }
             _ => return None,
         };

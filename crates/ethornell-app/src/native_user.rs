@@ -505,6 +505,11 @@ impl NativeUserState {
             .map(|(name, _)| name.as_str())
     }
 
+    /// sub_469110: whether a face id was interned.
+    pub(super) fn font_name_known(&self, id: i32) -> bool {
+        self.fonts.values().any(|record| record.id == id)
+    }
+
     fn intern_font(&mut self, name: String, option: i32) -> i32 {
         // sub_468A70 registers metadata only for option 0 (charset 128)
         // or option 1 (charset/default value 0). Option -1 and all other
@@ -720,6 +725,8 @@ impl NativeUserState {
     }
 }
 
+const CHILD_WINDOW_HANDLE: &str = "無効なチャイルドウィンドウハンドルが指定されました";
+
 impl RuntimeTraceApi {
     pub(super) fn has_active_native_screen_shake(&self) -> bool {
         self.native_user.screen_shake.active
@@ -858,9 +865,13 @@ impl RuntimeTraceApi {
                 let resource = pop_int_value(stack).unwrap_or_default();
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
-                if !(0..0x4000).contains(&resource) {
+                // sub_478B30: sub_4986D0, then sub_461F20's missing bitmap.
+                if let Err(error) = target_checks::bitmap(resource) {
+                    return Some(Err(error));
+                }
+                if !self.graph_resources.contains_key(&resource) {
                     return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "UserB0:00 invalid graph resource {resource}"
+                        "指定されたビットマップ [ {resource} ] は存在しません"
                     ))));
                 }
                 self.native_user.last_window_bitmap_draw = Some((x, y, resource));
@@ -911,6 +922,12 @@ impl RuntimeTraceApi {
                 let y_offset = pop_int_value(stack).unwrap_or_default();
                 let x_offset = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
+                // sub_478C70 -> sub_48F6D0: an unknown object is fatal.
+                if object != 0 && !self.graph_handle_exists(object) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "無効なスプライトハンドルが指定されました".into(),
+                    )));
+                }
                 if object == 0 {
                     self.native_user.cursor_object = None;
                     let visible = if self.cursor_idle_timeout_ms != 0 {
@@ -957,9 +974,21 @@ impl RuntimeTraceApi {
                     updates_per_second,
                     lock_renderer,
                 ) {
-                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "UserB0:08 invalid shake configuration mode={direction_mode} amplitude={amplitude} oscillation_ticks={oscillation_ticks} cycles={cycle_count} damping={damping_percent} update_rate={updates_per_second}"
-                    ))));
+                    // sub_478D00 -> sub_43D0A0.
+                    let text = if direction_mode as u32 >= 4 {
+                        format!("無効な振動パターン [ {direction_mode} ] が指定されました")
+                    } else if oscillation_ticks < 1 {
+                        format!("無効な周波数 [ {oscillation_ticks} ] が指定されました")
+                    } else if cycle_count < 1 {
+                        format!("無効な繰り返し回数 [ {cycle_count} ] が指定されました")
+                    } else if updates_per_second >= 1 {
+                        format!(
+                            "無効なフレームレート [ {updates_per_second} ] が指定されました\n\nフレームレートは周波数より高くなければなりません"
+                        )
+                    } else {
+                        format!("無効なフレームレート [ {updates_per_second} ] が指定されました")
+                    };
+                    return Some(Err(ethornell_vm::VmError::Runtime(text)));
                 }
                 ethornell_vm::Value::None
             }
@@ -970,24 +999,27 @@ impl RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let title = pop_string_value(stack).unwrap_or_default();
+                // sub_478ED0 -> sub_42FEC0: 32..=2048 each way, eight slots.
                 if !(32..=2048).contains(&width) || !(32..=2048).contains(&height) {
                     return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "UserB0:10 invalid debug window size {width}x{height}"
+                        "無効なウィンドウサイズ [ {width} , {height} ] が指定されました"
                     ))));
                 }
-                ethornell_vm::Value::Int(
-                    self.native_user
-                        .allocate_debug_window(title, x, y, width, height)
-                        .unwrap_or_default(),
-                )
+                let Some(handle) = self.native_user.allocate_debug_window(title, x, y, width, height)
+                else {
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "これ以上、チャイルドウィンドウを生成することはできません".into(),
+                    )));
+                };
+                ethornell_vm::Value::Int(handle)
             }
             0x11 => {
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(slot) = NativeUserState::debug_slot(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "UserB0:11 invalid debug window handle 0x{:08X}",
-                        handle as u32
-                    ))));
+                    // sub_478FA0's text repeats "チャイルド".
+                    return Some(Err(ethornell_vm::VmError::Runtime(
+                        "無効なチャイルドチャイルドウィンドウハンドルが指定されました".into(),
+                    )));
                 };
                 self.native_user.debug_windows[slot] = None;
                 ethornell_vm::Value::None
@@ -996,9 +1028,7 @@ impl RuntimeTraceApi {
                 let visible = pop_int_value(stack).unwrap_or_default() != 0;
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:14 invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.visible = visible;
                 ethornell_vm::Value::None
@@ -1007,9 +1037,7 @@ impl RuntimeTraceApi {
                 let title = pop_string_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:15 invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.title = title;
                 ethornell_vm::Value::None
@@ -1019,9 +1047,7 @@ impl RuntimeTraceApi {
                 let x = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:16 invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.x = x;
                 window.y = y;
@@ -1030,9 +1056,7 @@ impl RuntimeTraceApi {
             0x17 => {
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:17 invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 stack.push(ethornell_vm::Value::Int(window.x));
                 ethornell_vm::Value::Int(window.y)
@@ -1041,9 +1065,7 @@ impl RuntimeTraceApi {
                 let color = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:18 invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.clear_color = color;
                 window.bitmap_draws.clear();
@@ -1057,19 +1079,41 @@ impl RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
-                if !(0..0x4000).contains(&bitmap)
-                    || !is_debug_blend_mode(blend_mode)
-                    || !(0..=256).contains(&alpha)
+                // sub_479130: validators, then sub_4301A0: window, bitmap,
+                // sub_40A520's pixel mode (1) and empty clip (4).
+                if let Err(error) = target_checks::bitmap(bitmap)
+                    .and_then(|()| target_checks::effect_mode(blend_mode))
+                    .and_then(|()| target_checks::effect_level(alpha))
                 {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:19 invalid debug bitmap parameters".into(),
-                    )));
+                    return Some(Err(error));
                 }
-                let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:19 invalid debug window handle".into(),
-                    )));
+                let Some((client_width, client_height)) = self
+                    .native_user
+                    .debug_window(handle)
+                    .map(|window| (window.width, window.height))
+                else {
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
+                let Some(info) = ethornell_vm::GraphApi::query_bitmap_info(self, bitmap) else {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "指定されたビットマップ [ {bitmap} ] は存在しません"
+                    ))));
+                };
+                if !matches!(info.format, 1 | 2) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "画面モードとビットマップ [ {bitmap} ] のピクセルモードには互換性がありません"
+                    ))));
+                }
+                if x >= client_width
+                    || y >= client_height
+                    || x.saturating_add(info.width as i32) <= 0
+                    || y.saturating_add(info.height as i32) <= 0
+                {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "指定された出力座標 [ {x} , {y} ] ではチャイルドウィンドウのクライアント外になります"
+                    ))));
+                }
+                let window = self.native_user.debug_window_mut(handle).unwrap();
                 window.bitmap_draws.push(NativeDebugBitmapDraw {
                     x,
                     y,
@@ -1090,10 +1134,26 @@ impl RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
-                if !is_debug_blend_mode(blend_mode) || !(0..=256).contains(&alpha) {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:1A invalid debug text parameters".into(),
-                    )));
+                // sub_479280: sub_498660 on the font, then sub_4302A0:
+                // window, height (p5) and width percent (p6, "style" here)
+                // through sub_409280. No blend validators.
+                if self.native_user.font_face(font_id).is_none() {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "無効なフォント番号 [ {font_id} ] が指定されました"
+                    ))));
+                }
+                if self.native_user.debug_window(handle).is_none() {
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
+                }
+                if !(4..=200).contains(&font_size) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "指定されたフォントサイズ [ {font_size} ] は無効です"
+                    ))));
+                }
+                if !(25..=200).contains(&style) {
+                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
+                        "指定されたフォント幅 [ {style} ] は無効です"
+                    ))));
                 }
                 let glyph_count = text.chars().count() as i32;
                 let extent = glyph_count
@@ -1101,9 +1161,7 @@ impl RuntimeTraceApi {
                     .saturating_add(1)
                     / 2;
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:1A invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.text_draws.push(NativeDebugTextDraw {
                     x,
@@ -1123,9 +1181,7 @@ impl RuntimeTraceApi {
                 let close_message = pop_string_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:1C invalid debug window handle".into(),
-                    )));
+                    return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.close_message = close_message;
                 ethornell_vm::Value::None
@@ -1140,18 +1196,25 @@ impl RuntimeTraceApi {
                 let width = pop_int_value(stack).unwrap_or_default();
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
-                if width < 8
-                    || height < 8
-                    || x < 0
-                    || y < 0
-                    || x.saturating_add(width) > self.screen_width
-                    || y.saturating_add(height) > self.screen_height
-                    || !(8..=64).contains(&font_size)
-                    || !(1..=256).contains(&max_chars)
+                // sub_479460 -> sub_464480: size within the screen (1), font
+                // (2), height 8..=64 (3), 1..=256 characters (4); the
+                // position is not checked.
+                let fail = |text: String| Some(Err(ethornell_vm::VmError::Runtime(text)));
+                if (width as u32) < 8
+                    || width > self.screen_width
+                    || (height as u32) < 8
+                    || height > self.screen_height
                 {
-                    return Some(Err(ethornell_vm::VmError::Runtime(
-                        "UserB0:20 invalid edit-control configuration".into(),
-                    )));
+                    return fail(format!("無効なウィンドウサイズ [ {width}, {height} ] が指定されました"));
+                }
+                if self.native_user.font_face(font_id).is_none() {
+                    return fail(format!("無効なフォント番号 [ {font_id} ] が指定されました"));
+                }
+                if (font_size as u32).wrapping_sub(8) > 0x38 {
+                    return fail(format!("無効なフォントサイズ [ {font_size} ] が指定されました"));
+                }
+                if (max_chars as u32).wrapping_sub(1) > 0xFF {
+                    return fail(format!("無効な有効文字数 [ {max_chars} ] が指定されました"));
                 }
                 self.native_user.edit.active = true;
                 self.native_user.edit.visible = true;
@@ -1165,12 +1228,12 @@ impl RuntimeTraceApi {
                 self.native_user.edit.focused = focus;
                 ethornell_vm::Value::None
             }
+            // sub_4795D0 -> sub_4646F0 always pushes 0.
             0x21 => {
-                let was_active = self.native_user.edit.active;
                 self.native_user.edit.active = false;
                 self.native_user.edit.visible = false;
                 self.native_user.edit.focused = false;
-                ethornell_vm::Value::Int(i32::from(was_active))
+                ethornell_vm::Value::Int(0)
             }
             0x22 => {
                 let scale = pop_int_value(stack).unwrap_or_default();
@@ -1180,9 +1243,16 @@ impl RuntimeTraceApi {
                 }
                 ethornell_vm::Value::Int(i32::from(valid))
             }
-            0x23 => ethornell_vm::Value::Int(i32::from(self.native_user.edit.active)),
+            // sub_479620: dword_565FF8, the shown flag of sub_464770.
+            0x23 => ethornell_vm::Value::Int(i32::from(
+                self.native_user.edit.active && self.native_user.edit.visible,
+            )),
+            // sub_464770 only acts on an existing control.
             0x24 => {
-                self.native_user.edit.visible = pop_int_value(stack).unwrap_or_default() != 0;
+                let visible = pop_int_value(stack).unwrap_or_default() != 0;
+                if self.native_user.edit.active {
+                    self.native_user.edit.visible = visible;
+                }
                 ethornell_vm::Value::None
             }
             0x25 => {
@@ -1194,14 +1264,10 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             0x26 => {
+                // sub_464860 copies into the initial-text buffer that the
+                // next B0:20 shows; EM_LIMITTEXT does not cut it.
                 let text = pop_string_value(stack).unwrap_or_default();
-                let max_bytes = self
-                    .native_user
-                    .edit
-                    .max_chars
-                    .min(MAX_EDIT_TEXT_BYTES)
-                    .max(1);
-                self.native_user.text = truncate_shift_jis(&text, max_bytes);
+                self.native_user.text = truncate_shift_jis(&text, MAX_EDIT_TEXT_BYTES);
                 ethornell_vm::Value::None
             }
             // VM owns the destination pointer write.
@@ -1362,33 +1428,29 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::Int(i32::from(available))
             }
             0xC3 => {
+                // sub_479D20 -> sub_469130: script order (archive, font
+                // file). A font already registered under that name returns
+                // 1; with an archive the file is read from it
+                // (AddFontMemResourceEx), without one from the primary root
+                // (AddFontResourceA).
+                let name = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
-                let name = pop_string_value(stack).unwrap_or_default();
-                let available = !name.is_empty()
-                    && (!archive.is_empty()
-                        && (self.manager.find(&name).is_some()
-                            || self.manager.find(&format!("{archive}:{name}")).is_some()));
-                if available {
-                    self.native_user
-                        .font_resources
-                        .insert(format!("{archive}:{name}"));
-                }
-                ethornell_vm::Value::Int(i32::from(available))
-            }
-            0xC4 => {
-                let name = pop_string_value(stack).unwrap_or_default();
-                let resolved = self
+                let key = if archive.is_empty() { name.clone() } else { format!("{archive}:{name}") };
+                let registered = self
                     .native_user
-                    .font_aliases
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or(name);
-                let available = self.native_user.fonts.contains_key(&resolved)
-                    || self
-                        .native_user
-                        .font_resources
-                        .iter()
-                        .any(|entry| entry.ends_with(&resolved));
+                    .font_resources
+                    .iter()
+                    .any(|entry| entry.rsplit(':').next() == Some(name.as_str()));
+                let available = registered
+                    || (!name.is_empty()
+                        && if archive.is_empty() {
+                            self.manager.find(&name).is_some()
+                        } else {
+                            self.manager.find(&key).is_some() || self.manager.find(&name).is_some()
+                        });
+                if available && !registered {
+                    self.native_user.font_resources.insert(key);
+                }
                 ethornell_vm::Value::Int(i32::from(available))
             }
             0xC6 => {
@@ -1426,21 +1488,6 @@ impl RuntimeTraceApi {
         };
         Some(Ok(value))
     }
-}
-
-fn is_debug_blend_mode(blend_mode: i32) -> bool {
-    matches!(
-        blend_mode,
-        0x00..=0x09
-            | 0x20..=0x27
-            | 0x40
-            | 0x41
-            | 0x80
-            | 0xC0
-            | 0xC1
-            | 0xF0
-            | 0xFF
-    )
 }
 
 fn truncate_shift_jis(text: &str, max_bytes: usize) -> String {
@@ -1540,16 +1587,6 @@ mod tests {
         assert_eq!(msvc_rand(&mut seed), 18_467);
         assert_eq!(msvc_rand(&mut seed), 6_334);
         assert_eq!(msvc_rand(&mut seed), 26_500);
-    }
-
-    #[test]
-    fn debug_blend_mode_matches_target_allowlist() {
-        for mode in [0, 9, 0x20, 0x27, 0x40, 0x41, 0x80, 0xC0, 0xC1, 0xF0, 0xFF] {
-            assert!(is_debug_blend_mode(mode), "mode {mode:#x}");
-        }
-        for mode in [-1, 0x0A, 0x1F, 0x28, 0x42, 0x81, 0xC2, 0xF1, 0x100] {
-            assert!(!is_debug_blend_mode(mode), "mode {mode:#x}");
-        }
     }
 
     #[test]

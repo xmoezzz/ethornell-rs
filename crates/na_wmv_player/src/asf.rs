@@ -159,6 +159,8 @@ pub struct AsfFile {
     pub packet_size: u32,     // upstream: s->packet_size = hdr.max_pktsize
     pub min_packet_size: u32, // upstream: hdr.min_pktsize
     pub preroll_ms: u32,      // upstream: hdr.preroll
+    /// ASF file play duration after subtracting preroll.
+    pub play_duration_ms: Option<u64>,
 
     is_audio_stream: [bool; 128],
     audio_descramble: [AsfAudioDescramble; 128],
@@ -188,6 +190,7 @@ impl AsfFile {
         let mut min_pktsize = 0u32;
         let mut max_pktsize = 0u32;
         let mut preroll_ms = 0u32;
+        let mut play_time_100ns = 0u64;
 
         let header_end = hdr.size;
         let mut pos = 24u64 + 4 + 1 + 1;
@@ -200,7 +203,8 @@ impl AsfFile {
                 // ASFMainHeader: we follow upstream's `asf_read_file_properties`.
                 reader.seek(SeekFrom::Current(16 + 8 + 8))?; // file_id + file_size + create_time
                 packet_count = reader.read_u64::<LittleEndian>()?; // data_packets_count
-                reader.seek(SeekFrom::Current(8 + 8))?; // play_time + send_time
+                play_time_100ns = reader.read_u64::<LittleEndian>()?;
+                let _send_time = reader.read_u64::<LittleEndian>()?;
 
                 // preroll is a QWORD in ASF; upstream uses the low 32 bits.
                 preroll_ms = reader.read_u32::<LittleEndian>()?;
@@ -345,6 +349,8 @@ impl AsfFile {
             packet_size: max_pktsize,
             min_packet_size: min_pktsize,
             preroll_ms,
+            play_duration_ms: (play_time_100ns > 0)
+                .then_some((play_time_100ns / 10_000).saturating_sub(preroll_ms as u64)),
             is_audio_stream,
             audio_descramble,
             streams: std::array::from_fn(|_| AsfStreamState::default()),

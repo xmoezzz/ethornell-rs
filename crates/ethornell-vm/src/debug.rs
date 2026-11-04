@@ -1,4 +1,4 @@
-use crate::Vm;
+use crate::{FRAME_SEGMENT, Vm};
 use std::{
     collections::HashMap,
     sync::{
@@ -39,6 +39,10 @@ impl InstructionProfile {
                 .unwrap_or_default(),
             counts: HashMap::new(),
         }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub(crate) fn record(&mut self, vm: &Vm, program_index: usize, pc: usize) {
@@ -82,7 +86,7 @@ impl InstructionProfile {
                 program = vm.program_name(program_index),
                 pc,
                 offset = format_args!("0x{:08X}", instruction.offset),
-                opcode = instruction.opcode_name,
+                opcode = instruction.opcode.name(),
                 count,
                 slice_steps,
                 "VM instruction profile"
@@ -91,12 +95,12 @@ impl InstructionProfile {
     }
 }
 
-fn debug_enabled() -> bool {
+pub(crate) fn debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("DEBUG").is_some())
 }
 
-fn trace_msgwnd_enabled() -> bool {
+pub(crate) fn trace_msgwnd_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TRACE_MSGWND_LOOP").is_some())
 }
@@ -117,8 +121,8 @@ impl Vm {
             return;
         }
 
-        let body_slot_addr = 0x1200_0000 | self.mem_ptr.saturating_sub(0x90);
-        let body_record_addr = 0x1200_0000 | self.mem_ptr.saturating_sub(0x50);
+        let body_slot_addr = FRAME_SEGMENT | self.mem_ptr.saturating_sub(0x90);
+        let body_record_addr = FRAME_SEGMENT | self.mem_ptr.saturating_sub(0x50);
         let body_slot = self.read_int(body_slot_addr, 2).unwrap_or_default();
         if !matches!(body_slot, 12 | 13) {
             return;
@@ -158,9 +162,9 @@ impl Vm {
             return;
         }
 
-        let counter_addr = 0x1200_0000 | self.mem_ptr.saturating_sub(532);
-        let table_ptr_addr = 0x1200_0000 | self.mem_ptr.saturating_sub(2024);
-        let local_record = 0x1200_0000 | self.mem_ptr.saturating_sub(2016);
+        let counter_addr = FRAME_SEGMENT | self.mem_ptr.saturating_sub(532);
+        let table_ptr_addr = FRAME_SEGMENT | self.mem_ptr.saturating_sub(2024);
+        let local_record = FRAME_SEGMENT | self.mem_ptr.saturating_sub(2016);
         let counter = self.read_int(counter_addr, 2).unwrap_or_default();
         let table_ptr = self.read_int(table_ptr_addr, 2).unwrap_or_default();
         let table_count = self

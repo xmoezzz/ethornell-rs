@@ -157,18 +157,25 @@ impl RuntimeFlashRegistry {
             return Ok(descriptors.clone());
         }
 
-        let backends = wgpu::Backends::all();
-        let instance = create_wgpu_instance(backends, wgpu::BackendOptions::default());
-        let (adapter, device, queue) = pollster::block_on(request_adapter_and_device(
-            backends,
-            &instance,
-            None,
-            wgpu::PowerPreference::HighPerformance,
-        ))
-        .map_err(|error| error.to_string())?;
-        let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
-        self.descriptors = Some(descriptors.clone());
-        Ok(descriptors)
+        // The web cannot block on adapter/device creation; Flash controls
+        // fail to load there instead.
+        #[cfg(target_arch = "wasm32")]
+        return Err("Flash is not available in the web build".into());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let backends = wgpu::Backends::all();
+            let instance = create_wgpu_instance(backends, wgpu::BackendOptions::default());
+            let (adapter, device, queue) = pollster::block_on(request_adapter_and_device(
+                backends,
+                &instance,
+                None,
+                wgpu::PowerPreference::HighPerformance,
+            ))
+            .map_err(|error| error.to_string())?;
+            let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
+            self.descriptors = Some(descriptors.clone());
+            Ok(descriptors)
+        }
     }
 
     pub(crate) fn start(&mut self, bitmap: i32) -> i32 {
@@ -300,7 +307,16 @@ fn capture_player_frame(player: &RufflePlayer) -> Option<DecodedImage> {
     player.render();
     let renderer =
         <dyn Any>::downcast_mut::<WgpuRenderBackend<TextureTarget>>(player.renderer_mut())?;
-    let image = renderer.capture_frame()?;
+    // ruffle reads frames back with a blocking buffer map, which the web
+    // does not have; there a Flash control yields no frame.
+    #[cfg(target_arch = "wasm32")]
+    let image: Option<image::RgbaImage> = {
+        let _ = renderer;
+        None
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let image = renderer.capture_frame();
+    let image = image?;
     Some(DecodedImage {
         width: image.width(),
         height: image.height(),

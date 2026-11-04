@@ -1,0 +1,22 @@
+cargo-features = ["profile-rustflags"]
+[package]
+name = "ethornell_vita"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+build = "build.rs"
+[workspace]
+[profile.release]
+rustflags = ["-C", "no-vectorize-slp"]
+[profile.dev]
+rustflags = ["-C", "no-vectorize-slp"]
+[package.metadata.vita]
+title_id = "ETHORNELL"
+title_name = "Ethornell"
+build_std = "std,panic_abort"
+[target.'cfg(target_os = "vita")'.dependencies]
+ethornell-console = { path = "../../console" }
+linked_list_allocator = { version = "0.10.6", default-features = false }
+vitasdk-sys = {version="=0.3.3",default-features=false,features=["SceAudio_stub","SceCtrl_stub","SceSysmem_stub","SceTouch_stub"]}
+[build-dependencies]
+cc = "1"

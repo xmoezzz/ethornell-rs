@@ -65,6 +65,15 @@ pub unsafe extern "C" fn ethornell_ios_complete_request(
     unsafe { ethornell_android_complete_request(h, id, response) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ethornell_ios_request_payload(
+    h: u64,
+    id: u64,
+    out: *mut u8,
+    capacity: u32,
+) -> i32 {
+    unsafe { ethornell_android_request_payload(h, id, out, capacity) }
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn ethornell_ios_destroy(h: u64) -> i32 {
     ethornell_android_destroy(h)
 }

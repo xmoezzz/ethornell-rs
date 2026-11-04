@@ -16,6 +16,9 @@ control flow so the port cannot drift.
 | `handlers/closure.csv` | For each of the 695 native selectors: handler and every function reachable by direct call. |
 | `handlers/shared_core.txt` | Functions used by ≥ 8 selectors — port these first. |
 | `tools/export_decompiled.py`, `tools/handler_closure.py` | Regenerate the above from `reverse/BGI.sqlite`. |
+| `raw/bgi1622/` | Exports from the BGI 1.622 reference binary (senmomo trial), one native table at a time: `<group>.c` pseudocode, `<group>.asm` disassembly + vtables. Never edit. |
+| `tools/ida_export_closure.py` | IDAPython: regenerate a `raw/bgi1622/` table export. |
+| `adr/` | Decision records; each open effort says where it stopped. Start here when resuming. |
 
 `reverse/` is not tracked; `raw/` and `handlers/` are the checked-in copy of its
 decompilations. 2946 functions are engine code (the rest is CRT/MSVC); 1977 of

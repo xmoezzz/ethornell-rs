@@ -5,6 +5,11 @@ use std::io::Cursor;
 use std::path::Path;
 
 mod cbg;
+mod cbg2_encode;
+mod cbg_encode;
+pub use cbg2_encode::encode_cbg_v2;
+pub use cbg_encode::encode_cbg_v1;
+pub use cbg::decode_native_buffer as decode_cbg_native_buffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ImageFormat {
@@ -117,6 +122,13 @@ pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
     cbg::decode_cbg(data)
 }
 
+/// Decode frame `frame` of a BGI frame movie ("BF_Movie_______", drawn by
+/// Graph90:F6) over `image`, which must have the movie's size. A frame codes
+/// only the blocks that change, so `image` must hold the frame before it.
+pub fn decode_bf_movie_frame(data: &[u8], frame: u32, image: &mut DecodedImage) -> Result<()> {
+    cbg::bf_movie::decode_frame(data, frame, image)
+}
+
 pub fn decode_cbg_to_png(data: &[u8], output: &Path) -> Result<()> {
     let image = decode_cbg(data)?;
     write_rgba_png(&image, output)
@@ -146,6 +158,9 @@ pub fn write_rgba_png(image: &DecodedImage, output: &Path) -> Result<()> {
 }
 
 fn decode_standard_image(data: &[u8]) -> Result<DecodedImage> {
+    if let Some(image) = decode_bmp_32bpp_rgb_with_alpha(data) {
+        return Ok(image);
+    }
     let image = image::load_from_memory(data)
         .map_err(|err| EthornellError::UnsupportedFormat(format!("standard image decode: {err}")))?
         .to_rgba8();
@@ -162,10 +177,62 @@ pub fn bmp_native_bitmap_format(data: &[u8]) -> Result<i32> {
     use image::ImageDecoder;
     let decoder = image::codecs::bmp::BmpDecoder::new(Cursor::new(data))
         .map_err(|err| EthornellError::UnsupportedFormat(format!("BMP header: {err}")))?;
-    Ok(if decoder.color_type().has_alpha() {
-        2
-    } else {
-        1
+    Ok(
+        if decoder.color_type().has_alpha() || decode_bmp_32bpp_rgb_with_alpha(data).is_some() {
+            2
+        } else {
+            1
+        },
+    )
+}
+
+/// BGI system graphics are 32-bpp `BI_RGB` BMPs whose fourth byte is a real
+/// alpha mask. Generic decoders treat that byte as padding, so read it here.
+/// A bitmap whose fourth byte is zero everywhere was written by a tool that
+/// leaves the byte unused, and stays opaque (`None`).
+fn decode_bmp_32bpp_rgb_with_alpha(data: &[u8]) -> Option<DecodedImage> {
+    const BI_RGB: u32 = 0;
+    let u16_at = |offset: usize| {
+        Some(u16::from_le_bytes(
+            data.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    };
+    let u32_at = |offset: usize| {
+        Some(u32::from_le_bytes(
+            data.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+    if !data.starts_with(b"BM") || u32_at(14)? < 40 {
+        return None;
+    }
+    if u16_at(28)? != 32 || u32_at(30)? != BI_RGB {
+        return None;
+    }
+    let pixel_offset = u32_at(10)? as usize;
+    let width = u32_at(18)? as i32;
+    let height = u32_at(22)? as i32;
+    if width <= 0 || height == 0 {
+        return None;
+    }
+    let (width, rows) = (width as usize, height.unsigned_abs() as usize);
+    let stride = width.checked_mul(4)?;
+    let pixels = data.get(pixel_offset..pixel_offset.checked_add(stride.checked_mul(rows)?)?)?;
+    if pixels.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+        return None;
+    }
+    let mut rgba = vec![0u8; stride * rows];
+    for (row, source) in pixels.chunks_exact(stride).enumerate() {
+        // Positive heights store the bottom row first.
+        let target_row = if height > 0 { rows - 1 - row } else { row };
+        let target = &mut rgba[target_row * stride..(target_row + 1) * stride];
+        for (out, bgra) in target.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+            out.copy_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+        }
+    }
+    Some(DecodedImage {
+        width: width as u32,
+        height: rows as u32,
+        rgba,
     })
 }
 
@@ -358,6 +425,43 @@ mod tests {
         assert_eq!(
             decode_image(data.get_ref()).unwrap().rgba,
             vec![10, 20, 30, 40]
+        );
+    }
+
+    fn bmp_32bpp_bi_rgb(height: i32, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let mut data = vec![0u8; 54];
+        data[..2].copy_from_slice(b"BM");
+        data[2..6].copy_from_slice(&((54 + pixels.len() * 4) as u32).to_le_bytes());
+        data[10..14].copy_from_slice(&54u32.to_le_bytes());
+        data[14..18].copy_from_slice(&40u32.to_le_bytes());
+        data[18..22].copy_from_slice(&1i32.to_le_bytes());
+        data[22..26].copy_from_slice(&height.to_le_bytes());
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[28..30].copy_from_slice(&32u16.to_le_bytes());
+        for pixel in pixels {
+            data.extend_from_slice(pixel);
+        }
+        data
+    }
+
+    #[test]
+    fn bi_rgb_32bpp_bmp_uses_the_fourth_byte_as_alpha() {
+        // BGRA, bottom row first: the top row is a transparent white corner.
+        let data = bmp_32bpp_bi_rgb(2, &[[0, 0, 255, 128], [255, 255, 255, 0]]);
+        assert_eq!(bmp_native_bitmap_format(&data).unwrap(), 2);
+        assert_eq!(
+            decode_image(&data).unwrap().rgba,
+            vec![255, 255, 255, 0, 255, 0, 0, 128]
+        );
+    }
+
+    #[test]
+    fn bi_rgb_32bpp_bmp_with_an_all_zero_fourth_byte_stays_opaque() {
+        let data = bmp_32bpp_bi_rgb(-2, &[[0, 0, 255, 0], [255, 0, 0, 0]]);
+        assert_eq!(bmp_native_bitmap_format(&data).unwrap(), 1);
+        assert_eq!(
+            decode_image(&data).unwrap().rgba,
+            vec![255, 0, 0, 255, 0, 0, 255, 255]
         );
     }
 

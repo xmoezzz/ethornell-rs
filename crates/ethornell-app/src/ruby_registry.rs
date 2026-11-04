@@ -120,15 +120,24 @@ impl RubyRegistry {
     /// entries. The target loops forever on a line without a separator or with
     /// an empty side; the portable runtime rejects it instead, keeping the
     /// lines registered before it.
+    /// `sub_434DE0` (`91:96`): consume `base\reading` records up to each
+    /// newline. An empty reading leaves the newline in place, so it becomes
+    /// part of the next base. Where the target would spin forever (no
+    /// separator, or an empty base) this stops and reports false.
     pub(crate) fn register_records(&mut self, records: &str) -> bool {
-        for line in records.lines() {
-            let Some((base, reading)) = line.split_once('\\') else {
+        let mut rest = records;
+        while !rest.is_empty() {
+            let Some(split) = rest.find('\\').filter(|&split| split > 0) else {
                 return false;
             };
-            if base.is_empty() || reading.is_empty() {
-                return false;
+            let base = &rest[..split];
+            rest = &rest[split + 1..];
+            let (length, newline) = rest.find('\n').map_or((rest.len(), 0), |end| (end, 1));
+            if length > 0 {
+                let reading = &rest[..length];
+                self.register(base, reading, false);
+                rest = &rest[length + newline..];
             }
-            self.register(base, reading, false);
         }
         true
     }

@@ -33,6 +33,7 @@ final class NativeEngine {
     static final int EVENT_CONFIRMATION = 2;
     static final int EVENT_CLOSED = 3;
     static final int EVENT_TITLE = 4;
+    static final int EVENT_DIALOG = 5;
 
     // Pause reasons.
     static final int PAUSE_ACTIVITY = 1;
@@ -63,6 +64,12 @@ final class NativeEngine {
     static native String nativePollEvent(long handle, long[] meta);
 
     static native int nativeCompleteRequest(long handle, long requestId, int result);
+
+    /** The JSON description of a dialog request (event kind 5), or null. */
+    static native String nativeRequestPayload(long handle, long requestId);
+
+    /** Answers a dialog request with JSON (see platform/android/include/ABI.md). */
+    static native int nativeCompleteDialog(long handle, long requestId, String answer);
 
     static native int nativeDestroy(long handle);
 

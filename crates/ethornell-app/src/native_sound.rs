@@ -17,6 +17,46 @@ impl RuntimeTraceApi {
             return None;
         }
 
+        // BGI 1.622 sub_4984C0/498510/498560/4985B0 validate as
+        // unsigned, even when no buffer is loaded. Parameter checks precede
+        // channel checks (and consume no output values on failure).
+        let channel_limit = match id {
+            0x08 | 0x14 | 0x16 | 0x17 | 0x18 | 0x19 | 0x1C => Some(16),
+            0x09 | 0x22 | 0x24 | 0x25 | 0x26 | 0x2C | 0x2F => Some(64),
+            _ => None,
+        };
+        if let Some(limit) = channel_limit {
+            let args = stack.iter().map(value_to_i32).collect::<Vec<_>>();
+            let channel = args.first().copied().unwrap_or_default();
+            let parameters: &[(&str, usize)] = match id {
+                0x24 => &[("pan", 2), ("volume", 1)],
+                0x17 => &[("pan", 1)],
+                0x08 | 0x09 | 0x16 | 0x1C | 0x2C => &[("volume", 1)],
+                _ => &[],
+            };
+            for &(name, index) in parameters {
+                let value = args.get(index).copied().unwrap_or_default();
+                if value as u32 > 128 {
+                    // sub_498510 (pan) / sub_498560 (volume).
+                    let message = if name == "pan" {
+                        format!("無効なパンポット（定位） [ {value} ] が指定されました")
+                    } else {
+                        format!("無効なボリューム（音量） [ {value} ] が指定されました")
+                    };
+                    return Some(Err(ethornell_vm::VmError::Runtime(message)));
+                }
+            }
+            if channel as u32 >= limit {
+                // sub_4985B0 (BGM, 16) / sub_4984C0 (SE, 64).
+                let message = if limit == 16 {
+                    format!("無効な音楽チャンネル番号 [ {channel} ] が指定されました")
+                } else {
+                    format!("無効な効果音番号 [ {channel} ] が指定されました")
+                };
+                return Some(Err(ethornell_vm::VmError::Runtime(message)));
+            }
+        }
+
         let value = match id {
             // sub_487010 pushes the engine's fixed software channel count.
             0x00 => ethornell_vm::Value::Int(20),
@@ -40,6 +80,13 @@ impl RuntimeTraceApi {
                 let volume = pop_int_value(stack).unwrap_or(128);
                 let file = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_487BB0: volume, channel, then sub_4946F0's 12/14.
+                if let Err(error) = target_checks::volume(volume)
+                    .and_then(|()| target_checks::bgm_channel(channel))
+                    .and_then(|()| self.native_bgm_asset_check(&[("", &file)], &file))
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_bgm_slot(channel, "", &file, false);
                 self.set_native_bgm_play_volume(channel, volume);
                 tracing::debug!(channel, file, volume, loaded, "SoundLoadNativeChannel");
@@ -53,6 +100,16 @@ impl RuntimeTraceApi {
                 let file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_487C80: pan, volume, channel, then 12/14.
+                if let Err(error) = target_checks::pan(pan)
+                    .and_then(|()| target_checks::volume(volume))
+                    .and_then(|()| target_checks::bgm_channel(channel))
+                    .and_then(|()| {
+                        self.native_bgm_asset_check(&[(&archive, &file)], &format!("{archive} : {file}"))
+                    })
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_bgm_slot(channel, &archive, &file, true);
                 self.set_native_bgm_play_volume(channel, volume);
                 if let Some(slot) = self.bgm_slots.get_mut(&channel) {
@@ -72,6 +129,22 @@ impl RuntimeTraceApi {
                 let intro_file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_487D80: pan, volume, channel, then 12/14 for either
+                // stream.
+                let label = format!("{archive} : {intro_file} / {loop_file}");
+                let loop_name = if loop_file.is_empty() { &intro_file } else { &loop_file };
+                if let Err(error) = target_checks::pan(pan)
+                    .and_then(|()| target_checks::volume(volume))
+                    .and_then(|()| target_checks::bgm_channel(channel))
+                    .and_then(|()| {
+                        self.native_bgm_asset_check(
+                            &[(&archive, &intro_file), (&archive, loop_name)],
+                            &label,
+                        )
+                    })
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_bgm_pair(
                     channel,
                     &archive,
@@ -101,11 +174,6 @@ impl RuntimeTraceApi {
                 // vtable+12 with pause = (value == 0).
                 let action = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if channel as u32 >= 0x10 {
-                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "SoundA0:14 BGM channel {channel} is out of range"
-                    ))));
-                }
                 if action == 0 {
                     if self.bgm_slots.contains_key(&channel) {
                         self.audio_requests.push_back(AudioCommand::Pause {
@@ -148,25 +216,26 @@ impl RuntimeTraceApi {
                 let duration = pop_int_value(stack).unwrap_or_default();
                 let volume = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if volume as u32 > 0x80 || channel as u32 >= 0x10 {
-                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "SoundA0:16 volume {volume} / BGM channel {channel} is out of range"
-                    ))));
-                }
                 if !self.bgm_slots.contains_key(&channel) {
                     return Some(Ok(ethornell_vm::Value::None));
                 }
-                self.set_native_bgm_play_volume(channel, volume);
-                self.apply_native_bgm_volume(channel, duration);
+                let index = channel as usize;
+                self.bgm_play_ramps[index] = Some(NativeSoundRamp::new(
+                    self.native_sound_tick,
+                    duration,
+                    self.bgm_play_volumes[index],
+                    volume as u8,
+                ));
                 ethornell_vm::Value::None
             }
             // sub_4A2C20 maps 0..128 around center 64 to DirectSound pan.
             0x17 => {
                 let pan = pop_int_value(stack).unwrap_or(64);
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if let Some(slot) = self.bgm_slots.get_mut(&channel) {
-                    slot.panning = native_audio_panning(pan);
-                }
+                let Some(slot) = self.bgm_slots.get_mut(&channel) else {
+                    return Some(Ok(ethornell_vm::Value::None));
+                };
+                slot.panning = native_audio_panning(pan);
                 self.audio_requests.push_back(AudioCommand::SetPanning {
                     channel,
                     panning: native_audio_panning(pan),
@@ -178,15 +247,29 @@ impl RuntimeTraceApi {
             0x18 => {
                 let duration = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                self.set_native_bgm_fade_volume(channel, 128);
-                self.apply_native_bgm_volume(channel, duration);
+                if self.bgm_slots.contains_key(&channel) {
+                    let index = channel as usize;
+                    self.bgm_fade_ramps[index] = Some(NativeSoundRamp::new(
+                        self.native_sound_tick,
+                        duration,
+                        self.bgm_fade_volumes[index],
+                        128,
+                    ));
+                }
                 ethornell_vm::Value::None
             }
             0x19 => {
                 let duration = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                self.set_native_bgm_fade_volume(channel, 0);
-                self.apply_native_bgm_volume(channel, duration);
+                if self.bgm_slots.contains_key(&channel) {
+                    let index = channel as usize;
+                    self.bgm_fade_ramps[index] = Some(NativeSoundRamp::new(
+                        self.native_sound_tick,
+                        duration,
+                        self.bgm_fade_volumes[index],
+                        0,
+                    ));
+                }
                 ethornell_vm::Value::None
             }
             // sub_4A2BB0 changes the independent secondary BGM gain bank.
@@ -203,6 +286,12 @@ impl RuntimeTraceApi {
                 let file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_4984C0, then CProcLoadSound's BW and mono checks.
+                if let Err(error) = target_checks::se_channel(channel)
+                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                {
+                    return Some(Err(error));
+                }
                 let loaded =
                     self.load_native_sound_slot_from_archive(channel, &archive, &file, 1.0, 1.0, 0);
                 call.complete_procedure(
@@ -217,6 +306,12 @@ impl RuntimeTraceApi {
                 let file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_4984C0, then CProcLoadSound's BW and mono checks.
+                if let Err(error) = target_checks::se_channel(channel)
+                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_sound_slot_from_archive(
                     channel,
                     &archive,
@@ -253,6 +348,12 @@ impl RuntimeTraceApi {
                 let file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_4984C0, then CProcLoadSound's BW and mono checks.
+                if let Err(error) = target_checks::se_channel(channel)
+                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_sound_slot_from_archive(
                     channel,
                     &archive,
@@ -276,63 +377,35 @@ impl RuntimeTraceApi {
                 let pan = pop_int_value(stack).unwrap_or(64);
                 let volume = pop_int_value(stack).unwrap_or(128);
                 let channel = pop_int_value(stack).unwrap_or_default();
-                for (value, what, limit) in
-                    [(pan, "pan", 0x80u32), (volume, "volume", 0x80), (channel, "SE channel", 0x3F)]
-                {
-                    if value as u32 > limit {
-                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                            "SoundA0:24 {what} {value} is out of range"
-                        ))));
-                    }
-                }
                 if !self.sound_slots.contains_key(&channel) {
                     return Some(Ok(ethornell_vm::Value::Int(0)));
                 }
-                self.set_native_sound_play_volume(channel, volume);
-                let sound = self.sound_slots.get_mut(&channel).map(|sound| {
-                    let restart = std::mem::take(&mut sound.needs_restart);
-                    sound.panning = native_audio_panning(pan);
-                    (sound.clone(), restart)
-                });
-                if let Some((sound, restart)) = sound {
-                    let was_active = sound_channel_active(&self.sound_channel_active, channel);
-                    let effective_volume = self.native_sound_effective_volume(channel);
-                    self.audio_requests.push_back(AudioCommand::Play {
-                        asset: sound.asset,
-                        loop_asset: sound.loop_asset,
-                        channel: native_se_audio_channel(channel),
-                        looped: sound.looped,
-                        volume: effective_volume,
-                        decode_gain: sound.decode_gain,
-                        playback_rate: sound.playback_rate,
-                        panning: sound.panning,
-                        fade_ms: 0,
-                        restart,
-                    });
-                    set_sound_channel_active(&mut self.sound_channel_active, channel, true);
-                    if restart || !was_active {
-                        self.start_sound_clock(channel, sound.playback_rate);
-                    }
-                }
+                // sub_4A4050 always stops/starts the resident wave and
+                // cancels its fade; it never resumes the previous playback.
+                self.play_native_sound_slot(channel, volume, pan);
                 ethornell_vm::Value::Int(self.sound_length_ms(channel))
             }
             // sub_4878F0 stops without freeing the resident buffer.
             0x25 => {
                 let channel = pop_int_value(stack).unwrap_or_default();
-                self.audio_requests.push_back(AudioCommand::Stop {
-                    channel: native_se_audio_channel(channel),
-                    fade_ms: 0,
-                });
-                set_sound_channel_active(&mut self.sound_channel_active, channel, false);
-                self.stop_sound_clock(channel);
+                if self.sound_slots.contains_key(&channel) {
+                    self.release_native_sound_playback(channel);
+                }
                 ethornell_vm::Value::None
             }
             // sub_4A30C0 schedules a per-channel fade to silence.
             0x26 => {
                 let duration = pop_int_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                self.set_native_sound_fade_volume(channel, 0);
-                self.apply_native_sound_volume(channel, duration);
+                if self.sound_slots.contains_key(&channel) {
+                    let index = channel as usize;
+                    self.sound_fade_ramps[index] = Some(NativeSoundRamp::new(
+                        self.native_sound_tick,
+                        duration,
+                        self.sound_fade_volumes[index],
+                        0,
+                    ));
+                }
                 ethornell_vm::Value::None
             }
             0x27 => {
@@ -342,6 +415,12 @@ impl RuntimeTraceApi {
                 let file = pop_string_value(stack).unwrap_or_default();
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
+                // sub_4984C0, then CProcLoadSound's BW and mono checks.
+                if let Err(error) = target_checks::se_channel(channel)
+                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                {
+                    return Some(Err(error));
+                }
                 let loaded = self.load_native_sound_slot_from_archive(
                     channel,
                     &archive,
@@ -364,7 +443,10 @@ impl RuntimeTraceApi {
                 let descriptor = pop_int_value(stack).unwrap_or_default();
                 let source = stack.pop();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                let valid = channel >= 0 && source.is_some();
+                if let Err(error) = target_checks::se_channel(channel) {
+                    return Some(Err(error));
+                }
+                let valid = source.is_some();
                 tracing::debug!(
                     channel,
                     descriptor,
@@ -391,11 +473,6 @@ impl RuntimeTraceApi {
             // channel >= 0x40 is fatal.
             0x2F => {
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if channel as u32 >= 0x40 {
-                    return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                        "SoundA0:2F SE channel {channel} is out of range"
-                    ))));
-                }
                 ethornell_vm::Value::Int(self.sound_length_ms(channel))
             }
             // sub_48D640 opens the target MCI CD-audio device and selects
@@ -664,6 +741,52 @@ impl RuntimeTraceApi {
         true
     }
 
+    /// sub_4A4B00 / sub_4A40E0: a missing file throws 12 ("BWファイル ..
+    /// は存在しません"); data no decoder takes throws 14 ("BWファイルではない").
+    /// Ogg and RIFF payloads without a BW header stay accepted.
+    fn native_bgm_asset_check(
+        &self,
+        files: &[(&str, &str)],
+        label: &str,
+    ) -> ethornell_vm::VmResult<()> {
+        for &(archive, file) in files {
+            let Some(asset) = self.load_native_audio_asset(archive, file) else {
+                return Err(ethornell_vm::VmError::Runtime(format!(
+                    "指定されたBWファイル [ {label} ] は存在しません"
+                )));
+            };
+            if asset.bytes.len() < 0x40
+                && !matches!(
+                    ethornell_audio::probe_audio(&asset.bytes).kind,
+                    ethornell_audio::AudioKind::Ogg | ethornell_audio::AudioKind::RiffWave
+                )
+                || ethornell_audio::probe_audio(&asset.bytes).kind == ethornell_audio::AudioKind::Unknown
+            {
+                return Err(ethornell_vm::VmError::Runtime(format!(
+                    "指定されたファイル [ {label} ] はBWファイルではないようです"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// CProcLoadSound (sub_43A3C0): data that is not a BW wave is a script
+    /// error. A missing file is the load procedure's own failure.
+    fn native_se_asset_check(&self, archive: &str, file: &str) -> ethornell_vm::VmResult<()> {
+        let Some(asset) = self.load_native_audio_asset(archive, file) else {
+            return Ok(());
+        };
+        let info = ethornell_audio::probe_audio(&asset.bytes);
+        if info.kind == ethornell_audio::AudioKind::Unknown {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "指定されたファイル [ {archive} : {file} ] はBWファイルではないようです"
+            )));
+        }
+        // The worker's "はモノラルではない" refusal (0x80000002) is not a
+        // plain channel-count test: stereo Ogg (type 3) SE play in 1.622.
+        Ok(())
+    }
+
     fn load_native_audio_asset(&self, archive: &str, file: &str) -> Option<AudioAsset> {
         let entry = if archive.is_empty() {
             self.manager.find(file)
@@ -697,7 +820,9 @@ impl RuntimeTraceApi {
         } else {
             self.bgm_secondary_volumes[index] = volume;
         }
-        self.apply_native_bgm_volume(channel, 0);
+        if self.bgm_slots.contains_key(&channel) {
+            self.apply_native_bgm_volume(channel);
+        }
     }
 
     fn set_native_bgm_play_volume(&mut self, channel: i32, volume: i32) {
@@ -706,6 +831,7 @@ impl RuntimeTraceApi {
             .and_then(|index| self.bgm_play_volumes.get_mut(index))
         {
             *slot = volume.clamp(0, 128) as u8;
+            self.bgm_play_ramps[channel as usize] = None;
         }
     }
 
@@ -715,6 +841,7 @@ impl RuntimeTraceApi {
             .and_then(|index| self.bgm_fade_volumes.get_mut(index))
         {
             *slot = volume.clamp(0, 128) as u8;
+            self.bgm_fade_ramps[channel as usize] = None;
         }
     }
 
@@ -726,19 +853,38 @@ impl RuntimeTraceApi {
             return 0.0;
         };
         native_mixer_volume([
-            self.bgm_primary_volumes[index],
+            // sub_494F50 applies 0 to every primary bank while minimized.
+            if self.sound_minimize_muted { 0 } else { self.bgm_primary_volumes[index] },
             self.bgm_secondary_volumes[index],
             self.bgm_play_volumes[index],
             self.bgm_fade_volumes[index],
         ])
     }
 
-    fn apply_native_bgm_volume(&mut self, channel: i32, duration: i32) {
+    /// sub_494F50 (muted) / sub_4946B0 (restored): the primary BGM and SE
+    /// banks apply 0 while the window is minimized and the stored values
+    /// again afterwards; A0:08/A0:09 keep storing in between.
+    pub(super) fn set_sound_minimize_muted(&mut self, muted: bool) {
+        if self.sound_minimize_muted == muted {
+            return;
+        }
+        self.sound_minimize_muted = muted;
+        let bgm = self.bgm_slots.keys().copied().collect::<Vec<_>>();
+        for channel in bgm {
+            self.apply_native_bgm_volume(channel);
+        }
+        let sounds = self.sound_slots.keys().copied().collect::<Vec<_>>();
+        for channel in sounds {
+            self.apply_native_sound_volume(channel);
+        }
+    }
+
+    fn apply_native_bgm_volume(&mut self, channel: i32) {
         let volume = self.native_bgm_effective_volume(channel);
         self.audio_requests.push_back(AudioCommand::SetVolume {
             channel,
             volume,
-            fade_ms: native_audio_duration(duration),
+            fade_ms: 0,
         });
     }
 
@@ -755,7 +901,9 @@ impl RuntimeTraceApi {
         } else {
             self.sound_secondary_volumes[index] = volume;
         }
-        self.apply_native_sound_volume(channel, 0);
+        if self.sound_slots.contains_key(&channel) {
+            self.apply_native_sound_volume(channel);
+        }
     }
 
     fn set_native_sound_play_volume(&mut self, channel: i32, volume: i32) {
@@ -773,6 +921,7 @@ impl RuntimeTraceApi {
             .and_then(|index| self.sound_fade_volumes.get_mut(index))
         {
             *slot = volume.clamp(0, 128) as u8;
+            self.sound_fade_ramps[channel as usize] = None;
         }
     }
 
@@ -784,7 +933,7 @@ impl RuntimeTraceApi {
             return [0; 4];
         };
         [
-            self.sound_primary_volumes[index],
+            if self.sound_minimize_muted { 0 } else { self.sound_primary_volumes[index] },
             self.sound_secondary_volumes[index],
             self.sound_play_volumes[index],
             self.sound_fade_volumes[index],
@@ -795,12 +944,12 @@ impl RuntimeTraceApi {
         native_mixer_volume(self.native_sound_volume_factors(channel))
     }
 
-    fn apply_native_sound_volume(&mut self, channel: i32, duration: i32) {
+    fn apply_native_sound_volume(&mut self, channel: i32) {
         let volume = self.native_sound_effective_volume(channel);
         self.audio_requests.push_back(AudioCommand::SetVolume {
             channel: native_se_audio_channel(channel),
             volume,
-            fade_ms: native_audio_duration(duration),
+            fade_ms: 0,
         });
     }
 
@@ -919,8 +1068,13 @@ impl RuntimeTraceApi {
     }
 
     fn play_native_sound_slot(&mut self, channel: i32, volume: i32, pan: i32) {
+        if !self.sound_slots.contains_key(&channel) {
+            return;
+        }
         self.set_native_sound_play_volume(channel, volume);
+        self.set_native_sound_fade_volume(channel, 128);
         let Some(sound) = self.sound_slots.get_mut(&channel).map(|sound| {
+            sound.needs_restart = false;
             sound.panning = native_audio_panning(pan);
             sound.clone()
         }) else {
@@ -944,11 +1098,50 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn advance_audio_clocks(&mut self, elapsed_ms: u64) {
+        // Envelopes use the unnormalized host tick (GetTickCount), including
+        // pause gaps. Playback clock capping below preserves its existing ABI.
+        self.native_sound_tick = self.native_sound_tick.wrapping_add(elapsed_ms as u32);
+        self.poll_native_sound_envelopes();
         for clock in &mut self.bgm_playback_clocks {
-            clock.advance(elapsed_ms);
+            clock.advance(elapsed_ms.min(500));
         }
         for clock in &mut self.sound_playback_clocks {
-            clock.advance(elapsed_ms);
+            clock.advance(elapsed_ms.min(500));
+        }
+    }
+
+    /// sub_4A2E70: poll both envelopes before composing gain. Stopped
+    /// resident buffers still participate; reaching zero does not stop them.
+    fn poll_native_sound_envelopes(&mut self) {
+        for channel in 0..16 {
+            if !self.bgm_slots.contains_key(&(channel as i32)) {
+                continue;
+            }
+            let play = poll_sound_ramp(
+                &mut self.bgm_play_ramps[channel],
+                &mut self.bgm_play_volumes[channel],
+                self.native_sound_tick,
+            );
+            let fade = poll_sound_ramp(
+                &mut self.bgm_fade_ramps[channel],
+                &mut self.bgm_fade_volumes[channel],
+                self.native_sound_tick,
+            );
+            if play || fade {
+                self.apply_native_bgm_volume(channel as i32);
+            }
+        }
+        for channel in 0..64 {
+            if !self.sound_slots.contains_key(&(channel as i32)) {
+                continue;
+            }
+            if poll_sound_ramp(
+                &mut self.sound_fade_ramps[channel],
+                &mut self.sound_fade_volumes[channel],
+                self.native_sound_tick,
+            ) {
+                self.apply_native_sound_volume(channel as i32);
+            }
         }
     }
 
@@ -1063,13 +1256,8 @@ fn discover_native_cd_audio_tracks(
                 continue;
             };
             let bytes = if let Some(policy)=file_policy::active() {
-                use std::io::Read;
                 let Some(rel)=path.strip_prefix(&policy.resource).ok() else {continue;};
-                let Ok(file)=policy.open_resource(&rel.to_string_lossy()) else {continue;};
-                if file.metadata().map(|m|m.len()>128*1024*1024).unwrap_or(true) {continue;}
-                let mut bytes=Vec::new();
-                if file.take(128*1024*1024+1).read_to_end(&mut bytes).is_err() || bytes.len()>128*1024*1024 {continue;}
-                Ok(bytes)
+                policy.read_resource(&rel.to_string_lossy(), 128*1024*1024)
             } else {std::fs::read(&path)};
             let Ok(bytes) = bytes else {
                 continue;
@@ -1168,6 +1356,18 @@ fn parse_native_cd_track_number(stem: &str) -> Option<u8> {
         .then_some(track as u8)
 }
 
+fn poll_sound_ramp(ramp: &mut Option<NativeSoundRamp>, volume: &mut u8, now: u32) -> bool {
+    let Some(active) = *ramp else {
+        return false;
+    };
+    let (sample, done) = active.sample(now);
+    *volume = sample;
+    if done {
+        *ramp = None;
+    }
+    true
+}
+
 /// Mirrors sub_4A21C0's four-factor attenuation composition, then converts
 /// the target 0..=128 attenuation domain to the portable backend's 0.0..=1.0
 /// gain domain. Each native factor is independently clamped before combining.
@@ -1222,10 +1422,179 @@ fn native_clock_mut<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{AudioCommand, RuntimeTraceApi};
     use super::{
         OWNED_A0_IDS, native_audio_fixed, native_mixer_volume, native_se_audio_channel,
         parse_native_cd_track_number,
     };
+    use ethornell_vm::{NativeCallFrame, NativeOpcode, SoundApi, Value};
+
+    fn api_with_resident_channel() -> RuntimeTraceApi {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        let mut header = [0u8; 64];
+        header[0..4].copy_from_slice(&64u32.to_le_bytes());
+        header[4..8].copy_from_slice(b"bw  ");
+        header[12..16].copy_from_slice(&44_100u32.to_le_bytes());
+        header[16..20].copy_from_slice(&44_100u32.to_le_bytes());
+        assert!(api.register_native_sound_memory(3, &header, 0, 1.0, 1.0));
+        api.bgm_slots.insert(3, api.sound_slots[&3].clone());
+        api.audio_requests.clear();
+        api
+    }
+
+    fn sound_call(
+        api: &mut RuntimeTraceApi,
+        id: u16,
+        args: &[i32],
+    ) -> ethornell_vm::VmResult<Value> {
+        let mut call = NativeCallFrame::new(
+            NativeOpcode { group: 0xA0, id },
+            args.iter().copied().map(Value::Int).collect(),
+        );
+        let result = SoundApi::call_sound(api, &mut call);
+        if result.is_ok() {
+            assert!(call.args().is_empty());
+        }
+        result
+    }
+
+    #[test]
+    fn sound_controls_reject_unsigned_out_of_range_before_side_effects() {
+        let mut api = api_with_resident_channel();
+        for (id, args) in [
+            (0x08, vec![-1, 128]),
+            (0x08, vec![16, 128]),
+            (0x08, vec![0, -1]),
+            (0x09, vec![64, 128]),
+            (0x09, vec![0, 129]),
+            (0x14, vec![16, 1]),
+            (0x16, vec![16, 128, 100]),
+            (0x17, vec![0, -1]),
+            (0x17, vec![16, 64]),
+            (0x18, vec![-1, 100]),
+            (0x19, vec![16, 100]),
+            (0x1C, vec![0, 129]),
+            (0x22, vec![64]),
+            (0x25, vec![-1]),
+            (0x25, vec![64]),
+            (0x26, vec![64, 100]),
+            (0x2C, vec![0, -1]),
+        ] {
+            assert!(
+                sound_call(&mut api, id, &args).is_err(),
+                "A0:{id:02X} {args:?}"
+            );
+            assert!(api.audio_requests.is_empty());
+            assert!(api.sound_slots.contains_key(&3));
+        }
+        let error = sound_call(&mut api, 0x17, &[16, 129])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("パンポット"),
+            "parameter validation must precede channel validation: {error}"
+        );
+    }
+
+    #[test]
+    fn se_stop_keeps_the_buffer_and_play_always_restarts_and_cancels_fade() {
+        let mut api = api_with_resident_channel();
+        assert_eq!(
+            sound_call(&mut api, 0x24, &[3, 128, 64]).unwrap(),
+            Value::Int(1000)
+        );
+        sound_call(&mut api, 0x26, &[3, 100]).unwrap();
+        api.advance_audio_clocks(50);
+        assert_eq!(api.sound_fade_volumes[3], 64);
+        sound_call(&mut api, 0x25, &[3]).unwrap();
+        assert!(api.sound_slots.contains_key(&3));
+        assert!(api.sound_fade_ramps[3].is_some()); // stop does not cancel fade
+        assert!(!api.sound_channel_active[3]);
+        assert_eq!(sound_call(&mut api, 0x2F, &[3]).unwrap(), Value::Int(1000));
+        for _ in 0..2 {
+            api.audio_requests.clear();
+            sound_call(&mut api, 0x24, &[3, 100, 0]).unwrap();
+            assert_eq!(api.sound_fade_volumes[3], 128);
+            assert!(api.sound_fade_ramps[3].is_none());
+            assert_eq!(api.sound_playback_clocks[3].position_ms(), 0);
+            assert!(matches!(
+                api.audio_requests.back(),
+                Some(AudioCommand::Play {
+                    restart: true,
+                    panning: 0.0,
+                    ..
+                })
+            ));
+            api.advance_audio_clocks(20);
+            assert_eq!(api.sound_playback_clocks[3].position_ms(), 20);
+        }
+        sound_call(&mut api, 0x22, &[3]).unwrap();
+        assert_eq!(sound_call(&mut api, 0x2F, &[3]).unwrap(), Value::Int(0));
+    }
+
+    #[test]
+    fn sound_envelopes_compose_independently_and_retarget_from_last_sample() {
+        let mut api = api_with_resident_channel();
+        sound_call(&mut api, 0x16, &[3, 0, 100]).unwrap();
+        sound_call(&mut api, 0x19, &[3, 200]).unwrap();
+        assert!(api.audio_requests.is_empty()); // deferred until sound poll
+        assert_eq!(
+            (api.bgm_play_volumes[3], api.bgm_fade_volumes[3]),
+            (128, 128)
+        );
+        api.advance_audio_clocks(50);
+        assert_eq!((api.bgm_play_volumes[3], api.bgm_fade_volumes[3]), (64, 96));
+        sound_call(&mut api, 0x08, &[3, 100]).unwrap();
+        assert!(api.bgm_play_ramps[3].is_some());
+        sound_call(&mut api, 0x18, &[3, 100]).unwrap();
+        api.advance_audio_clocks(50);
+        assert_eq!((api.bgm_play_volumes[3], api.bgm_fade_volumes[3]), (0, 112));
+        api.advance_audio_clocks(50);
+        assert_eq!(api.bgm_fade_volumes[3], 128);
+        assert!(api.bgm_play_ramps[3].is_none() && api.bgm_fade_ramps[3].is_none());
+        sound_call(&mut api, 0x16, &[3, 128, 0]).unwrap();
+        assert_eq!(api.bgm_play_volumes[3], 0);
+        api.advance_audio_clocks(0);
+        assert_eq!(api.bgm_play_volumes[3], 128);
+        sound_call(&mut api, 0x26, &[3, -1]).unwrap();
+        api.advance_audio_clocks(0);
+        assert_eq!(api.sound_fade_volumes[3], 0);
+        assert!(api.sound_slots.contains_key(&3));
+        sound_call(&mut api, 0x16, &[3, 0, 1000]).unwrap();
+        api.advance_audio_clocks(1000); // sound timer is not the VM's capped clock
+        assert_eq!(api.bgm_play_volumes[3], 0);
+        assert!(api.bgm_play_ramps[3].is_none());
+        assert!(
+            api.audio_requests
+                .iter()
+                .all(|command| matches!(command, AudioCommand::SetVolume { fade_ms: 0, .. }))
+        );
+    }
+
+    #[test]
+    fn unloaded_sound_controls_leave_no_backend_commands_or_envelopes() {
+        let mut api = api_with_resident_channel();
+        for (id, args) in [
+            (0x08, vec![15, 64]),
+            (0x09, vec![63, 64]),
+            (0x17, vec![15, 64]),
+            (0x18, vec![15, 100]),
+            (0x19, vec![15, 100]),
+            (0x1C, vec![15, 64]),
+            (0x25, vec![63]),
+            (0x26, vec![63, 100]),
+            (0x2C, vec![63, 64]),
+        ] {
+            sound_call(&mut api, id, &args).unwrap();
+        }
+        api.advance_audio_clocks(100);
+        assert!(api.audio_requests.is_empty());
+        assert_eq!(api.bgm_primary_volumes[15], 64);
+        assert_eq!(api.sound_primary_volumes[63], 64);
+        assert!(api.bgm_fade_ramps[15].is_none() && api.sound_fade_ramps[63].is_none());
+    }
 
     #[test]
     fn owns_every_recovered_sound_dispatch_entry() {

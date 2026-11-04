@@ -174,7 +174,7 @@ fn is_generic_native_name(key: CallKey) -> bool {
 pub fn infer_program_call_arg_counts(program: &BpProgram) -> Vec<CallSiteArgCount> {
     let mut state = StackEffectState::default();
     let mut observations = Vec::new();
-    for instruction in &program.instructions {
+    for instruction in program.instructions.iter() {
         state.visit(program, instruction, &mut observations);
     }
     observations
@@ -247,7 +247,7 @@ impl StackEffectState {
             return;
         }
 
-        match instruction.opcode_name.as_str() {
+        match instruction.opcode.name() {
             "push_byte" | "push_word" | "push_dword" | "push_base_offset" | "push_string"
             | "push_offset" | "load_base" => self.push(1),
             "store_base" | "jmp" | "call" => self.pop(1),
@@ -297,6 +297,11 @@ fn builtin_stack_effect(name: &str) -> Option<(usize, usize)> {
         "atan2" | "strfind" | "streq" => (2, 1),
         "vec3_length" | "memory_equal" => (3, 1),
         "qword_add" | "qword_sub" | "qword_mul" | "qword_div" | "qword_mod" => (3, 0),
+        "fixed_mul" | "fixed_div" => (2, 1),
+        "vec4_add" | "vec4_sub" | "vec4_mul" | "vec4_div" | "vec4_scale" | "vec4_div_scalar" => {
+            (3, 0)
+        }
+        "vec3_normalize" => (2, 0),
         "memcpy" | "memset" | "strconcat" | "quote_string" => (3, 0),
         "memclr" | "strcpy" => (2, 0),
         "memrepeat" => (4, 0),
@@ -688,6 +693,10 @@ pub fn known_call_arg_count(group: u8, id: u16) -> Option<usize> {
         (0x92, 0xf1) => 6,
         (0x92, 0xf2) => 13,
         (0x92, 0x19) | (0x92, 0x8e) => 1,
+        // Not in the reference build's table: Wonderful Everyday's
+        // logwnd._bp passes (destination, source, width) and pushes nothing
+        // back before its next call.
+        (0x92, 0x1b) => 3,
         // Tayutama2_trial_TG.exe: funcs_486FEE[0x9c] -> sub_4867D0.
         // The native handler pops 21 BP values before calling sub_403B10.
         (0x92, 0x9c) => 21,
@@ -853,5 +862,13 @@ mod tests {
     fn graph_control_selectors_follow_target_abi_descriptor() {
         assert_eq!(known_call_arg_count(0x90, 0x21), Some(9));
         assert_eq!(known_call_arg_count(0x90, 0x22), Some(7));
+    }
+
+    #[test]
+    fn graph92_1b_pops_its_three_arguments() {
+        // Wonderful Everyday's log halo; without an arity the VM handed the
+        // call no arguments and left all three on the operand stack.
+        assert_eq!(known_call_arg_count(0x92, 0x1b), Some(3));
+        assert!(!super::known_call_returns_value(0x92, 0x1b));
     }
 }

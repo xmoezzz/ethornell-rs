@@ -1165,6 +1165,7 @@ name = "ethornell-app"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "chardetng",
  "encoding_rs",
  "ethornell-archive",
  "ethornell-audio",
@@ -1180,7 +1181,9 @@ dependencies = [
  "pollster",
  "ruffle_core",
  "ruffle_render_wgpu",
+ "serde_json",
  "tracing",
+ "vitasdk-sys",
  "wgpu 0.19.4",
  "winit 0.31.0-beta.3",
 ]
@@ -1200,7 +1203,7 @@ name = "ethornell-audio"
 version = "0.1.0"
 dependencies = [
  "ethornell-core",
- "kira",
+ "kira 0.8.7",
  "serde",
  "symphonia",
 ]
@@ -1259,6 +1262,7 @@ dependencies = [
  "ethornell-image",
  "raw-window-handle 0.6.2",
  "tracing",
+ "web-sys",
  "wgpu 0.19.4",
  "winit 0.31.0-beta.3",
 ]
@@ -1271,6 +1275,7 @@ dependencies = [
  "encoding_rs",
  "ethornell-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1278,10 +1283,29 @@ name = "ethornell-vm"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "ethornell-archive",
  "ethornell-core",
+ "ethornell-image",
  "ethornell-script",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "ethornell-web"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "ethornell-app",
+ "ethornell-archive",
+ "ethornell-audio",
+ "ethornell-core",
+ "ethornell-render",
+ "getrandom",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -1634,9 +1658,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1665,6 +1691,15 @@ name = "glam"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
+dependencies = [
+ "mint",
+]
+
+[[package]]
+name = "glam"
+version = "0.29.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8babf46d4c1c9d92deac9f7be466f76dfc4482b6452fc5024b5e8daf6ffeb3ee"
 dependencies = [
  "mint",
 ]
@@ -2336,11 +2371,27 @@ checksum = "8968f1eda49cdf4f6406fd5ffe590c3ca2778a1b0e50b5684974b138a99dfb2f"
 dependencies = [
  "atomic-arena",
  "cpal",
- "glam",
+ "glam 0.25.0",
  "mint",
  "ringbuf 0.3.3",
  "send_wrapper",
  "symphonia",
+]
+
+[[package]]
+name = "kira"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb5a9f9dff5e262540b628b00d5e1a772270a962d6869f8695bb24832ff3b394"
+dependencies = [
+ "cpal",
+ "glam 0.29.3",
+ "mint",
+ "paste",
+ "ringbuf 0.3.3",
+ "send_wrapper",
+ "symphonia",
+ "triple_buffer",
 ]
 
 [[package]]
@@ -4648,6 +4699,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "triple_buffer"
+version = "8.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "420466259f9fa5decc654c490b9ab538400e5420df8237f84ecbe20368bcf72b"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4770,6 +4830,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vitasdk-sys"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "665d8a491ad572e0ebc103846c4a51e66b641c942391b7241f91c413a3a301a9"
 
 [[package]]
 name = "walkdir"
@@ -6057,6 +6123,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "env_logger 0.10.2",
+ "kira 0.9.6",
  "log",
  "png 0.17.16",
  "pollster",

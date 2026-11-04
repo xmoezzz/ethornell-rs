@@ -22,7 +22,7 @@ impl Vm {
                 // sub_465AB0 failing to read/decode the module is fatal.
                 let Some(mut program) = api.load_program(&archive, &file) else {
                     return Err(VmError::Runtime(format!(
-                        "LoadProgramModule: cannot load {archive}:{file}"
+                        "指定されたプログラム [ {archive} : {file} ] は存在しません"
                     )));
                 };
                 self.assign_program_instance(&mut program);
@@ -32,8 +32,7 @@ impl Vm {
                 let used = self.module_chain_code_used();
                 if u64::from(size) + u64::from(used) > u64::from(self.thread.code_region_size()) {
                     return Err(VmError::Runtime(format!(
-                        "cannot load {archive}:{file}: {size} bytes do not fit the code region ({used} of {} used)",
-                        self.thread.code_region_size()
+                        "コード領域のサイズが不足しているので、プログラム [ {archive} : {file} ] を読み込むことができません"
                     )));
                 }
                 Value::Int(self.append_target_loaded_program(program) as i32)
@@ -47,9 +46,7 @@ impl Vm {
                     api.free_program(Value::Program(Arc::new(program)));
                 }
                 if remaining == 0 {
-                    return Err(VmError::Runtime(
-                        "FreeLastProgramModule removed the last module of the thread".into(),
-                    ));
+                    return Err(VmError::Runtime("メインプログラムが削除されてしまいました".into()));
                 }
                 Value::Int(remaining)
             }
@@ -67,7 +64,7 @@ impl Vm {
                 // (sub_444CE0 returns 0x80000000).
                 let Some(mut program) = api.load_program_ex(&archive, &file, &parameters) else {
                     return Err(VmError::Runtime(format!(
-                        "LoadProgramThread cannot read {archive}:{file}"
+                        "指定されたプログラム [ {archive} : {file} ] は存在しません"
                     )));
                 };
                 self.assign_program_instance(&mut program);
@@ -80,7 +77,7 @@ impl Vm {
                 let size = Self::program_target_code_size(&program);
                 if size > code_bytes {
                     return Err(VmError::Runtime(format!(
-                        "cannot load {archive}:{file}: {size} bytes do not fit a {code_bytes}-byte code region"
+                        "生成されたスレッドのコード領域のサイズが不足しているので、プログラム [ {archive} : {file} ] を読み込むことができません"
                     )));
                 }
                 let thread_id = self

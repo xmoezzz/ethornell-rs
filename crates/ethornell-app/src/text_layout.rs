@@ -22,7 +22,7 @@
 const LINE_START_PROHIBITED: &str =
     "\"':;?!ﾞﾟ･，．、。：；？！”゛゜‐]})）〕］｝〉≫》」』】ヽヾゝゞ々ー～っゃゅょッャュョ";
 const LINE_END_PROHIBITED: &str = "[{(（〔［｛〈≪《「『【“";
-const HANGING: &str = "?!ﾞﾟ，．、。？！”゛゜]})）〕］｝〉≫》」』】ヽヾゝゞ々ー～っゃゅょッャュョ";
+pub(crate) const HANGING: &str = "?!ﾞﾟ，．、。？！”゛゜]})）〕］｝〉≫》」』】ヽヾゝゞ々ー～っゃゅょッャュョ";
 const INDENT_OPENERS: &str = "「　（『";
 
 #[derive(Debug, Clone, Copy)]

@@ -19,6 +19,9 @@ pub enum HostRequest {
     Message {
         text: String,
     },
+    /// A UserB0 input dialog. Answer with `Vm::complete_user_dialog`; the
+    /// VM writes the accepted text itself and pushes 1 or 0.
+    UserDialog(crate::UserDialogRequest),
 }
 
 #[cfg(test)]
@@ -56,21 +59,20 @@ mod tests {
     fn program(code: u8, name: &'static str, id: u8) -> BpProgram {
         BpProgram {
             script_name: Some(format!("test-{name}")),
-            functions: vec![],
-            strings: vec![],
-            instructions: vec![BpInstruction {
+            functions: std::sync::Arc::new(vec![]),
+            strings: std::sync::Arc::new(vec![]),
+            instructions: std::sync::Arc::new(vec![BpInstruction {
                 offset: 8,
                 opcode: BpOpcode::Known { code, name },
-                opcode_hex: format!("{code:02x}"),
-                opcode_name: name.into(),
-                operands: vec![],
+                operands: vec![].into(),
                 known_call: None,
-                raw: vec![code, id],
+                raw: vec![code, id].into(),
                 warning: None,
-            }],
+            }]),
             labels: Default::default(),
             warnings: vec![],
             module_size: 0,
+            code: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -166,8 +168,8 @@ mod tests {
         // Parser's conservative headerless code-end probe stops at the first
         // ret; explicitly model both valid branch targets for this unit BP.
         let suffix=ethornell_script::parse_bp_program(None,&raw[8..]);
-        p.instructions.extend(suffix.instructions.into_iter().map(|mut i|{i.offset+=8;i}));
-        p.labels=p.instructions.iter().enumerate().map(|(n,i)|(i.offset as u32,n)).collect();
+        std::sync::Arc::make_mut(&mut p.instructions).extend(suffix.instructions.iter().cloned().map(|mut i|{i.offset+=8;i}));
+        p.labels=std::sync::Arc::new(p.instructions.iter().enumerate().map(|(n,i)|(i.offset as u32,n)).collect());
         let mut root=Vm::new();root.set_native_abi_profile(crate::NativeAbiProfile::Amachoco);
         root.start_async_program_with_args(Value::Program(std::sync::Arc::new(p.clone())),vec![],false).unwrap();
         root.async_tasks[0].vm.start_async_program_with_args(Value::Program(std::sync::Arc::new(p.clone())),vec![],false).unwrap();
@@ -232,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn native_input_intercepts_before_sync_builtin_and_validates_all_writes() {
+    fn user_input_dialog_suspends_typed_and_validates_all_writes() {
         let mut vm = Vm::new();
         vm.start(&program(0xb0, "usr1", 0x84));
         vm.stack = vec![
@@ -247,18 +249,17 @@ mod tests {
                 .stop_reason,
             VmStopReason::WaitingForHost
         );
-        assert!(matches!(
-            &host.requests[0],
-            HostRequest::Native {
-                opcode: NativeOpcode {
-                    group: 0xb0,
-                    id: 0x84
-                },
-                ..
-            }
-        ));
+        assert_eq!(
+            host.requests,
+            [HostRequest::UserDialog(crate::UserDialogRequest::Input {
+                title: "caption".into(),
+                initial: "initial".into(),
+                max_bytes: 255,
+                numeric: false,
+            })]
+        );
         let before = vm.memory[0x3000];
-        let mut response = HostResponse {
+        let response = HostResponse {
             outputs: vec![Value::Int(1)],
             writes: vec![
                 HostMemoryWrite {
@@ -271,13 +272,37 @@ mod tests {
                 },
             ],
         };
-        assert!(vm.complete_host_request(1, response.clone()).is_err());
+        assert!(vm.complete_host_request(1, response).is_err());
         assert_eq!(vm.memory[0x3000], before);
-        response.writes.pop();
-        vm.complete_host_request(1, response).unwrap();
+        vm.complete_user_dialog(1, Some(crate::UserDialogResponse::Input("答え".into())))
+            .unwrap();
         vm.run_loaded(&mut host, &VmRunOptions::default());
-        assert_eq!(vm.memory[0x3000], 42);
+        assert_eq!(vm.read_c_string_bytes(0x3000).unwrap(), encoding_rs::SHIFT_JIS.encode("答え").0.to_vec());
         assert_eq!(vm.stack, vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn user_dialog_cancel_writes_nothing_and_pushes_zero() {
+        let mut vm = Vm::new();
+        vm.start(&program(0xb0, "usr1", 0x84));
+        vm.memory[0x3000] = 9;
+        vm.stack = vec![
+            Value::Ptr(0x3000),
+            Value::Str("caption".into()),
+            Value::Str(String::new()),
+            Value::Int(-4),
+        ];
+        let mut host = Host::default();
+        vm.run_loaded(&mut host, &VmRunOptions::default());
+        assert!(matches!(
+            &host.requests[0],
+            HostRequest::UserDialog(crate::UserDialogRequest::Input { max_bytes: 4, numeric: true, .. })
+        ));
+        assert!(vm.complete_user_dialog(2, None).is_err());
+        vm.complete_user_dialog(1, None).unwrap();
+        vm.run_loaded(&mut host, &VmRunOptions::default());
+        assert_eq!(vm.memory[0x3000], 9);
+        assert_eq!(vm.stack, vec![Value::Int(0)]);
     }
 
     #[test]
@@ -343,6 +368,7 @@ mod tests {
         let mut child = root.async_tasks.remove(0);
         let mut grandchild = child.vm.async_tasks.remove(0);
         for vm in [&mut root, child.vm.as_mut(), grandchild.vm.as_mut()] {
+            materialize_test_memory(vm);
             assert_eq!(vm.graph_text_encoding, Some(encoding_rs::GBK));
             for (group, id, count, from_top) in [
                 (0x92, 0x90, 15, 13),
@@ -414,12 +440,12 @@ mod tests {
         .unwrap();
         let usage = root.resource_usage();
         assert_eq!(usage.vm_count, 2);
-        assert_eq!(usage.memory_bytes, initial.memory_bytes * 2);
+        // An idle thread keeps compact code, not a second process buffer.
+        assert_eq!(usage.memory_bytes, initial.memory_bytes);
         assert!(
             root.check_resource_budget(VmResourceBudget {
                 max_vm_count: 1,
                 max_memory_capacity_bytes: usize::MAX,
-                max_journal_entries: usize::MAX
             })
             .is_err()
         );
@@ -466,18 +492,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_void_save_is_fatal_instead_of_silently_successful() {
+    fn failed_save_is_ignored_like_the_target() {
+        // sub_48A140 discards sub_4664F0's result: Sys80:78 has no output
+        // and a failed write is not an error.
         let mut vm = Vm::new();
         vm.start(&program(0x80, "sys1", 0x78));
         vm.stack = vec![Value::Int(0), Value::Str("save".into())];
         let report = vm.run_loaded(&mut PolicyHost, &VmRunOptions::default());
-        assert_eq!(report.stop_reason, VmStopReason::Error);
-        assert!(
-            report
-                .recent_trace
-                .iter()
-                .any(|line| line.contains("save commit failed"))
-        );
+        assert_eq!(report.stop_reason, VmStopReason::Completed);
+        assert!(vm.stack.is_empty());
     }
 
     #[test]
@@ -511,22 +534,34 @@ mod tests {
         assert!(report.recent_trace.is_empty());
     }
 
+    // These snapshot fixtures inspect idle VMs directly, without scheduling
+    // them. Materialize their private test backing before installing bytes.
+    fn materialize_test_memory(vm: &mut Vm) {
+        if vm.memory.is_empty() {
+            vm.memory.resize(crate::HEAP_MEMORY_BASE, 0);
+            if let Some(window) = vm.parked_local.take() {
+                window.restore(&mut vm.memory[crate::LOCAL_MEMORY_BASE as usize..crate::HEAP_MEMORY_BASE]);
+            }
+        }
+    }
+
     fn write_encoded(
         vm: &mut Vm,
         pointer: u32,
         text: &str,
         encoding: &'static encoding_rs::Encoding,
     ) {
+        materialize_test_memory(vm);
         let (bytes, _, errors) = encoding.encode(text);
         assert!(!errors);
-        let start = Vm::memory_addr(pointer) as usize;
+        let start = vm.memory_addr(pointer) as usize;
         vm.memory[start..start + bytes.len()].copy_from_slice(&bytes);
         vm.memory[start + bytes.len()] = 0;
     }
 
     #[test]
     fn raw_pointer_native_dialogs_decode_in_owning_root_or_child_under_both_graph_encodings() {
-        let ptr = 0x1200_3000; // Per-thread local memory at the same guest address.
+        let ptr = 0x0800_3000; // Per-thread local memory at the same guest address.
         for encoding in [encoding_rs::SHIFT_JIS, encoding_rs::GBK] {
             for (id, suffix) in [
                 (0x80, vec![]),
@@ -655,8 +690,8 @@ mod tests {
 
     #[test]
     fn raw_pointer_host_snapshot_uses_graph_encoding_without_decoding_output_pointers() {
-        let text_ptr = 0x1200_3000;
-        let output_ptr = 0x1200_4000;
+        let text_ptr = 0x0800_3000;
+        let output_ptr = 0x0800_4000;
         for (encoding, text) in [
             (encoding_rs::SHIFT_JIS, "日本語"),
             (encoding_rs::GBK, "胧白"),
@@ -716,13 +751,13 @@ mod tests {
     fn native_snapshot_decodes_wrapped_operand_ring_and_preserves_memory_output_isolation() {
         let mut root = Vm::new();
         let mut p = program(0xb0, "usr1", 0x84);
-        p.instructions
-            .extend(program(0x80, "sys1", 0x5f).instructions);
+        std::sync::Arc::make_mut(&mut p.instructions)
+            .extend(program(0x80, "sys1", 0x5f).instructions.iter().cloned());
         root.start_async_program_with_args(Value::Program(std::sync::Arc::new(p)), vec![], false)
             .unwrap();
         let child = &mut root.async_tasks[0].vm;
-        let ptr = 0x1200_3000;
-        let out = 0x1200_4000;
+        let ptr = 0x0800_3000;
+        let out = 0x0800_4000;
         write_encoded(child, ptr, "確認", encoding_rs::SHIFT_JIS);
         child.operand_slots[crate::OPERAND_STACK_CAPACITY - 3] = Value::Ptr(out);
         child.operand_slots[crate::OPERAND_STACK_CAPACITY - 2] = Value::Ptr(ptr);
@@ -732,39 +767,24 @@ mod tests {
         root.run_loaded(&mut host, &VmRunOptions::default());
         assert_eq!(
             host.requests,
-            vec![HostRequest::Native {
-                opcode: NativeOpcode {
-                    group: 0xb0,
-                    id: 0x84
-                },
-                args: vec![
-                    Value::Ptr(out),
-                    Value::Str("確認".into()),
-                    Value::Str("確認".into()),
-                    Value::Int(255)
-                ]
-            }]
+            vec![HostRequest::UserDialog(crate::UserDialogRequest::Input {
+                title: "確認".into(),
+                initial: "確認".into(),
+                max_bytes: 255,
+                numeric: false,
+            })]
         );
-        let offset = Vm::memory_addr(out) as usize;
+        let offset = root.memory_addr(out) as usize;
         root.memory[offset] = 7;
-        root.complete_host_request(
-            1,
-            HostResponse {
-                outputs: vec![Value::Int(0)],
-                writes: vec![HostMemoryWrite {
-                    address: out,
-                    bytes: vec![42],
-                }],
-            },
-        )
-        .unwrap();
+        root.complete_user_dialog(1, Some(crate::UserDialogResponse::Input("*".into())))
+            .unwrap();
         // Accepted response is deferred; neither parent's bytes nor child's
         // local output are changed before its scheduler slice.
         assert_eq!(root.memory[offset], 7);
-        assert_eq!(root.async_tasks[0].vm.memory[offset], 0);
+        assert_eq!(crate::async_program::local_byte(&root.async_tasks[0].vm, offset), 0);
         root.run_loaded(&mut host, &VmRunOptions::default());
         assert_eq!(root.memory[offset], 7);
-        assert_eq!(root.async_tasks[0].vm.memory[offset], 42);
+        assert_eq!(crate::async_program::local_byte(&root.async_tasks[0].vm, offset), b'*');
         assert!(
             root.complete_host_request(1, HostResponse::default())
                 .is_err()
@@ -776,10 +796,10 @@ mod tests {
         let mut vm = Vm::new();
         write_encoded(&mut vm, 0x3000, "選択", encoding_rs::SHIFT_JIS);
         let original = vec![
-            Value::Ptr(0x3000),
-            Value::Ptr(0x3000),
-            Value::Ptr(0x3000),
             Value::Ptr(0x4000),
+            Value::Ptr(0x3000),
+            Value::Ptr(0x3000),
+            Value::Ptr(0x3000),
             Value::Ptr(0x3000),
             Value::Int(1),
         ];
@@ -796,10 +816,10 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                Value::Str("選択".into()),
-                Value::Str("選択".into()),
-                Value::Str("選択".into()),
                 Value::Ptr(0x4000),
+                Value::Str("選択".into()),
+                Value::Str("選択".into()),
+                Value::Str("選択".into()),
                 Value::Str("選択".into()),
                 Value::Int(1)
             ]
@@ -892,23 +912,17 @@ pub struct HostResponse {
 pub(crate) struct PendingHostRequest {
     id: u64,
     output_count: usize,
+    /// Set for `HostRequest::UserDialog`: where the answer is written.
+    pub(crate) user_dialog: Option<crate::user_dialog::UserDialogSink>,
 }
 
-/// Measured Vec backing storage; not a process RSS estimate. Shared heap is
-/// counted once; every live child VM's private memory is counted separately.
+/// Measured Vec backing storage; not a process RSS estimate. The running
+/// thread holds the process memory; every other VM only its own buffer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VmResourceUsage {
     pub vm_count: usize,
     pub memory_bytes: usize,
     pub memory_capacity_bytes: usize,
-    pub shared_heap_bytes: usize,
-    pub shared_heap_capacity_bytes: usize,
-    pub journal_entries: usize,
-    pub journal_capacity_bytes: usize,
-    /// Total covered bytes in journal ranges (not retained byte copies).
-    pub journal_range_bytes: usize,
-    pub shared_generation: u64,
-    pub oldest_consumed_generation: u64,
 }
 
 /// Host-enforced admission limits. Check before scheduling a pass and after
@@ -918,7 +932,6 @@ pub struct VmResourceUsage {
 pub struct VmResourceBudget {
     pub max_vm_count: usize,
     pub max_memory_capacity_bytes: usize,
-    pub max_journal_entries: usize,
 }
 
 impl Vm {
@@ -939,7 +952,11 @@ impl Vm {
                 "invalid or overlapping host request".into(),
             ));
         }
-        self.pending_host_request = Some(PendingHostRequest { id, output_count });
+        self.pending_host_request = Some(PendingHostRequest {
+            id,
+            output_count,
+            user_dialog: None,
+        });
         Ok(true)
     }
 
@@ -948,6 +965,10 @@ impl Vm {
         api: &mut A,
         opcode: NativeOpcode,
     ) -> VmResult<bool> {
+        // Typed UserB0 dialogs suspend after parsing (see user_dialog.rs).
+        if crate::user_dialog::is_user_dialog(opcode.group, opcode.id) {
+            return Ok(false);
+        }
         let Some(argc) = self.effective_arg_count(opcode.group, opcode.id) else {
             return Ok(false);
         };
@@ -1046,8 +1067,20 @@ impl Vm {
                 "host response violates stack output contract".into(),
             ));
         }
+        // A suspended thread does not hold the process memory (see
+        // `hand_over_memory`), so only the address itself is checked here;
+        // `settle_ready_host_response` writes once the thread runs again.
         for write in &response.writes {
-            target.resolve_range(write.address, write.bytes.len())?;
+            let start = target.memory_addr(write.address) as usize;
+            if start
+                .checked_add(write.bytes.len())
+                .is_none_or(|end| end > crate::MAX_MEMORY_SIZE)
+            {
+                return Err(VmError::MemoryOutOfBounds {
+                    addr: write.address,
+                    size: write.bytes.len(),
+                });
+            }
         }
         target.ready_host_response = Some(response);
         target.pending_host_request = None;
@@ -1058,19 +1091,16 @@ impl Vm {
         let Some(response) = self.ready_host_response.take() else {
             return Ok(());
         };
-        // Guest memory cannot shrink while the owning thread is suspended;
-        // scheduling only transfers/enlarges the shared segment in between.
+        // The thread runs again, so it holds the process memory: the writes
+        // land in the globals and heap every thread sees.
         let ranges = response
             .writes
             .iter()
             .map(|write| self.resolve_range(write.address, write.bytes.len()))
             .collect::<VmResult<Vec<_>>>()?;
         for (write, range) in response.writes.into_iter().zip(ranges) {
-            self.memory[range.clone()].copy_from_slice(&write.bytes);
+            self.memory[range].copy_from_slice(&write.bytes);
             self.clear_shadow_values(write.address, write.bytes.len());
-            if range.start >= crate::HEAP_MEMORY_BASE {
-                self.mark_shared_heap_dirty(range);
-            }
         }
         for value in response.outputs {
             self.push_value(value);
@@ -1085,7 +1115,7 @@ impl Vm {
         std::mem::take(&mut self.async_reports)
     }
 
-    fn host_request_vm_mut(&mut self, id: u64) -> Option<&mut Vm> {
+    pub(crate) fn host_request_vm_mut(&mut self, id: u64) -> Option<&mut Vm> {
         if self
             .pending_host_request
             .as_ref()
@@ -1130,25 +1160,26 @@ impl Vm {
     }
 
     pub fn resource_usage(&self) -> VmResourceUsage {
-        let shared = self
-            .shared_heap
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut usage = VmResourceUsage {
-            shared_heap_bytes: shared.bytes.len(),
-            shared_heap_capacity_bytes: shared.bytes.capacity(),
-            journal_entries: shared.journal.len(),
-            journal_capacity_bytes: shared
-                .journal
-                .capacity()
-                .saturating_mul(std::mem::size_of::<crate::SharedHeapJournalEntry>()),
-            journal_range_bytes: shared.journal.iter().map(|entry| entry.range.len()).sum(),
-            shared_generation: shared.generation,
-            oldest_consumed_generation: self.shared_heap_generation,
-            ..VmResourceUsage::default()
-        };
+        let mut usage = VmResourceUsage::default();
         self.add_private_usage(&mut usage);
         usage
+    }
+
+    /// `(task key, runnable, completed, memory length, capacity)` for every
+    /// child VM, depth first, for budget diagnostics.
+    pub fn task_memory_breakdown(&self) -> Vec<(String, bool, bool, usize, usize)> {
+        let mut out = Vec::new();
+        for task in &self.async_tasks {
+            out.push((
+                task.key().to_string(),
+                task.runnable,
+                task.completed,
+                task.vm.memory.len(),
+                task.vm.memory.capacity(),
+            ));
+            out.extend(task.vm.task_memory_breakdown());
+        }
+        out
     }
 
     fn add_private_usage(&self, usage: &mut VmResourceUsage) {
@@ -1157,9 +1188,6 @@ impl Vm {
         usage.memory_capacity_bytes = usage
             .memory_capacity_bytes
             .saturating_add(self.memory.capacity());
-        usage.oldest_consumed_generation = usage
-            .oldest_consumed_generation
-            .min(self.shared_heap_generation);
         for task in &self.async_tasks {
             task.vm.add_private_usage(usage);
         }
@@ -1167,13 +1195,8 @@ impl Vm {
 
     pub fn check_resource_budget(&self, budget: VmResourceBudget) -> VmResult<VmResourceUsage> {
         let usage = self.resource_usage();
-        let capacity = usage
-            .memory_capacity_bytes
-            .saturating_add(usage.shared_heap_capacity_bytes)
-            .saturating_add(usage.journal_capacity_bytes);
         if usage.vm_count > budget.max_vm_count
-            || capacity > budget.max_memory_capacity_bytes
-            || usage.journal_entries > budget.max_journal_entries
+            || usage.memory_capacity_bytes > budget.max_memory_capacity_bytes
         {
             return Err(VmError::Runtime("VM resource budget exceeded".into()));
         }

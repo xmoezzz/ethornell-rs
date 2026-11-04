@@ -23,6 +23,11 @@
 //! The 0x2X aliases run with `256 - p` (the dispatcher's jump table), 0x20 and
 //! 0xC0 are plain aliases of 1 and 5. A format pair a kernel does not handle
 //! leaves the destination unchanged, exactly as the target does.
+//!
+//! Modes 0 and 1 on formats 1/2 are checked against BGI 1.622 under Unicorn
+//! through 91:18's plain-blit path (`sub_40B560`; `bitmap_kernels` vectors):
+//! its format-2 sources are blended in pixel pairs (`sub_40B1B0`,
+//! `sub_40B330`, `sub_40BD00`), the odd last pixel of a row in integers.
 
 use ethornell_image::DecodedImage;
 
@@ -80,6 +85,35 @@ fn for_each_pixel(
     }
 }
 
+/// Like `for_each_pixel`, but in the SSE kernels' order: each clipped row
+/// two pixels at a time, then the odd last pixel through the scalar path.
+fn for_each_pair(
+    destination: &mut DecodedImage,
+    source: &DecodedImage,
+    x: i32,
+    y: i32,
+    mut pair: impl FnMut(&[u8; 8], &mut [u8; 8]),
+    mut tail: impl FnMut(&[u8; 4], &mut [u8; 4]),
+) {
+    let Some(c) = clip(destination, source, x, y) else {
+        return;
+    };
+    for row in 0..c.height {
+        let s_base = ((c.src_y + row) * source.width as usize + c.src_x) * 4;
+        let d_base = ((c.dst_y + row) * destination.width as usize + c.dst_x) * 4;
+        for col in (0..c.width & !1).step_by(2) {
+            let at = |base: usize| base + col * 4..base + col * 4 + 8;
+            let s: [u8; 8] = source.rgba[at(s_base)].try_into().unwrap();
+            pair(&s, (&mut destination.rgba[at(d_base)]).try_into().unwrap());
+        }
+        if c.width & 1 != 0 {
+            let at = |base: usize| base + (c.width - 1) * 4..base + c.width * 4;
+            let s: [u8; 4] = source.rgba[at(s_base)].try_into().unwrap();
+            tail(&s, (&mut destination.rgba[at(d_base)]).try_into().unwrap());
+        }
+    }
+}
+
 fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
@@ -111,49 +145,119 @@ pub(crate) fn blit_alpha_over(
             true
         }
         (2, 1) => {
-            // sub_40B130: skip alpha < 2; 7-bit alpha; 127 copies the colour.
-            for_each_pixel(destination, source, x, y, |s, d| {
-                if s[3] < 2 {
-                    return;
-                }
+            // sub_40B1B0: a pair is skipped when both alphas are 0 and
+            // copied raw when both are >= 254; otherwise both pixels take
+            // the 7-bit alpha weights. The odd last pixel skips alpha < 2
+            // and copies the colour with alpha 0 at 254/255.
+            let blend = |s: &[u8], d: &mut [u8]| {
                 let k = i32::from(s[3] >> 1);
-                if k == 127 {
-                    *d = [s[0], s[1], s[2], 0];
-                } else {
-                    // unk_50B0F0 weights are [k, k, k, 0]: the fourth byte
-                    // keeps its value.
-                    for lane in 0..3 {
-                        d[lane] = lerp7(d[lane], s[lane], k);
-                    }
+                // unk_50B0F0 weights are [k, k, k, 0]: the fourth byte
+                // keeps its value.
+                for lane in 0..3 {
+                    d[lane] = lerp7(d[lane], s[lane], k);
                 }
-            });
+            };
+            for_each_pair(
+                destination,
+                source,
+                x,
+                y,
+                |s, d| {
+                    if s[3] == 0 && s[7] == 0 {
+                        return;
+                    }
+                    if s[3] >= 254 && s[7] >= 254 {
+                        *d = *s;
+                        return;
+                    }
+                    blend(&s[..4], &mut d[..4]);
+                    blend(&s[4..], &mut d[4..]);
+                },
+                |s, d| {
+                    if s[3] < 2 {
+                        return;
+                    }
+                    if s[3] >> 1 == 127 {
+                        *d = [s[0], s[1], s[2], 0];
+                    } else {
+                        blend(s, d);
+                    }
+                },
+            );
             true
         }
         (2, 2) => {
-            // sub_40B200: straight-alpha source-over with 8.8 weights.
-            for_each_pixel(destination, source, x, y, |s, d| {
-                let sa = u32::from(s[3]);
-                if sa == 0 {
-                    return;
-                }
-                if sa == 255 {
-                    *d = *s;
-                    return;
-                }
-                let weighted_dst = (256 - sa) * u32::from(d[3]);
-                let total = weighted_dst + (sa << 8);
-                let wd = (weighted_dst << 8) / total;
-                let ws = (sa << 16) / total;
-                for lane in 0..3 {
-                    let mixed = (u32::from(d[lane]) * wd + u32::from(s[lane]) * ws) & 0xffff;
-                    d[lane] = (mixed >> 8).min(255) as u8;
-                }
-                d[3] = ((total >> 8) & 0xff) as u8;
-            });
+            // sub_40B330.
+            for_each_pair(destination, source, x, y, |s, d| alpha_over_pair(s, d, None), alpha_over_scalar);
             true
         }
         _ => false,
     }
+}
+
+/// The odd last pixel of `sub_40B330` (format 2 over format 2): integer
+/// straight-alpha source-over with 8.8 weights.
+fn alpha_over_scalar(s: &[u8; 4], d: &mut [u8; 4]) {
+    let sa = u32::from(s[3]);
+    if sa == 0 {
+        return;
+    }
+    if sa == 255 {
+        *d = *s;
+        return;
+    }
+    let weighted_dst = (256 - sa) * u32::from(d[3]);
+    let total = weighted_dst + (sa << 8);
+    let wd = (weighted_dst << 8) / total;
+    let ws = (sa << 16) / total;
+    for lane in 0..3 {
+        let mixed = (u32::from(d[lane]) * wd + u32::from(s[lane]) * ws) & 0xffff;
+        d[lane] = (mixed >> 8).min(255) as u8;
+    }
+    d[3] = ((total >> 8) & 0xff) as u8;
+}
+
+/// Two pixels of `sub_40B330` (BGI 1.622, `scale` None) or `sub_40BD00`
+/// (`scale` = 256 - parameter): skipped when both source alphas are 0;
+/// `sub_40B330` copies a pair whose alphas are both 255. Otherwise both
+/// go through the SSE float weights: `a = sa` (times `scale / 256`),
+/// `lower = da / 256 * (256 - a)`, `total = lower + a`, then
+/// `rcpps(total) * [a, lower] * 256` truncated into the `qword_50B900`
+/// tables. `rcpps` is modelled as the exact single-precision reciprocal
+/// (as under Unicorn); hardware approximates it to 12 bits, differently
+/// per CPU vendor.
+fn alpha_over_pair(s: &[u8; 8], d: &mut [u8; 8], scale: Option<u32>) {
+    if s[3] == 0 && s[7] == 0 {
+        return;
+    }
+    if scale.is_none() && s[3] == 255 && s[7] == 255 {
+        *d = *s;
+        return;
+    }
+    let factor = scale.map(|keep| 0.003_906_25 * keep as f32);
+    let mut out = [0u8; 8];
+    for pixel in 0..2 {
+        let base = pixel * 4;
+        let sa = factor.map_or(f32::from(s[base + 3]), |factor| f32::from(s[base + 3]) * factor);
+        let da = f32::from(d[base + 3]);
+        let lower = da * 0.003_906_25 * (256.0 - sa);
+        let total = lower + sa;
+        let reciprocal = 1.0 / total;
+        let weight = |part: f32| {
+            let value = reciprocal * part * 256.0;
+            // cvttps2dq: NaN / out of range is 0x80000000, whose table
+            // entry (index * 16 wraps) is entry 0.
+            if value.is_finite() && value.abs() < 2_147_483_648.0 { value as i32 as u32 & 0xFFFF } else { 0 }
+        };
+        let (ws, wd) = (weight(sa), weight(lower));
+        for lane in 0..3 {
+            let mixed = (u32::from(s[base + lane]) * ws + u32::from(d[base + lane]) * wd) & 0xffff;
+            out[base + lane] = (mixed >> 8).min(255) as u8;
+        }
+        let alpha = if total.is_finite() { total as i32 } else { i32::MIN };
+        out[base + 3] = (alpha as u16 as i16).clamp(0, 255) as u8;
+    }
+    *d = out;
 }
 
 /// Mode 1/0x20 with a transparency parameter `1..=255`
@@ -212,7 +316,8 @@ pub(crate) fn blit_alpha_over_parameter(
             true
         }
         (2, 2) => {
-            for_each_pixel(destination, source, x, y, |s, d| {
+            // sub_40BD00: SSE pairs, the odd last pixel in integers.
+            for_each_pair(destination, source, x, y, |s, d| alpha_over_pair(s, d, Some(coverage)), |s, d| {
                 if s[3] == 0 {
                     return;
                 }
@@ -882,34 +987,17 @@ pub(crate) fn crossfade_cache(
     }
     let width = primary.width.min(secondary.width);
     let height = primary.height.min(secondary.height);
-    let t = transition;
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
     for y in 0..height as usize {
         for x in 0..width as usize {
-            let p = &primary.rgba[(y * primary.width as usize + x) * 4..][..4];
-            let s = &secondary.rgba[(y * secondary.width as usize + x) * 4..][..4];
-            let out = &mut rgba[(y * width as usize + x) * 4..][..4];
-            if format == 1 {
-                for lane in 0..4 {
-                    // pmulhw((s - p) << 4, t << 4): an arithmetic >> 16.
-                    let delta = ((i32::from(s[lane]) - i32::from(p[lane])) << 4) as i16;
-                    let product = (i32::from(delta) * i32::from((t << 4) as i16)) >> 16;
-                    out[lane] = (i32::from(p[lane]) + product).clamp(0, 255) as u8;
-                }
-            } else {
-                let weighted_primary = (256 - t) * i32::from(p[3]);
-                let total = (weighted_primary + t * i32::from(s[3])) as u32;
-                if total == 0 {
-                    continue;
-                }
-                let weight = ((weighted_primary << 7) as u32 / total) as i32;
-                for lane in 0..3 {
-                    let delta = i32::from(p[lane]) - i32::from(s[lane]);
-                    let mixed = ((delta * weight) as i16 >> 7) as i32 + i32::from(s[lane]);
-                    out[lane] = mixed.clamp(0, 255) as u8;
-                }
-                out[3] = (total >> 8).min(255) as u8;
-            }
+            let p = primary.rgba[(y * primary.width as usize + x) * 4..][..4]
+                .try_into()
+                .unwrap();
+            let s = secondary.rgba[(y * secondary.width as usize + x) * 4..][..4]
+                .try_into()
+                .unwrap();
+            rgba[(y * width as usize + x) * 4..][..4]
+                .copy_from_slice(&crossfade_pixel(p, s, format, transition));
         }
     }
     Some(DecodedImage {
@@ -917,6 +1005,31 @@ pub(crate) fn crossfade_cache(
         height,
         rgba,
     })
+}
+
+pub(crate) fn crossfade_pixel(p: [u8; 4], s: [u8; 4], format: i32, t: i32) -> [u8; 4] {
+    let mut out = [0; 4];
+    if format == 1 {
+        for lane in 0..4 {
+            let delta = ((i32::from(s[lane]) - i32::from(p[lane])) << 4) as i16;
+            let product = (i32::from(delta) * i32::from((t << 4) as i16)) >> 16;
+            out[lane] = (i32::from(p[lane]) + product).clamp(0, 255) as u8;
+        }
+    } else {
+        let weighted_primary = (256 - t) * i32::from(p[3]);
+        let total = (weighted_primary + t * i32::from(s[3])) as u32;
+        if total == 0 {
+            return out;
+        }
+        let weight = ((weighted_primary << 7) as u32 / total) as i32;
+        for lane in 0..3 {
+            let delta = i32::from(p[lane]) - i32::from(s[lane]);
+            out[lane] =
+                (((delta * weight) as i16 >> 7) as i32 + i32::from(s[lane])).clamp(0, 255) as u8;
+        }
+        out[3] = (total >> 8).min(255) as u8;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1022,12 +1135,21 @@ mod tests {
         let mut dst = image(&[[100, 100, 100, 0]; 3]);
         let src = image(&[[200, 0, 50, 255], [200, 0, 50, 128], [200, 0, 50, 1]]);
         assert!(blit_alpha_over(&mut dst, 1, &src, 2, 0, 0));
-        // alpha 255 -> k = 127 -> exact colour, fourth byte cleared.
-        assert_eq!(&dst.rgba[0..4], &[200, 0, 50, 0]);
+        // A pair (255, 128) blends both: k = 127 is d + ((s - d) * 127 >> 7),
+        // fourth byte kept.
+        assert_eq!(&dst.rgba[0..4], &[199, 0, 50, 0]);
         // alpha 128 -> k = 64: d + ((s - d) * 64 >> 7)
         assert_eq!(&dst.rgba[4..7], &[150, 50, 75]);
-        // alpha 1 is skipped (the target tests `& 0xFE000000`).
+        // The odd last pixel: alpha 1 is skipped (`& 0xFE000000`) ...
         assert_eq!(&dst.rgba[8..11], &[100, 100, 100]);
+        // ... and k = 127 copies the colour with the fourth byte cleared.
+        let mut dst = image(&[[100, 100, 100, 9]]);
+        assert!(blit_alpha_over(&mut dst, 1, &image(&[[200, 0, 50, 255]]), 2, 0, 0));
+        assert_eq!(dst.rgba, [200, 0, 50, 0]);
+        // A pair with both alphas >= 254 is copied raw.
+        let mut dst = image(&[[100, 100, 100, 9]; 2]);
+        assert!(blit_alpha_over(&mut dst, 1, &image(&[[200, 0, 50, 254], [1, 2, 3, 255]]), 2, 0, 0));
+        assert_eq!(dst.rgba, [200, 0, 50, 254, 1, 2, 3, 255]);
     }
 
     #[test]

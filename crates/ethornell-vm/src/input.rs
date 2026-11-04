@@ -115,7 +115,7 @@ impl Vm {
     }
 
     fn read_zero_terminated_input_descriptors(&self, ptr: u32) -> VmResult<Vec<i32>> {
-        let base = Self::memory_addr(ptr) as usize;
+        let base = self.memory_addr(ptr) as usize;
         let mut descriptors = Vec::new();
         for index in 0..16usize {
             let offset = base.saturating_add(index.saturating_mul(4));

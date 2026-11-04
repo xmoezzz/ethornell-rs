@@ -1,0 +1,17 @@
+[package]
+name = "ethornell-console"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+[lib]
+crate-type = ["rlib", "staticlib"]
+[workspace]
+[dependencies]
+ethornell-app = { path = "../../crates/ethornell-app", default-features = false, features = ["console"] }
+ethornell-render = { path = "../../crates/ethornell-render", default-features = false, features = ["native-gpu"] }
+ethornell-audio = { path = "../../crates/ethornell-audio" }
+ethornell-archive = { path = "../../crates/ethornell-archive" }
+
+[target.'cfg(target_os="horizon")'.dependencies]
+# Must match the patched newlib ABI used by build-std.
+libc = "=0.2.178"

@@ -1,3 +1,4 @@
+use ethornell_image::DecodedImage;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -99,9 +100,14 @@ impl BurikoMovieRegistry {
         Ok(handle)
     }
 
-    pub(crate) fn validate_decode(
+    /// Graph90:F6: sub_405F10 (synchronous) and sub_405E00 (DCProcDecodeBMV)
+    /// check the handle (3), frame (4) and destination bitmap (5), then decode
+    /// the frame over the destination's pixels (sub_49CBD0/sub_49CC10 ->
+    /// sub_49CC40).
+    pub(crate) fn decode_frame(
         &self,
         destination_info: Option<(u32, u32, i32)>,
+        destination_pixels: Option<&mut DecodedImage>,
         source: i32,
         frame_index: i32,
     ) -> i32 {
@@ -121,11 +127,15 @@ impl BurikoMovieRegistry {
         {
             return 5;
         }
-        // The target reaches status 6 only when its proprietary BMV frame
-        // decoder fails after all handle/header/bitmap checks. The portable
-        // backend currently validates the complete public contract but cannot
-        // decode that codec yet.
-        6
+        // The target reaches status 6 only when its BMV frame decoder fails
+        // after all handle/header/bitmap checks.
+        let Some(pixels) = destination_pixels else {
+            return 6;
+        };
+        match ethornell_image::decode_bf_movie_frame(&resource.bytes, frame_index as u32, pixels) {
+            Ok(()) => 0,
+            Err(_) => 6,
+        }
     }
 }
 
@@ -143,9 +153,41 @@ fn parse_buriko_movie_header(bytes: &[u8]) -> Option<[i32; 5]> {
     Some([read(20), read(24), read(32), read(36), read(40)])
 }
 
+/// An 8 x 8 BF_Movie of one frame: one grey block (Y DC 400, level 178) with
+/// opaque alpha, Huffman-coded by hand.
+#[cfg(test)]
+pub(crate) fn decodable_test_movie() -> Vec<u8> {
+    let mut bytes = BURIKO_MOVIE_MAGIC.to_vec();
+    for value in [0x10001_u32, 8, 8, 32, 2, 3, 1, 30, 0, 0, 0, 0] {
+        bytes.extend(value.to_le_bytes());
+    }
+    // Quantizers 1, then the frame table.
+    bytes.extend([1u8; 128]);
+    bytes.extend(196u32.to_le_bytes());
+    // DC weights: two 9-bit differences (code 1) and one 0-bit (code 0); AC
+    // weights: three end-of-block codes (code 0).
+    let mut weights = [0u8; 16 + 176];
+    weights[0] = 1;
+    weights[9] = 2;
+    weights[16] = 3;
+    bytes.extend(weights);
+    // The strip after this table, then the alpha.
+    bytes.extend(200u32.to_le_bytes());
+    bytes.extend(207u32.to_le_bytes());
+    // Block mask, 192 coefficients, DC codes 1 +400, 1 -400, 0; AC 0, 0, 0.
+    bytes.extend([0b1, 0xc0, 0x01, 0b1110_0100, 0b0010_0110, 0b1111_0000, 0]);
+    // Alpha mode 1: one 0xFF byte, then copies of the pixel to the left.
+    bytes.extend(1u32.to_le_bytes());
+    bytes.extend([0b10, 0xff, 0x3f, 0xfe]);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BURIKO_MOVIE_MAGIC, BurikoMovieRegistry, parse_buriko_movie_header};
+    use super::{
+        BURIKO_MOVIE_MAGIC, BurikoMovieRegistry, DecodedImage, decodable_test_movie,
+        parse_buriko_movie_header,
+    };
 
     fn movie_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 64];
@@ -174,5 +216,55 @@ mod tests {
         assert_eq!(registry.attach(root), Err(7));
         assert_eq!(registry.release(child), 0);
         assert!(registry.attach(root).is_ok());
+    }
+
+    #[test]
+    fn decode_frame_checks_the_contract_then_draws_the_frame() {
+        let mut registry = BurikoMovieRegistry::default();
+        let (movie, metadata) = registry
+            .load(String::new(), "movie.bmv".into(), decodable_test_movie())
+            .unwrap();
+        assert_eq!(metadata, [8, 8, 2, 3, 1]);
+        let info = Some((8, 8, 2));
+        let mut pixels = DecodedImage {
+            width: 8,
+            height: 8,
+            rgba: vec![0; 8 * 8 * 4],
+        };
+        assert_eq!(
+            registry.decode_frame(info, Some(&mut pixels), movie + 1, 0),
+            3
+        );
+        assert_eq!(registry.decode_frame(info, Some(&mut pixels), movie, 1), 4);
+        assert_eq!(
+            registry.decode_frame(Some((8, 8, 1)), Some(&mut pixels), movie, 0),
+            5
+        );
+        assert!(pixels.rgba.iter().all(|&byte| byte == 0));
+        assert_eq!(registry.decode_frame(info, Some(&mut pixels), movie, 0), 0);
+        assert!(
+            pixels
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel == [178, 178, 178, 255])
+        );
+    }
+
+    #[test]
+    fn a_frame_that_fails_to_decode_is_status_6() {
+        // movie_bytes() has the header fields the contract checks, no frames.
+        let mut registry = BurikoMovieRegistry::default();
+        let (movie, _) = registry
+            .load(String::new(), "movie.bmv".into(), movie_bytes())
+            .unwrap();
+        let mut pixels = DecodedImage {
+            width: 640,
+            height: 480,
+            rgba: vec![0; 640 * 480 * 4],
+        };
+        assert_eq!(
+            registry.decode_frame(Some((640, 480, 4)), Some(&mut pixels), movie, 0),
+            6
+        );
     }
 }

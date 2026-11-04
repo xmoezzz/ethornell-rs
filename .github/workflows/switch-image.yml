@@ -1,0 +1,64 @@
+name: Switch build image
+
+# The Nintendo Switch build environment (platform/switch/docker/Dockerfile) on this
+# repository's GHCR, tagged with the Dockerfile's hash: it is built only when
+# the Dockerfile changes, and every NRO build reuses it.
+on:
+  workflow_call:
+    outputs:
+      image:
+        description: The image to build the NRO in
+        value: ${{ jobs.image.outputs.image }}
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: switch build image
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image reference
+        id: ref
+        run: |
+          set -euo pipefail
+          hash="$(sha256sum platform/switch/docker/Dockerfile | cut -c1-16)"
+          name="ghcr.io/${GITHUB_REPOSITORY,,}/switch-build"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "image=$name:$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for an existing image
+        id: exists
+        run: |
+          if docker manifest inspect "${{ steps.ref.outputs.image }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        if: steps.exists.outputs.found != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: platform/switch/docker
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.image }}
+            ${{ steps.ref.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Nintendo Switch build environment for ethornell-rs

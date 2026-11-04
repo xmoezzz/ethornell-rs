@@ -101,18 +101,17 @@ impl Vm {
     }
 
     pub(crate) fn scenario_guarded_read_int(&self, ptr: u32, width: u8) -> Option<u32> {
-        if width < 2 {
+        if width < 2 || self.loaded_bcs_ranges.is_empty() {
             return None;
         }
 
         let code_base = self.read_raw_u32(SCRIPT_CODE_BASE_SLOT)?;
-        let code_base_addr = Self::memory_addr(code_base);
         let current_offset = self.read_raw_u32(SCRIPT_CURRENT_OFFSET_SLOT)?;
-        if Self::memory_addr(ptr) != Self::memory_addr(code_base.wrapping_add(current_offset)) {
+        let ptr_addr = self.memory_addr(ptr);
+        if ptr_addr != self.memory_addr(code_base.wrapping_add(current_offset)) {
             return None;
         }
 
-        let ptr_addr = Self::memory_addr(ptr);
         if self.loaded_bcs_ranges.iter().any(|range| {
             ptr_addr >= range.base.saturating_add(range.code_start)
                 && ptr_addr < range.base.saturating_add(range.code_end)
@@ -120,6 +119,7 @@ impl Vm {
             return None;
         }
 
+        let code_base_addr = self.memory_addr(code_base);
         let range = self.loaded_bcs_ranges.iter().find(|range| {
             code_base_addr >= range.base
                 && code_base_addr < range.base.saturating_add(range.total_len)
@@ -146,7 +146,7 @@ impl Vm {
         total_len: usize,
         program: &ethornell_script::bcs::BcsProgram,
     ) {
-        let base = Self::memory_addr(base);
+        let base = self.memory_addr(base);
         self.loaded_bcs_ranges
             .retain(|range| !(range.base == base && range.script_name == script_name));
         self.loaded_bcs_ranges.push(LoadedBcsRange {
@@ -199,7 +199,7 @@ impl Vm {
                 }
                 let addr = bcs_base.saturating_add(string_ref.offset);
                 self.mem_values
-                    .insert(Self::value_key(addr), Value::Str(string_ref.text.clone()));
+                    .insert(self.value_key(addr), Value::Str(string_ref.text.clone()));
                 written += 1;
             }
         }
@@ -245,7 +245,7 @@ impl Vm {
         let Some(handle) = self.read_raw_u32(SCRIPT_FUNCTION_TABLE_SLOT) else {
             return Ok(0);
         };
-        if handle == 0 || !self.record_tables.contains_key(&Self::value_key(handle)) {
+        if handle == 0 || !self.record_tables.contains_key(&self.value_key(handle)) {
             tracing::warn!(subs = program.subs.len(), "BCS function table is not open");
             return Ok(0);
         }
@@ -253,7 +253,7 @@ impl Vm {
         let script_index = self
             .read_raw_u32(SCRIPT_INFO_COUNT_SLOT)
             .unwrap_or_default();
-        let bcs_base = Self::memory_addr(bcs_base);
+        let bcs_base = self.memory_addr(bcs_base);
         if std::env::var_os("DEBUG").is_some() {
             tracing::info!(
                 script_index,
@@ -295,14 +295,14 @@ impl Vm {
                 .saturating_add(field_bias)
                 .saturating_add((index as u32).saturating_mul(4));
             self.mem_values
-                .insert(Self::value_key(addr), Value::Str(text.to_string()));
+                .insert(self.value_key(addr), Value::Str(text.to_string()));
             written += 1;
         }
         for string_ref in &command.string_refs {
             if !string_ref.text.is_empty() {
                 let addr = bcs_base.saturating_add(string_ref.offset);
                 self.mem_values
-                    .insert(Self::value_key(addr), Value::Str(string_ref.text.clone()));
+                    .insert(self.value_key(addr), Value::Str(string_ref.text.clone()));
                 written += 1;
             }
         }
@@ -310,7 +310,7 @@ impl Vm {
     }
 
     fn read_raw_u32(&self, ptr: u32) -> Option<u32> {
-        let start = Self::memory_addr(ptr) as usize;
+        let start = self.memory_addr(ptr) as usize;
         let bytes = self.memory.get(start..start.checked_add(4)?)?;
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
@@ -341,7 +341,7 @@ fn value_text(value: &BcsValue) -> Option<&str> {
     }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
@@ -359,7 +359,8 @@ mod tests {
     #[test]
     fn guarded_fetch_returns_ret_even_after_the_loaded_file_boundary() {
         let mut vm = Vm::new();
-        let raw_base = 0x1220_0614u32;
+        // The scenario arena is a heap block the scripts allocate.
+        let raw_base = vm.alloc_heap(0x6_0000) + 0x614;
         let current_offset = 0x0001_0000u32;
         vm.memory[SCRIPT_CODE_BASE_SLOT as usize..SCRIPT_CODE_BASE_SLOT as usize + 4]
             .copy_from_slice(&raw_base.to_le_bytes());
@@ -367,7 +368,7 @@ mod tests {
             .copy_from_slice(&current_offset.to_le_bytes());
         vm.loaded_bcs_ranges.push(LoadedBcsRange {
             script_name: "main".into(),
-            base: Vm::memory_addr(raw_base),
+            base: vm.memory_addr(raw_base),
             code_start: 0x60,
             code_end: 0x0a98,
             total_len: 3003,
@@ -382,8 +383,8 @@ mod tests {
     #[test]
     fn guarded_fetch_allows_code_in_another_bcs_in_the_same_arena() {
         let mut vm = Vm::new();
-        let raw_base = 0x1220_0614u32;
-        let target_base = 0x1224_6084u32;
+        let raw_base = vm.alloc_heap(0x6_0000) + 0x614;
+        let target_base = raw_base + 0x4_5A70;
         let target_offset = target_base.wrapping_sub(raw_base).saturating_add(0x7a78);
         vm.memory[SCRIPT_CODE_BASE_SLOT as usize..SCRIPT_CODE_BASE_SLOT as usize + 4]
             .copy_from_slice(&raw_base.to_le_bytes());
@@ -391,14 +392,14 @@ mod tests {
             .copy_from_slice(&target_offset.to_le_bytes());
         vm.loaded_bcs_ranges.push(LoadedBcsRange {
             script_name: "main".into(),
-            base: Vm::memory_addr(raw_base),
+            base: vm.memory_addr(raw_base),
             code_start: 0x60,
             code_end: 0x0ae0,
             total_len: 3003,
         });
         vm.loaded_bcs_ranges.push(LoadedBcsRange {
             script_name: "function".into(),
-            base: Vm::memory_addr(target_base),
+            base: vm.memory_addr(target_base),
             code_start: 0x550,
             code_end: 0x7c44,
             total_len: 63_940,

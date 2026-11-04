@@ -72,6 +72,15 @@ int Graph90_33_SetObjectPosition(struct CThread *t)
 
 // ------------------------------------- Graph90:57 ReplaceSpriteBitmap ---
 
+// Graph90:38 property 0x10 enters the very same sprite_replace_primary;
+// `extra` is ignored. Unlike selector 57, the property wrapper does NOT
+// first check bitmap < 0x4000: inert modes 1/3/4 accept any value, while
+// missing resources in 0/2/5/6 cause -65534 -> manager status 254 -> script
+// error. Preserve current position, transform, alpha and sort state. In
+// modes 5/6, clear the secondary/transition and retain the new primary for
+// every later reprojection. BGI 1.622 equivalents are sub_428940 (virtual
+// SetProperty) -> sub_427670 (rebuild); raw/bgi1622/90_sprite_property.*.
+
 // sub_4272F0: rebuild the current mode with the existing geometry.
 static int sprite_replace_primary(struct CDspObjSprite *s, uint32_t bitmap)
 {
@@ -276,3 +285,17 @@ int Graph90_53_RefreshSpriteRect(struct CThread *t)
 // transition at +0x240; the draw (sub_4258D0 case 1) mixes primary and
 // secondary through sub_40C0F0 (see the kernels above) before applying the
 // object's own alpha.
+
+// BGI 1.622 90:3C -> 443E10 -> 41BF70: independent copied hit bit plane.
+// -1 removes it (rectangle acceptance), -2 installs a zero-filled plane.
+// Formats 0/1/2/3 test WORD !=0 / RGB24 !=0 / alpha !=0 / BYTE !=0.
+// Rows are ceil(width/8) bytes; x occupies bit (x&7), least significant first.
+// 90:3D -> 4625D0 subtracts the object's resolved origin from the cursor,
+// then calls vtable+100 with check_extent=1. 41C0F0 returns the MASKED BIT,
+// not a normalized Boolean. Knob forwards to its controlled target.
+static unsigned native_hit_plane(const unsigned char *bits, unsigned width,
+    unsigned height, int x, int y) {
+    if (x < 0 || y < 0 || (unsigned)x >= width || (unsigned)y >= height)
+        return 0;
+    return bits ? bits[y*((width+7)/8)+(x>>3)] & (1u<<(x&7)) : 1;
+}

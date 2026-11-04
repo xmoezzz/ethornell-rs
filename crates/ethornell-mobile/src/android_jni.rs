@@ -263,6 +263,63 @@ pub extern "system" fn Java_com_xmoezzz_ethornell_NativeEngine_nativeCompleteReq
     unsafe { ethornell_android_complete_request(handle as u64, request_id as u64, &response) }
 }
 
+/// The JSON description of a kind-5 dialog request, or null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_xmoezzz_ethornell_NativeEngine_nativeRequestPayload(
+    env: JNIEnv,
+    _: JClass,
+    handle: jlong,
+    request_id: jlong,
+) -> jstring {
+    let size = unsafe {
+        ethornell_android_request_payload(handle as u64, request_id as u64, std::ptr::null_mut(), 0)
+    };
+    if size <= 1 {
+        return std::ptr::null_mut();
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let copied = unsafe {
+        ethornell_android_request_payload(
+            handle as u64,
+            request_id as u64,
+            buffer.as_mut_ptr(),
+            size as u32,
+        )
+    };
+    if copied != size {
+        return std::ptr::null_mut();
+    }
+    buffer.pop();
+    let text = String::from_utf8_lossy(&buffer);
+    env.new_string(text)
+        .map(|text| text.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Answers a kind-5 dialog request with JSON text.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_xmoezzz_ethornell_NativeEngine_nativeCompleteDialog(
+    mut env: JNIEnv,
+    _: JClass,
+    handle: jlong,
+    request_id: jlong,
+    answer: JString,
+) -> jint {
+    let Some(answer) = java_string(&mut env, &answer).filter(|answer| !answer.is_empty()) else {
+        return fail(ARG, "empty dialog answer");
+    };
+    let response = ResponseV1 {
+        struct_size: std::mem::size_of::<ResponseV1>() as u32,
+        result: 0,
+        text: StringV1 {
+            ptr: answer.as_ptr(),
+            len: answer.len() as u32,
+            reserved: 0,
+        },
+    };
+    unsafe { ethornell_android_complete_request(handle as u64, request_id as u64, &response) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_xmoezzz_ethornell_NativeEngine_nativeDestroy(
     _: JNIEnv,

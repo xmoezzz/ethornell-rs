@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ethornell</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="launcher">
+    <h1>Ethornell</h1>
+    <p>Plays BGI/Ethornell games in the browser. Pick the game folder (the one
+      holding <code>system.arc</code> and <code>data*.arc</code>). The files stay
+      on this computer; they are read in place, never uploaded or copied.</p>
+    <div class="row">
+      <label class="button">Open game folder…
+        <input id="folder" type="file" webkitdirectory multiple hidden>
+      </label>
+      <label class="button secondary">Choose font…
+        <input id="font" type="file" accept=".ttf,.otf,.ttc" hidden>
+      </label>
+    </div>
+    <p id="font-status" class="hint"></p>
+    <details>
+      <summary>Options</summary>
+      <label><input id="gbk" type="checkbox"> Chinese (GBK) script text</label>
+      <label><input id="silent" type="checkbox"> No sound</label>
+    </details>
+    <p id="status" class="hint" role="status"></p>
+  </main>
+  <div id="stage" hidden>
+    <canvas id="screen" tabindex="0"></canvas>
+  </div>
+  <dialog id="prompt">
+    <form method="dialog">
+      <h2 id="prompt-title"></h2>
+      <p id="prompt-text"></p>
+      <div id="prompt-fields"></div>
+      <menu id="prompt-buttons"></menu>
+    </form>
+  </dialog>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

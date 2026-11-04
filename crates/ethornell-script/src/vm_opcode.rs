@@ -513,6 +513,96 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         confidence: "medium",
         evidence: "current VM implementation",
     },
+    // 0x56 fixed_mul: Multiply two 16.16 fixed-point values.
+    BpOpcodeSpec {
+        code: 0x56,
+        symbol: "fixed_mul",
+        stack_effect: "2 -> 1",
+        immediate: "none",
+        description: "Multiply two 16.16 fixed-point values.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x57 fixed_div: Divide two 16.16 fixed-point values; a zero divisor gives 0.
+    BpOpcodeSpec {
+        code: 0x57,
+        symbol: "fixed_div",
+        stack_effect: "2 -> 1",
+        immediate: "none",
+        description: "Divide two 16.16 fixed-point values; a zero divisor gives 0.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x58 vec4_add: Add two four-lane 16.16 vectors into a destination.
+    BpOpcodeSpec {
+        code: 0x58,
+        symbol: "vec4_add",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Add two four-lane 16.16 vectors into a destination.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x59 vec4_sub: Subtract two four-lane 16.16 vectors into a destination.
+    BpOpcodeSpec {
+        code: 0x59,
+        symbol: "vec4_sub",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Subtract two four-lane 16.16 vectors into a destination.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x5A vec4_mul: Multiply two four-lane 16.16 vectors lane by lane.
+    BpOpcodeSpec {
+        code: 0x5A,
+        symbol: "vec4_mul",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Multiply two four-lane 16.16 vectors lane by lane.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x5B vec4_div: Divide two four-lane 16.16 vectors lane by lane; a zero lane gives 0.
+    BpOpcodeSpec {
+        code: 0x5B,
+        symbol: "vec4_div",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Divide two four-lane 16.16 vectors lane by lane; a zero lane gives 0.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x5D vec3_normalize: Normalize x, y, z of a 16.16 vector and store the length in w.
+    BpOpcodeSpec {
+        code: 0x5D,
+        symbol: "vec3_normalize",
+        stack_effect: "2 -> 0",
+        immediate: "none",
+        description: "Normalize x, y, z of a 16.16 vector and store the length in w.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x5E vec4_scale: Multiply a four-lane 16.16 vector by a 16.16 scalar.
+    BpOpcodeSpec {
+        code: 0x5E,
+        symbol: "vec4_scale",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Multiply a four-lane 16.16 vector by a 16.16 scalar.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
+    // 0x5F vec4_div_scalar: Divide a four-lane 16.16 vector by a 16.16 scalar; zero gives a zero vector.
+    BpOpcodeSpec {
+        code: 0x5F,
+        symbol: "vec4_div_scalar",
+        stack_effect: "3 -> 0",
+        immediate: "none",
+        description: "Divide a four-lane 16.16 vector by a 16.16 scalar; zero gives a zero vector.",
+        confidence: "high",
+        evidence: "senmomo BGI.exe interpreter table 0x506300 (sub_4747C0..sub_474B40)",
+    },
     // 0x60 memory_copy: Pop destination, source and byte count and copy bytes.
     BpOpcodeSpec {
         code: 0x60,

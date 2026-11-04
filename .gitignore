@@ -31,3 +31,6 @@ docs/
 
 .DS_Store
 /dist
+
+# Packaged platform builds (platform/wasm/build.sh)
+/build/

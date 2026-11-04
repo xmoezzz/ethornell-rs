@@ -41,7 +41,29 @@ pub(crate) fn game_root_path(manager: &ResourceManager) -> PathBuf {
         .unwrap_or_else(|_| root.to_path_buf())
 }
 
-fn normalize_runtime_native_path(file: &str) -> String {
+pub(crate) fn script_game_root(native_root: &Path) -> String {
+    if cfg!(target_os = "windows") {
+        native_root.to_string_lossy().into_owned()
+    } else {
+        // BP stores paths in Shift-JIS buffers. The host path can contain
+        // characters that Shift-JIS cannot represent. Keep it on the host.
+        "C:\\Game\\".into()
+    }
+}
+
+fn normalize_runtime_native_path(native_root: &Path, file: &str) -> PathBuf {
+    if !cfg!(target_os = "windows") {
+        let normalized = file.replace('\\', "/");
+        if normalized.eq_ignore_ascii_case("C:/Game") {
+            return native_root.to_path_buf();
+        }
+        if normalized
+            .get(..8)
+            .is_some_and(|root| root.eq_ignore_ascii_case("C:/Game/"))
+        {
+            return native_root.join(normalized[8..].trim_start_matches('/'));
+        }
+    }
     let drive_absolute = file
         .as_bytes()
         .get(1)
@@ -53,7 +75,7 @@ fn normalize_runtime_native_path(file: &str) -> String {
     } else {
         file
     };
-    file.replace('\\', std::path::MAIN_SEPARATOR_STR)
+    PathBuf::from(file.replace('\\', std::path::MAIN_SEPARATOR_STR))
 }
 
 pub(crate) fn find_runtime_file(
@@ -79,8 +101,8 @@ pub(crate) fn find_runtime_file_from_root(
         return None;
     }
 
-    let normalized = normalize_runtime_native_path(file);
-    let path = Path::new(&normalized);
+    let normalized = normalize_runtime_native_path(native_root, file);
+    let path = normalized.as_path();
     let windows_absolute = file.starts_with("\\\\")
         || file
             .as_bytes()
@@ -96,8 +118,8 @@ pub(crate) fn find_runtime_file_from_root(
         // BGI also passes an already-resolved primary/secondary filesystem
         // root through the archive slot. Distinguish that from an ordinary
         // archive name and resolve the loose file below it.
-        let normalized_archive = archive.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let archive_path = Path::new(&normalized_archive);
+        let normalized_archive = normalize_runtime_native_path(native_root, archive);
+        let archive_path = normalized_archive.as_path();
         let rooted = if archive_path.is_absolute() {
             archive_path.to_path_buf()
         } else {
@@ -122,6 +144,16 @@ pub(crate) fn find_runtime_file_from_root(
     // The portable archive scan root is a separate namespace.
     if let Some(loose) = resolve_existing_path_case_insensitive(&game_root, path) {
         return Some(loose);
+    }
+    // sub_465E30: a loose file missing below the root is retried as
+    // `root + dir + "\\" + file` for each Sys80:37 directory, newest first.
+    for directory in manager.loose_search_paths() {
+        let directory = directory.replace('\\', std::path::MAIN_SEPARATOR_STR);
+        if let Some(loose) =
+            resolve_existing_path_case_insensitive(&game_root, &Path::new(&directory).join(path))
+        {
+            return Some(loose);
+        }
     }
 
     manager.archives().archives.iter().find_map(|archive| {
@@ -202,11 +234,11 @@ pub(crate) fn runtime_file_path_from_root(
     if super::file_policy::restricted() {
         return None;
     }
-    let normalized = normalize_runtime_native_path(file);
-    if normalized.trim().is_empty() {
+    if file.trim().is_empty() {
         return None;
     }
-    let path = Path::new(&normalized);
+    let normalized = normalize_runtime_native_path(native_root, file);
+    let path = normalized.as_path();
     if path.is_absolute() {
         Some(path.to_path_buf())
     } else if path.starts_with(manager.archives().root.as_path()) {
@@ -328,13 +360,7 @@ pub(crate) fn read_runtime_bytes(
             return None;
         }
         if let Some(container) = authorized_container_name(manager, file) {
-            let f = policy.open_resource(&container).ok()?;
-            if f.metadata().ok()?.len() > 256 * 1024 * 1024 {
-                return None;
-            }
-            let mut bytes = Vec::new();
-            f.take(256 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
-            return (bytes.len() <= 256 * 1024 * 1024).then_some(bytes);
+            return policy.read_resource(&container, 256 * 1024 * 1024).ok();
         }
         let entry = find_runtime_resource(manager, archive, file)?;
         if entry.packed_size > 256 * 1024 * 1024
@@ -387,16 +413,6 @@ pub(crate) fn is_empty_archive_arg(archive: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn testcase_manager() -> ResourceManager {
-        ResourceManager::open_game(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("testcase"),
-        )
-        .unwrap()
-    }
-
     fn temporary_root(name: &str) -> PathBuf {
         let unique = format!(
             "ethornell-{name}-{}-{}",
@@ -412,6 +428,103 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn unicode_game_root_survives_bp_path_buffers_and_save_io() {
+        use ethornell_vm::{SysApi, Value, Vm, VmRunOptions, VmStopReason};
+
+        let root = temporary_root("unicode-game-root");
+        let native_root = root.join("秽翼的尤斯蒂娅");
+        std::fs::create_dir(&native_root).unwrap();
+        let manager = ResourceManager::open_game(&root).unwrap();
+        let mut api =
+            super::super::RuntimeTraceApi::new_with_native_root(manager, native_root.clone());
+        let mut vm = Vm::new();
+        let run = |vm: &mut Vm, api: &mut super::super::RuntimeTraceApi, id, args| {
+            let program = ethornell_script::parse_bp_program(None, &[0x80, id]);
+            vm.start(&program);
+            vm.stack = args;
+            let report = vm.run_loaded(api, &VmRunOptions::default());
+            assert_eq!(report.stop_reason, VmStopReason::Completed, "{report:?}");
+            assert_eq!(vm.stack, vec![Value::Int(1)]);
+        };
+
+        // Sys80:3D writes the root into the same Shift-JIS buffer that the
+        // bootstrap uses to construct UserData. This failed for this name.
+        let buffer = 0x2000;
+        run(
+            &mut vm,
+            &mut api,
+            0x3d,
+            vec![Value::Ptr(buffer), Value::Int(0)],
+        );
+        let buffer = buffer as usize;
+        let length = vm.memory[buffer..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap();
+        assert_eq!(&vm.memory[buffer..buffer + length], b"C:\\Game\\");
+        let suffix = b"UserData\0";
+        vm.memory[buffer + length..buffer + length + suffix.len()].copy_from_slice(suffix);
+
+        run(&mut vm, &mut api, 0x28, vec![Value::Ptr(buffer as u32)]);
+        assert!(native_root.join("UserData").is_dir());
+        run(&mut vm, &mut api, 0x2a, vec![Value::Ptr(buffer as u32)]);
+        assert!(api.directory_exists("C:\\Game\\UserData"));
+
+        let save = "C:\\Game\\UserData\\slot.sud";
+        assert!(api.write_file_bytes(save, b"saved data"));
+        assert_eq!(
+            std::fs::read(native_root.join("UserData/slot.sud")).unwrap(),
+            b"saved data"
+        );
+        assert_eq!(api.read_user_file_bytes(save), Some(b"saved data".to_vec()));
+        assert_eq!(api.read_disk_file(save), Some(b"saved data".to_vec()));
+        assert!(api.file_exists("C:\\Game\\", "UserData/slot.sud"));
+        assert_eq!(api.file_size("", save), 10);
+        assert_eq!(
+            api.enumerate_user_files("C:\\Game\\UserData\\*.sud", false, 0),
+            vec!["slot.sud"]
+        );
+
+        // Existing saves can contain absolute host paths from older builds.
+        let host_save = native_root.join("UserData/slot.sud");
+        assert_eq!(
+            api.read_disk_file(host_save.to_str().unwrap()),
+            Some(b"saved data".to_vec())
+        );
+        assert!(api.delete_file("", save));
+        assert!(!host_save.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn game_mount_accepts_windows_separators_and_exact_root_components() {
+        let root = Path::new("/games/秽翼的尤斯蒂娅");
+        for path in ["C:\\Game", "C:\\Game\\", "c:/gAmE/"] {
+            assert_eq!(normalize_runtime_native_path(root, path), root);
+        }
+        for path in [
+            "C:\\Game\\UserData",
+            "c:/game/UserData",
+            "C:\\Game\\\\UserData",
+        ] {
+            assert_eq!(
+                normalize_runtime_native_path(root, path),
+                root.join("UserData")
+            );
+        }
+        assert_eq!(
+            normalize_runtime_native_path(root, "C:\\GameOther\\UserData"),
+            Path::new("C:/GameOther/UserData")
+        );
+        assert_eq!(
+            normalize_runtime_native_path(root, "秽翼的尤斯蒂娅/UserData"),
+            Path::new("秽翼的尤斯蒂娅/UserData")
+        );
+    }
+
+    #[test]
     fn writing_a_save_refreshes_all_cached_path_aliases() {
         use ethornell_vm::SysApi;
 
@@ -421,6 +534,8 @@ mod tests {
         let manager = ResourceManager::open_game(&root).unwrap();
         let mut api =
             super::super::RuntimeTraceApi::new_with_native_root(manager, native_root.clone());
+        // CreateFileA does not create directories (sub_42D940).
+        std::fs::create_dir_all(native_root.join("UserData")).unwrap();
         let absolute = native_root
             .join("UserData/slot.sud")
             .to_string_lossy()
@@ -639,22 +754,5 @@ mod tests {
             Some(archive)
         );
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn game_root_is_exposed_as_an_absolute_user_data_root() {
-        let manager = testcase_manager();
-        assert!(game_root_path(&manager).is_absolute());
-        assert!(game_root_path(&manager).ends_with("testcase"));
-    }
-
-    #[test]
-    fn get_user_data_root_paths_resolve_as_loose_files() {
-        let manager = testcase_manager();
-        let file = game_root_path(&manager).join("UserData").join("slot.sud");
-        assert_eq!(
-            find_runtime_file(&manager, "", &file.to_string_lossy()),
-            Some(file)
-        );
     }
 }

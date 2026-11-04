@@ -142,12 +142,9 @@ impl RuntimeGraphInputObject {
         if !self.extended {
             return Err(4);
         }
-        let group_exists = self
-            .descriptor
-            .regions
-            .iter()
-            .any(|region| region.group == group);
-        if !group_exists {
+        // sub_44B8A0: the group against the configured group count (2),
+        // then the item against that group's item count (3), unsigned.
+        if group as u32 >= self.descriptor.groups.len() as u32 {
             return Err(2);
         }
         if !self
@@ -280,6 +277,63 @@ impl RuntimeGraphInputObject {
 
     pub(crate) fn clear_deferred_pointer_activation(&mut self) {
         self.deferred_pointer_activation = None;
+    }
+
+    /// 448AD0 actions 2..18; action 1 is pointer activation at the host.
+    pub(crate) fn native_action(&mut self,action:i32)->bool {
+        let group=self.registered_state;
+        let item=self.current_item(group);
+        match action {
+            2|4=>{self.message_activate(-1,-1,i32::from(action==2),&|_,_|(0,0));return false;}
+            3=>{if self.valid_item(group,item) {self.message_activate(group,item,0,&|_,_|(0,0));}return false;}
+            7|8=>{
+                let count=if self.descriptor.groups.is_empty() {self.descriptor.regions.iter().map(|r|r.group+1).max().unwrap_or(0)}else{self.descriptor.groups.len() as i32};
+                let mut next=group;
+                for _ in 0..count {
+                    next+=if action==7 {-1}else{1};
+                    if next<0 {next=count-1;}else if next>=count {next=0;}
+                    let accepts=self.descriptor.groups.iter().find(|g|g.index==next).is_some_and(|g|g.selection_enabled);
+                    if accepts {self.registered_state=next;self.clear_exclusive_peers(next);self.queue_event([0x10000003,next,if action==7 {-1}else{1}]);return true;}
+                }
+                return false;
+            }
+            5|6|9..=18=>{}
+            _=>return false,
+        }
+        let Some(count)=self.group_item_count(group) else{return false;};
+        let requested=self.descriptor.groups.iter().find(|g|g.index==group).map_or(0,|g|g.navigation_columns);
+        let cols=if requested<=0 || requested>count {count}else{requested};
+        if cols<=0 {return false;}
+        let rows=(count+cols-1)/cols;
+        let direction=match action {5|13=>-1,6|14=>1,9|15=>0xFFFF,10|16=>1,11|17=>-65536,12|18=>65536,_=>0};
+        let loops=match action {5|6=>count,9|10|15|16=>cols,11|12|17|18=>rows,13|14=>1,_=>0};
+        let mut candidate=item;
+        for _ in 0..loops {
+            candidate=match action {
+                5=>if candidate-1<0 || candidate-1>=count {count-1}else{candidate-1},
+                6=>if candidate+1<0 || candidate+1>=count {0}else{candidate+1},
+                9=>{let col=candidate%cols-1;candidate/cols*cols+if col<0 {cols-1}else{col}},
+                10=>{let col=candidate%cols+1;candidate/cols*cols+if col>=cols {0}else{col}},
+                11=>{let row=candidate/cols-1;candidate%cols+if row<0 {rows-1}else{row}*cols},
+                12=>{let row=candidate/cols+1;candidate%cols+if row>=rows {0}else{row}*cols},
+                13=>candidate-1,14=>candidate+1,
+                15=>{if candidate%cols<=0 {break;}candidate-1},
+                16=>{if candidate%cols+1>=cols {break;}candidate+1},
+                17=>{if candidate/cols<=0 {break;}candidate-cols},
+                18=>{if candidate/cols+1>=rows {break;}candidate+cols},
+                _=>candidate,
+            };
+            if self.message_select_item(group,candidate) {
+                self.queue_event([0x10000004,pack_words(group,candidate),direction]);return true;
+            }
+        }
+        if (13..=18).contains(&action) {self.queue_event([0x10000005,pack_words(group,item),direction]);}
+        false
+    }
+
+    pub(crate) fn activate_native_action_item(&mut self,region:GraphInputRegion,local:(i32,i32),pointer:bool)->bool {
+        self.message_activate(region.group,region.index,i32::from(pointer),&|_,_|local);
+        pointer && self.select_activated_item(region)
     }
 
     /// Map one fresh physical mouse-left edge through the root input action
@@ -573,6 +627,7 @@ impl RuntimeGraphInputObject {
         if self.group_item_count(group).is_none() || !(item == -1 || self.valid_item(group, item)) {
             return false;
         }
+        if self.extended && item>=0 && self.descriptor.regions.iter().find(|r|r.group==group&&r.index==item).is_some_and(|r|r.enabled_depth==0) {return false;}
         let current = self.current_selections.get(&group).copied().unwrap_or(-1);
         if item == current {
             return false;
@@ -594,7 +649,7 @@ impl RuntimeGraphInputObject {
         if self.extended || normal != -1 {
             self.clear_exclusive_peers(group);
         }
-        true
+        self.extended || normal != -1
     }
 
     /// vtable+0x38 (sub_44A3E0 / sub_44C360): replace one item bitmap.
@@ -750,7 +805,7 @@ mod tests {
     fn activation_root_flag_selects_without_hover_selection_and_keeps_exclusion_rules() {
         for deferred in [false,true] {
             let mut input=RuntimeGraphInputObject::new_extended(7);
-            input.configure(GraphInputDescriptor {flags:[1,0,0,0,1,0,0],groups:vec![GraphInputGroup {index:0,initial_current_item:-1,selection_enabled:true,pointer_selection_enabled:false,pointer_activation_enabled:false,selection_exclusion_key:-1,extended_flags:if deferred{2}else{0}}],regions:vec![GraphInputRegion{index:0,..region()},region()],..GraphInputDescriptor::default()});
+            input.configure(GraphInputDescriptor {flags:[1,0,0,0,1,0,0],groups:vec![GraphInputGroup { navigation_columns: 0,index:0,initial_current_item:-1,selection_enabled:true,pointer_selection_enabled:false,pointer_activation_enabled:false,selection_exclusion_key:-1,extended_flags:if deferred{2}else{0}}],regions:vec![GraphInputRegion{index:0,..region()},region()],..GraphInputDescriptor::default()});
             assert!(!input.select_pointer_item(0,1));assert_eq!(input.selected_region_values(),vec![-1]);
             assert_eq!(input.pointer_activation_is_immediate(region()),!deferred);
             input.begin_interaction(region(),20,20);assert!(input.select_activated_item(region()));
@@ -773,6 +828,7 @@ mod tests {
         let mut extended = RuntimeGraphInputObject::new_extended(7);
         extended.configure(GraphInputDescriptor {
             initial_group: 0,
+            groups: vec![Default::default()],
             regions: vec![region()],
             ..GraphInputDescriptor::default()
         });
@@ -809,7 +865,7 @@ mod tests {
         let mut item = region();
         item.hover_resource = 11;
         input.configure(GraphInputDescriptor {
-            groups: vec![GraphInputGroup {
+            groups: vec![GraphInputGroup { navigation_columns: 0,
                 index: 0,
                 initial_current_item: -1,
                 selection_enabled: true,
@@ -842,7 +898,7 @@ mod tests {
     }
 
     fn message_processor(extended: bool) -> RuntimeGraphInputObject {
-        let group = |index, key| GraphInputGroup {
+        let group = |index, key| GraphInputGroup { navigation_columns: 0,
             index,
             initial_current_item: -1,
             selection_enabled: true,

@@ -1,10 +1,13 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use encoding_rs::SHIFT_JIS;
 use ethornell_core::Result;
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Cursor, Read};
+use std::ops::{Deref, Range};
 use std::path::Path;
+use std::sync::Arc;
 
 pub mod bcs;
 pub mod calls;
@@ -60,30 +63,106 @@ pub enum BpOperand {
     Raw(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A view into a module's shared bytecode. Disassembled instructions keep the
+/// bytes alive even after their program is dropped, without a byte allocation
+/// for every instruction.
+#[derive(Clone)]
+pub struct BpInstructionBytes {
+    code: Arc<Vec<u8>>,
+    range: Range<usize>,
+}
+
+impl Deref for BpInstructionBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.code[self.range.clone()]
+    }
+}
+
+impl PartialEq for BpInstructionBytes {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for BpInstructionBytes {}
+
+impl From<Vec<u8>> for BpInstructionBytes {
+    fn from(code: Vec<u8>) -> Self {
+        let range = 0..code.len();
+        Self {
+            code: Arc::new(code),
+            range,
+        }
+    }
+}
+
+impl fmt::Debug for BpInstructionBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl Serialize for BpInstructionBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.deref().serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BpInstruction {
     pub offset: u64,
     pub opcode: BpOpcode,
-    pub opcode_hex: String,
-    pub opcode_name: String,
-    pub operands: Vec<BpOperand>,
+    pub operands: Box<[BpOperand]>,
     pub known_call: Option<&'static str>,
-    pub raw: Vec<u8>,
+    pub raw: BpInstructionBytes,
     pub warning: Option<String>,
+}
+
+impl BpInstruction {
+    pub fn opcode_hex(&self) -> String {
+        format!("0x{:02X}", self.opcode.code())
+    }
+}
+
+// Keep the disassembler's JSON format while deriving diagnostic strings only
+// when requested, rather than storing two allocated strings per instruction.
+impl Serialize for BpInstruction {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("BpInstruction", 8)?;
+        state.serialize_field("offset", &self.offset)?;
+        state.serialize_field("opcode", &self.opcode)?;
+        state.serialize_field("opcode_hex", &self.opcode_hex())?;
+        state.serialize_field("opcode_name", self.opcode.name())?;
+        state.serialize_field("operands", &self.operands)?;
+        state.serialize_field("known_call", &self.known_call)?;
+        state.serialize_field("raw", &self.raw)?;
+        state.serialize_field("warning", &self.warning)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BpProgram {
     pub script_name: Option<String>,
-    pub functions: Vec<BpFunction>,
-    pub strings: Vec<String>,
-    pub instructions: Vec<BpInstruction>,
-    pub labels: HashMap<u32, usize>,
+    /// Shared by every copy of the module: the VM keeps one program entry per
+    /// LoadProgram (each with its own instance name), so only the name may
+    /// differ between copies.
+    pub functions: Arc<Vec<BpFunction>>,
+    pub strings: Arc<Vec<String>>,
+    pub instructions: Arc<Vec<BpInstruction>>,
+    pub labels: Arc<HashMap<u32, usize>>,
     pub warnings: Vec<String>,
     /// Code length from the BP header (`a2[1]` of sub_465AB0): the number of
     /// bytes the module occupies in a thread's code region, including data
     /// that follows the last instruction. Zero when unknown.
     pub module_size: u32,
+    /// The bytes the module occupies in a thread's code region (the image
+    /// without its BP header, as sub_4450B0 copies it); code offset 0 is the
+    /// first instruction.
+    #[serde(skip)]
+    pub code: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -118,12 +197,14 @@ pub fn opcode_name(code: u8) -> Option<&'static str> {
     vm_opcode::lookup_bp_opcode(code).map(|spec| spec.symbol)
 }
 
-/// Non-null entries in the shipped interpreter table at `0x506300`.
+/// Non-null entries in the shipped interpreter table at `0x506300`. The
+/// senmomo build (BGI 1.622) adds the 16.16 fixed-point and vector opcodes
+/// 0x56..=0x5F (without 0x5C).
 pub const NATIVE_REGISTERED_OPCODES: &[u8] = &[
     0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x11, 0x14, 0x15, 0x16,
     0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x30, 0x31, 0x32,
     0x33, 0x34, 0x35, 0x38, 0x39, 0x3a, 0x40, 0x42, 0x43, 0x44, 0x48, 0x49, 0x50, 0x51, 0x52, 0x53,
-    0x54, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
+    0x54, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
     0x6f, 0x70, 0x71, 0x74, 0x75, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81,
     0x90, 0x91, 0x92, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xff,
 ];
@@ -617,6 +698,7 @@ pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
         (0x92, 0x18) => Some("GraphConvertBitmapToAlphaDescriptor"),
         (0x92, 0x19) => Some("GraphInvertAlphaBitmap"),
         (0x92, 0x1a) => Some("GraphComposeBitmapAlphaAtOffset"),
+        (0x92, 0x1b) => Some("GraphOutlineBitmapHalo"),
         (0x92, 0x1c) => Some("GraphDrawBitmapTextMeasure"),
         (0x92, 0x1d) => Some("GraphDrawWrappedBitmapText"),
         (0x92, 0x1e) => Some("GraphDrawBitmapText"),
@@ -781,13 +863,14 @@ pub fn known_call_name(group: u8, id: u16) -> Option<&'static str> {
 }
 
 pub fn disassemble_bp(buf: &[u8]) -> Vec<BpInstruction> {
-    parse_bp_program(None, buf).instructions
+    Arc::unwrap_or_clone(parse_bp_program(None, buf).instructions)
 }
 
 pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
     let range = detect_code_range(buf);
     let module_size = declared_module_size(buf);
-    let mut cursor = Cursor::new(&buf[range.start..range.end]);
+    let code = Arc::new(buf[range.start..range.end].to_vec());
+    let mut cursor = Cursor::new(code.as_slice());
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
     let mut strings = Vec::new();
@@ -800,7 +883,7 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
             Ok(op) => op,
             Err(_) => break,
         };
-        let mut raw = vec![opcode_byte];
+        let mut raw_len = 1;
         let mut operands = Vec::new();
         let mut warning = None;
         let mut known_call = None;
@@ -808,22 +891,22 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
 
         match opcode_byte {
             0x00 | 0x08 | 0x09 | 0x0a => {
-                if let Some(value) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(value));
                 }
             }
             0x01 => {
-                if let Some(value) = read_u16_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U16(value));
                 }
             }
             0x02 => {
-                if let Some(value) = read_u32_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u32_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U32(value));
                 }
             }
             0x04..=0x06 => {
-                if let Some(value) = read_u16_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
                     if opcode_byte == 0x04 {
                         operands.push(BpOperand::U16(value));
                     } else if opcode_byte == 0x05 {
@@ -842,10 +925,11 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                 }
             }
             0x0b => {
-                if let Some(count) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(count) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     let mut bytes = Vec::new();
                     for _ in 0..count {
-                        if let Some(byte) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                        if let Some(byte) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning)
+                        {
                             bytes.push(byte);
                         }
                     }
@@ -853,15 +937,15 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                 }
             }
             0x0c => {
-                if let Some(width) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(width) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(width));
                 }
-                if let Some(count) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(count) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(count));
                 }
             }
             0x15 | 0x80 | 0x81 | 0x90 | 0x91 | 0x92 | 0xa0 | 0xb0 | 0xc0 | 0xd0 | 0xe0 => {
-                if let Some(value) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(value));
                     if !matches!(opcode_byte, 0xd0 | 0xe0) {
                         known_call = candidate_call_name(opcode_byte, value as u16);
@@ -869,7 +953,7 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                 }
             }
             0xff => {
-                if let Some(value) = read_u8_operand(&mut cursor, &mut raw, &mut warning) {
+                if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(value));
                     opcode_name_override = Some(match value {
                         0xf0 => "script_load",
@@ -898,12 +982,13 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
         }
         instructions.push(BpInstruction {
             offset,
-            opcode_hex: format!("0x{opcode_byte:02X}"),
-            opcode_name: opcode.name().to_string(),
             opcode,
-            operands,
+            operands: operands.into_boxed_slice(),
             known_call,
-            raw,
+            raw: BpInstructionBytes {
+                code: Arc::clone(&code),
+                range: relative..relative + raw_len,
+            },
             warning,
         });
     }
@@ -924,14 +1009,19 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
     functions.sort_by_key(|f| f.offset);
     functions.dedup_by_key(|f| f.offset);
 
+    // Programs stay cached for the session; discard the parser's growth slack.
+    instructions.shrink_to_fit();
+    labels.shrink_to_fit();
+
     BpProgram {
         script_name,
-        functions,
-        strings,
-        instructions,
-        labels,
+        functions: Arc::new(functions),
+        strings: Arc::new(strings),
+        instructions: Arc::new(instructions),
+        labels: Arc::new(labels),
         warnings,
         module_size,
+        code,
     }
 }
 
@@ -983,12 +1073,12 @@ fn detect_bp_code_end(buf: &[u8], start: usize, nominal_end: usize) -> usize {
 
 fn read_u8_operand(
     cursor: &mut Cursor<&[u8]>,
-    raw: &mut Vec<u8>,
+    raw_len: &mut usize,
     warning: &mut Option<String>,
 ) -> Option<u8> {
     match cursor.read_u8() {
         Ok(value) => {
-            raw.push(value);
+            *raw_len += 1;
             Some(value)
         }
         Err(_) => {
@@ -1000,13 +1090,13 @@ fn read_u8_operand(
 
 fn read_u16_operand(
     cursor: &mut Cursor<&[u8]>,
-    raw: &mut Vec<u8>,
+    raw_len: &mut usize,
     warning: &mut Option<String>,
 ) -> Option<u16> {
     let mut bytes = [0u8; 2];
     match cursor.read_exact(&mut bytes) {
         Ok(()) => {
-            raw.extend_from_slice(&bytes);
+            *raw_len += 2;
             Some(u16::from_le_bytes(bytes))
         }
         Err(_) => {
@@ -1018,12 +1108,12 @@ fn read_u16_operand(
 
 fn read_u32_operand(
     cursor: &mut Cursor<&[u8]>,
-    raw: &mut Vec<u8>,
+    raw_len: &mut usize,
     warning: &mut Option<String>,
 ) -> Option<u32> {
     match cursor.read_u32::<LittleEndian>() {
         Ok(value) => {
-            raw.extend_from_slice(&value.to_le_bytes());
+            *raw_len += 4;
             Some(value)
         }
         Err(_) => {
@@ -1059,6 +1149,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instructions_share_module_bytes_and_outlive_the_program() {
+        let mut bytes = vec![8, 0, 0, 0, 7, 0, 0, 0];
+        bytes.extend_from_slice(&[0x02, 1, 2, 3, 4, 0x44, 0x17]);
+        let program = parse_bp_program(None, &bytes);
+        for instruction in program.instructions.iter() {
+            assert!(Arc::ptr_eq(&instruction.raw.code, &program.code));
+        }
+        let instruction = program.instructions[0].clone();
+        drop(program);
+        drop(bytes);
+        assert_eq!(&*instruction.raw, &[0x02, 1, 2, 3, 4]);
+        // Equality describes instruction bytes, regardless of their backing image.
+        assert_eq!(instruction.raw, vec![0x02, 1, 2, 3, 4].into());
+    }
+
+    #[test]
+    fn module_instances_share_function_and_string_tables() {
+        let program = parse_bp_program(None, &[0x05, 7, 0, 0x06, 3, 0, 0x17, b'X', 0]);
+        assert!(!program.functions.is_empty());
+        assert!(!program.strings.is_empty());
+        let mut instance = program.clone();
+        instance.script_name = Some("another instance".into());
+        assert!(Arc::ptr_eq(&program.functions, &instance.functions));
+        assert!(Arc::ptr_eq(&program.strings, &instance.strings));
+        assert_eq!(program.functions, instance.functions);
+        assert_eq!(program.strings, instance.strings);
+    }
+
+    #[test]
+    fn truncated_immediates_keep_only_successfully_decoded_raw_bytes() {
+        for bytes in [&[0x01, 0xaa][..], &[0x02, 1, 2, 3][..]] {
+            let instructions = disassemble_bp(bytes);
+            assert_eq!(instructions.len(), 1);
+            assert_eq!(&*instructions[0].raw, &bytes[..1]);
+            assert!(instructions[0].operands.is_empty());
+            assert!(instructions[0].warning.is_some());
+        }
+    }
+
+    #[test]
+    fn compact_instructions_preserve_disassembler_json() {
+        let instructions = disassemble_bp(&[0xff, 0xf0, 0x03, 0x17]);
+        let json = serde_json::to_value(&instructions).unwrap();
+        assert_eq!(
+            json[0],
+            serde_json::json!({
+                "offset": 0,
+                "opcode": { "Known": { "code": 255, "name": "script_load" } },
+                "opcode_hex": "0xFF",
+                "opcode_name": "script_load",
+                "operands": [{ "U8": 240 }],
+                "known_call": null,
+                "raw": [255, 240],
+                "warning": null,
+            })
+        );
+        assert_eq!(json[1]["opcode_name"], "unknown");
+        assert_eq!(json[1]["opcode_hex"], "0x03");
+        assert_eq!(json[2]["raw"], serde_json::json!([23]));
+    }
+
+    #[test]
     fn maps_required_opcode_names() {
         assert_eq!(opcode_name(0x00), Some("push_byte"));
         assert_eq!(opcode_name(0x91), Some("grp2"));
@@ -1070,7 +1222,7 @@ mod tests {
 
     #[test]
     fn names_every_opcode_registered_by_the_native_interpreter() {
-        assert_eq!(NATIVE_REGISTERED_OPCODES.len(), 89);
+        assert_eq!(NATIVE_REGISTERED_OPCODES.len(), 98);
         assert!(
             NATIVE_REGISTERED_OPCODES
                 .iter()
@@ -1082,9 +1234,9 @@ mod tests {
     fn secondary_opcode_domains_consume_their_selector() {
         let instructions = disassemble_bp(&[0xd0, 0x40, 0xe0, 0x80, 0x17]);
         assert_eq!(instructions.len(), 3);
-        assert_eq!(instructions[0].raw, vec![0xd0, 0x40]);
+        assert_eq!(&*instructions[0].raw, &[0xd0, 0x40]);
         assert_eq!(instructions[0].opcode.name(), "legacy_3d");
-        assert_eq!(instructions[1].raw, vec![0xe0, 0x80]);
+        assert_eq!(&*instructions[1].raw, &[0xe0, 0x80]);
         assert_eq!(instructions[1].opcode.name(), "debug_inspect");
     }
 
@@ -1093,10 +1245,10 @@ mod tests {
         let instructions = disassemble_bp(&[0x0b, 3, 0xaa, 0xbb, 0xcc, 0x44, 0x17]);
 
         assert_eq!(instructions.len(), 3);
-        assert_eq!(instructions[0].raw, vec![0x0b, 3, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(&*instructions[0].raw, &[0x0b, 3, 0xaa, 0xbb, 0xcc]);
         assert_eq!(
-            instructions[0].operands,
-            vec![BpOperand::Raw(vec![0xaa, 0xbb, 0xcc])]
+            &*instructions[0].operands,
+            &[BpOperand::Raw(vec![0xaa, 0xbb, 0xcc])]
         );
         assert_eq!(instructions[1].opcode.name(), "vec3_length");
     }
@@ -1120,8 +1272,8 @@ mod tests {
     fn decodes_conservatively() {
         let instructions = disassemble_bp(&[0x00, 0x7f, 0xff, 0x17]);
         assert_eq!(instructions.len(), 2);
-        assert_eq!(instructions[0].raw, vec![0x00, 0x7f]);
-        assert_eq!(instructions[1].raw, vec![0xff, 0x17]);
+        assert_eq!(&*instructions[0].raw, &[0x00, 0x7f]);
+        assert_eq!(&*instructions[1].raw, &[0xff, 0x17]);
         assert_eq!(instructions[1].opcode.name(), "script_call");
     }
 

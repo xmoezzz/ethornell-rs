@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ethornell_image::DecodedImage;
-use na_mpeg2_decoder::{Decoder, Demuxer, Frame, Packet, StreamType, frame_to_rgba_bt601_limited};
+use na_mpeg2_decoder::{Decoder, Frame, StreamType, frame_to_rgba_bt601_limited, packet_ranges};
 
+use crate::MovieBytes;
 use crate::audio_runtime::{AudioCommand, StreamBytes};
 
 /// Audio channels for movie soundtracks: above the channels script sounds use.
@@ -116,7 +117,8 @@ pub(crate) fn movie_audio_commands(
 
 #[derive(Debug)]
 struct MovieDecoder {
-    packets: Vec<Packet>,
+    source: MovieBytes,
+    packets: Vec<MoviePacket>,
     /// The MPEG audio elementary stream (Layer II in BGI movies), played as
     /// one stream by the audio frontend.
     audio: Option<StreamBytes>,
@@ -125,39 +127,81 @@ struct MovieDecoder {
     packet_index: usize,
     frame_index: Option<usize>,
     current_frame: Option<Arc<Frame>>,
+    /// Index of the frame last handed to the bitmap. The target's renderer
+    /// (DCVideoImageSender, sub_45C260) copies each sample once.
+    delivered_index: Option<usize>,
     frame_interval_ms: i32,
+    /// Picture size from the first sequence header.
+    size: Option<(u32, u32)>,
     flushed: bool,
     failed: bool,
 }
 
+#[derive(Debug)]
+struct MoviePacket {
+    pts_90k: Option<i64>,
+    range: std::ops::Range<usize>,
+}
+
 impl MovieDecoder {
-    fn new(bytes: &[u8]) -> Option<Self> {
-        let mut demuxer = Demuxer::new_auto();
+    fn new(source: MovieBytes) -> Option<Self> {
+        let bytes = source.as_slice();
         let mut packets = Vec::new();
         let mut audio = Vec::new();
-        for packet in demuxer.push(bytes, None) {
+        for packet in packet_ranges(bytes) {
             match packet.stream_type {
-                StreamType::MpegVideo => packets.push(packet),
-                StreamType::MpegAudio => audio.extend_from_slice(&packet.data),
+                StreamType::MpegVideo => {
+                    // Decode at most one bounded chunk when another frame is
+                    // needed, even when the container has one enormous PES.
+                    for start in (packet.range.start..packet.range.end).step_by(64 * 1024) {
+                        packets.push(MoviePacket {
+                            pts_90k: (start == packet.range.start)
+                                .then_some(packet.pts_90k)
+                                .flatten(),
+                            range: start..(start + 64 * 1024).min(packet.range.end),
+                        });
+                    }
+                }
+                StreamType::MpegAudio => {
+                    audio.extend_from_slice(&bytes[packet.range]);
+                }
                 StreamType::Unknown => {}
             }
         }
         if packets.is_empty() {
             return None;
         }
+        // A file that isn't a movie (Graph90:F0 names movies by file, so a
+        // script can name an image archive) can still pass the demuxer as one
+        // video elementary stream through stray start codes in its data. Its
+        // first packet doesn't decode: fail the open instead of playing
+        // nothing for the duration the stray codes add up to.
+        let mut decoder = Decoder::new();
+        let first = &packets[0];
+        let pending_frames = decoder
+            .decode_shared(&bytes[first.range.clone()], first.pts_90k)
+            .ok()?
+            .into_iter()
+            .collect();
         let frame_rate = packets
             .iter()
-            .find_map(|packet| sequence_frame_rate(&packet.data))
+            .find_map(|packet| sequence_frame_rate(&bytes[packet.range.clone()]))
             .unwrap_or(25.0);
+        let size = packets
+            .iter()
+            .find_map(|packet| sequence_frame_size(&bytes[packet.range.clone()]));
         Some(Self {
+            source,
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
-            decoder: Decoder::new(),
-            pending_frames: VecDeque::new(),
-            packet_index: 0,
+            decoder,
+            pending_frames,
+            packet_index: 1,
             frame_index: None,
             current_frame: None,
+            delivered_index: None,
             frame_interval_ms: (1000.0 / frame_rate).round().max(1.0) as i32,
+            size,
             flushed: false,
             failed: false,
         })
@@ -169,6 +213,7 @@ impl MovieDecoder {
         self.packet_index = 0;
         self.frame_index = None;
         self.current_frame = None;
+        self.delivered_index = None;
         self.flushed = false;
         self.failed = false;
     }
@@ -187,6 +232,10 @@ impl MovieDecoder {
             }
         }
         let frame = self.current_frame.as_ref()?;
+        if self.delivered_index == self.frame_index {
+            return None;
+        }
+        self.delivered_index = self.frame_index;
         let mut rgba = vec![0; frame.width * frame.height * 4];
         frame_to_rgba_bt601_limited(frame, &mut rgba);
         Some(DecodedImage {
@@ -194,6 +243,10 @@ impl MovieDecoder {
             height: frame.height as u32,
             rgba,
         })
+    }
+
+    fn prepare_initial_frame(&mut self) -> Option<DecodedImage> {
+        self.frame_at(0)
     }
 
     fn next_frame(&mut self) -> Option<Arc<Frame>> {
@@ -206,7 +259,8 @@ impl MovieDecoder {
             }
             if let Some(packet) = self.packets.get(self.packet_index) {
                 self.packet_index += 1;
-                match self.decoder.decode_shared(&packet.data, packet.pts_90k) {
+                let data = &self.source.as_slice()[packet.range.clone()];
+                match self.decoder.decode_shared(data, packet.pts_90k) {
                     Ok(frames) => self.pending_frames.extend(frames),
                     Err(_) => self.failed = true,
                 }
@@ -290,12 +344,12 @@ impl GraphEffectRegistry {
         handle: i32,
         archive: String,
         resource: String,
-        bytes: &[u8],
+        bytes: MovieBytes,
     ) -> i32 {
-        if handle < 0 || resource.is_empty() || bytes.is_empty() {
+        if handle < 0 || resource.is_empty() || bytes.as_slice().is_empty() {
             return 4;
         }
-        let duration_ms = probe_mpeg_duration_ms(bytes);
+        let duration_ms = probe_mpeg_duration_ms(bytes.as_slice());
         if crate::file_policy::restricted() && duration_ms <= 0 {
             // Do not install a permanently active zero-duration process and
             // leave its native wait procedure blocked forever.
@@ -435,6 +489,9 @@ impl GraphEffectRegistry {
         process.audio_generation += 1;
         if let Some(movie) = process.movie.as_mut() {
             let _ = movie.frame_at(position_ms);
+            // A seek on a running graph renders the sample at the new
+            // position again.
+            movie.delivered_index = None;
         }
         0
     }
@@ -485,7 +542,7 @@ impl GraphEffectRegistry {
         let Some(process) = self.processes.get_mut(&handle) else {
             return 1;
         };
-        if process.movie.is_none() || !process.active {
+        if process.movie.is_none() {
             return 1;
         }
         process.paused = paused;
@@ -503,6 +560,31 @@ impl GraphEffectRegistry {
             }
             _ => 1,
         }
+    }
+
+    /// Whether a bitmap-slot movie is running (sub_44DAF0).
+    pub(crate) fn movie_playing(&self, handle: i32) -> bool {
+        self.processes
+            .get(&handle)
+            .is_some_and(|process| process.movie.is_some() && process.active && !process.paused)
+    }
+
+    /// The picture size the target's renderer (DCVideoImageSender,
+    /// sub_45C1C0) gives the bitmap slot when the graph connects.
+    pub(crate) fn movie_size(&self, handle: i32) -> Option<(u32, u32)> {
+        self.processes.get(&handle)?.movie.as_ref()?.size
+    }
+
+    /// Decode the already-buffered opening frame before the target creates a
+    /// bitmap slot.  This lets consoles install the real image directly,
+    /// avoiding a temporary 1280x720 blank RGBA surface at movie start.
+    pub(crate) fn prepare_initial_movie_frame(&mut self, handle: i32) -> Option<MovieFrameUpdate> {
+        let movie = self.processes.get_mut(&handle)?.movie.as_mut()?;
+        let image = movie.prepare_initial_frame()?;
+        Some(MovieFrameUpdate {
+            bitmap: handle,
+            image,
+        })
     }
 
     pub(crate) fn is_movie(&self, handle: i32) -> bool {
@@ -544,6 +626,21 @@ impl GraphEffectRegistry {
             }
         }
         updates
+    }
+
+    pub(crate) fn movie_diagnostics(&self) -> Vec<(i32, bool, i32, Option<usize>)> {
+        self.processes
+            .iter()
+            .filter_map(|(&handle, process)| {
+                let movie = process.movie.as_ref()?;
+                Some((
+                    handle,
+                    process.active,
+                    process.position_ms,
+                    movie.frame_index,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn movie_audio(&self) -> Vec<MovieAudio> {
@@ -619,8 +716,7 @@ impl GraphEffectRegistry {
 }
 
 fn probe_mpeg_duration_ms(bytes: &[u8]) -> i32 {
-    let mut demuxer = Demuxer::new_auto();
-    let packets = demuxer.push(bytes, None);
+    let packets = packet_ranges(bytes);
     let mut first_pts = None;
     let mut last_pts = None;
     let mut pictures = 0_u64;
@@ -634,8 +730,8 @@ fn probe_mpeg_duration_ms(bytes: &[u8]) -> i32 {
             first_pts.get_or_insert(pts);
             last_pts = Some(pts);
         }
-        pictures += count_start_codes(&packet.data, 0x00) as u64;
-        frame_rate = frame_rate.or_else(|| sequence_frame_rate(&packet.data));
+        pictures += count_start_codes(&bytes[packet.range.clone()], 0x00) as u64;
+        frame_rate = frame_rate.or_else(|| sequence_frame_rate(&bytes[packet.range.clone()]));
     }
 
     let frame_ms = frame_rate
@@ -686,9 +782,25 @@ fn sequence_frame_rate(bytes: &[u8]) -> Option<f64> {
     })
 }
 
+/// Horizontal and vertical size of an MPEG-1/2 sequence header (12 bits each).
+fn sequence_frame_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    bytes.windows(7).find_map(|window| {
+        let width = (u32::from(window[4]) << 4) | u32::from(window[5] >> 4);
+        let height = (u32::from(window[5] & 0x0F) << 8) | u32::from(window[6]);
+        (window[..4] == [0, 0, 1, 0xB3] && width > 0 && height > 0).then_some((width, height))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_header_frame_size_is_decoded() {
+        // 1280 = 0x500, 720 = 0x2D0.
+        let bytes = [0, 0, 1, 0xB3, 0x50, 0x02, 0xD0, 3];
+        assert_eq!(sequence_frame_size(&bytes), Some((1280, 720)));
+    }
 
     #[test]
     fn sequence_header_frame_rate_is_decoded() {
@@ -735,6 +847,33 @@ mod tests {
         stream
     }
 
+    #[test]
+    fn large_elementary_stream_is_decoded_incrementally() {
+        // A sequence header followed by padding: startup must not feed the
+        // entire input to Decoder, which would allocate a movie-sized ES buffer.
+        let mut bytes = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0, 0, 0x20, 0];
+        bytes.extend_from_slice(&[0, 0, 1, 0xB7]);
+        bytes.resize(2 * 1024 * 1024, 0);
+        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes)).unwrap();
+        assert_eq!(movie.packet_index, 1);
+        assert!(movie.packets.iter().all(|p| p.range.len() <= 64 * 1024));
+        assert!(movie.pending_frames.is_empty());
+    }
+
+    #[test]
+    fn borrowed_movie_probe_matches_owned_demux() {
+        let bytes = tiny_movie();
+        let mut demux = na_mpeg2_decoder::Demuxer::new_auto();
+        let owned = demux.push(&bytes, None);
+        let borrowed = packet_ranges(&bytes);
+        assert_eq!(owned.len(), borrowed.len());
+        for (owned, borrowed) in owned.iter().zip(borrowed) {
+            assert_eq!(owned.stream_type, borrowed.stream_type);
+            assert_eq!(owned.pts_90k, borrowed.pts_90k);
+            assert_eq!(owned.data, bytes[borrowed.range]);
+        }
+    }
+
     fn command_labels(commands: Vec<AudioCommand>) -> Vec<&'static str> {
         commands
             .into_iter()
@@ -753,9 +892,16 @@ mod tests {
     fn movie_soundtrack_is_kept_and_restarts_with_the_movie() {
         let mut registry = GraphEffectRegistry::default();
         assert_eq!(
-            registry.configure_media(5, "a".into(), "m".into(), &tiny_movie()),
+            registry.configure_media(
+                5,
+                "a".into(),
+                "m".into(),
+                MovieBytes::from_vec(tiny_movie())
+            ),
             0
         );
+        // 92:F2 sizes the bitmap slot from the sequence header.
+        assert_eq!(registry.movie_size(5), Some((320, 240)));
         let audio = registry.movie_audio();
         assert_eq!(audio.len(), 1);
         assert_eq!(&*audio[0].bytes.0, b"firstsecond");
@@ -773,7 +919,12 @@ mod tests {
     #[test]
     fn movie_audio_commands_follow_the_movie() {
         let mut registry = GraphEffectRegistry::default();
-        registry.configure_media(5, "a".into(), "m".into(), &tiny_movie());
+        registry.configure_media(
+            5,
+            "a".into(),
+            "m".into(),
+            MovieBytes::from_vec(tiny_movie()),
+        );
         let mut sent = BTreeMap::new();
         let mut step = |registry: &GraphEffectRegistry| {
             command_labels(movie_audio_commands(registry.movie_audio(), &mut sent))
@@ -812,6 +963,34 @@ mod tests {
             "closing the movie stops its soundtrack"
         );
         assert!(step(&registry).is_empty());
+    }
+
+    /// What an archive of images looks like to the demuxer: no pack header,
+    /// so one video elementary stream, whose compressed data happens to hold
+    /// picture start codes but no sequence header before them.
+    fn image_archive() -> Vec<u8> {
+        let mut bytes = b"BURIKO ARC20".to_vec();
+        for chunk in 0..8u8 {
+            bytes.extend_from_slice(&[0x5A ^ chunk; 61]);
+            bytes.extend_from_slice(&[0, 0, 1, 0x00]);
+        }
+        bytes
+    }
+
+    /// Wonderful Everyday names one movie by an archive of 185 images; the
+    /// stray picture start codes in it added up to a 2,903 ms movie that
+    /// played nothing.
+    #[test]
+    fn a_file_whose_first_video_packet_does_not_decode_is_no_movie() {
+        let bytes = image_archive();
+        assert!(probe_mpeg_duration_ms(&bytes) > 0);
+        let mut registry = GraphEffectRegistry::default();
+        assert_eq!(
+            registry.configure_media(5, String::new(), "m".into(), MovieBytes::from_vec(bytes)),
+            2
+        );
+        assert_eq!(registry.state(5), 4, "no movie process");
+        assert!(registry.movie_audio().is_empty());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+pub mod clock;
+
 use std::path::{Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, EthornellError>;
@@ -61,11 +63,13 @@ pub struct Version {
     pub compatibility: Option<String>,
 }
 
+/// Warnings and errors only by default; the per-frame engine trace is
+/// `RUST_LOG=ethornell=info` (or `debug`).
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ethornell=info,wgpu=warn".into()),
+                .unwrap_or_else(|_| "ethornell=warn,wgpu=warn".into()),
         )
         .try_init();
 }
@@ -109,6 +113,7 @@ pub fn classify_native_blend(selector: i32) -> NativeBlendPath {
 /// The formulas match the current wgpu pipeline state. Unknown selectors use
 /// source-over but retain their raw selector through [`NativeBlendPath`]; they
 /// are not renamed to a native operation that has not been recovered.
+#[inline]
 pub fn composite_native_rgba(
     destination: &mut [u8; 4],
     source: [u8; 4],
@@ -127,6 +132,12 @@ pub fn composite_native_rgba(
             destination[channel] =
                 (source_channel + ((delta * transparency) >> 8)).clamp(0, 255) as u8;
         }
+        return;
+    }
+    if opacity == 1.0 && source[3] == 255
+        && !matches!(classify_native_blend(selector), NativeBlendPath::Additive | NativeBlendPath::Subtractive)
+    {
+        *destination = source;
         return;
     }
     let source_alpha = (source[3] as f32 / 255.0) * opacity;

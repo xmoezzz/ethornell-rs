@@ -277,7 +277,7 @@ pub unsafe extern "C" fn ethornell_android_build_info(out: *mut u8, capacity: u3
             concat!(
                 "ethornell host ABI=1 source=",
                 env!("ETHORNELL_SOURCE_REV"),
-                "; pending working-tree provenance in build manifest; MPEG video-only; SWF partial; no WMV/BMV/MP4/IME"
+                "; pending working-tree provenance in build manifest; MPEG video-only; SWF partial; no WMV/BMV/MP4"
             ),
             out,
             capacity,
@@ -360,6 +360,7 @@ pub unsafe extern "C" fn ethornell_android_create(config: *const ConfigV1, out: 
             } else {
                 Some(font.into())
             },
+            font_data: None,
             font_face_index: config.font_face_index,
             gbk: config.text_encoding == 1,
             backend: config.backend,
@@ -494,13 +495,44 @@ pub unsafe extern "C" fn ethornell_android_complete_request(
             return fail(ARG, "response struct_size mismatch");
         }
         let response = unsafe { &*response };
-        if response.text.len != 0 || response.text.reserved != 0 {
-            return fail(ARG, "response text unsupported in v1");
-        }
+        // Kind-5 dialog requests are answered with JSON text; every other
+        // request takes the integer result and no text.
+        let text = match unsafe { string(StringV1 { ..response.text }) } {
+            Ok(text) => text,
+            Err(status) => return status,
+        };
         with_session(h, false, |r| {
-            r.complete_request(id, response.result)
-                .map_err(|e| e.to_string())
+            if text.is_empty() {
+                r.complete_request(id, response.result)
+            } else {
+                r.complete_dialog(id, &text)
+            }
+            .map_err(|e| e.to_string())
         })
+    })
+}
+/// The JSON description of a kind-5 dialog request, with the build_info
+/// size convention (required bytes including NUL; NULL/0 queries the size).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ethornell_android_request_payload(
+    h: u64,
+    id: u64,
+    out: *mut u8,
+    capacity: u32,
+) -> i32 {
+    guarded(|| {
+        let mut payload = None;
+        let status = with_session(h, true, |r| {
+            payload = r.request_payload(id);
+            payload
+                .is_some()
+                .then_some(())
+                .ok_or_else(|| "unknown/stale request".to_string())
+        });
+        match payload {
+            Some(payload) if status == 0 => unsafe { copy_string(&payload, out, capacity) },
+            _ => status,
+        }
     })
 }
 #[unsafe(no_mangle)]

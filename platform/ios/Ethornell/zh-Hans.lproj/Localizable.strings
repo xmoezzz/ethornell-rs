@@ -11,3 +11,6 @@
 "Close the game?" = "关闭游戏？";
 "Close" = "关闭";
 "Cancel" = "取消";
+"Field %d" = "字段 %d";
+"Month (1-12)" = "月（1-12）";
+"Day" = "日";

@@ -9,13 +9,23 @@ workspace = true
 [features]
 default = ["desktop-window"]
 desktop-window = ["dep:winit"]
+native-gpu = []
 
 [dependencies]
 ethornell-core = { path = "../ethornell-core" }
-wgpu.workspace = true
-winit = { workspace = true, optional = true }
-raw-window-handle = "0.6"
 tracing.workspace = true
 bytemuck.workspace = true
 ethornell-image = { path = "../ethornell-image" }
 ab_glyph.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgl"] }
+web-sys = { version = "0.3", features = ["OffscreenCanvas"] }
+
+[target.'cfg(not(any(target_arch = "wasm32",target_os="vita",target_os="horizon")))'.dependencies.wgpu]
+workspace = true
+features = ["dx12", "metal", "webgpu"]
+
+[target.'cfg(not(any(target_os="vita",target_os="horizon")))'.dependencies]
+winit = { workspace = true, optional = true }
+raw-window-handle = "0.6"

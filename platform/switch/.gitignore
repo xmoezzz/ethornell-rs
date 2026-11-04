@@ -1,0 +1,6 @@
+/runtime/build/
+/runtime/romfs/
+/runtime/*.elf
+/runtime/*.nacp
+/runtime/*.nro
+/runtime/*.map

@@ -1,12 +1,32 @@
 use ethornell_core::{EthornellError, Result};
 use kira::dsp::Frame;
-use kira::manager::backend::{Backend, DefaultBackend};
+use kira::manager::backend::Backend;
+#[cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))]
+use kira::manager::backend::DefaultBackend;
+
+#[cfg(any(target_arch="wasm32",target_os="vita",target_os="horizon"))]
+pub mod pump;
+#[cfg(not(target_arch = "wasm32"))]
+mod streamed;
+/// Desktop/mobile use cpal; web and native consoles pull the shared mixer.
+#[cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))]
+pub type PlatformBackend = DefaultBackend;
+#[cfg(any(target_arch="wasm32",target_os="vita",target_os="horizon"))]
+pub type PlatformBackend = pump::PumpBackend;
 use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::sound::{
     FromFileError, PlaybackPosition, PlaybackState,
     static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
-    streaming::{StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings};
+
+/// A sound decoded while it plays. kira streams on a decoder thread, which
+/// the web lacks; there the sound is decoded up front instead.
+#[cfg(not(target_arch = "wasm32"))]
+type StreamHandle = StreamingSoundHandle<FromFileError>;
+#[cfg(target_arch = "wasm32")]
+type StreamHandle = StaticSoundHandle;
 use kira::tween::Tween;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -111,13 +131,13 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-pub struct AudioSystem<B: Backend = DefaultBackend> {
+pub struct AudioSystem<B: Backend = PlatformBackend> {
     manager: AudioManager<B>,
     volume: f64,
     channels: BTreeMap<i32, StaticSoundHandle>,
     /// Channels playing a sound that is decoded while it plays (movie
     /// soundtracks). A channel is in at most one of the two maps.
-    streams: BTreeMap<i32, StreamingSoundHandle<FromFileError>>,
+    streams: BTreeMap<i32, StreamHandle>,
     next_unmanaged_channel: i32,
     host_suspended: bool,
 }
@@ -256,32 +276,40 @@ impl<B: Backend> AudioSystem<B> {
             return Ok(false);
         }
 
-        let intro = decode_static_sound(intro_bytes, StaticSoundSettings::default())?;
-        let loop_sound = decode_static_sound(loop_bytes, StaticSoundSettings::default())?;
-        if intro.sample_rate != loop_sound.sample_rate {
-            return Err(EthornellError::Other(format!(
-                "BGM pair sample-rate mismatch: intro={}Hz loop={}Hz",
-                intro.sample_rate, loop_sound.sample_rate
-            )));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let settings = streaming_settings(volume, playback_rate, panning, fade_in_ms);
+            self.start_streamed(channel, Some(intro_bytes), loop_bytes, looped.then_some(0), decode_gain, settings)
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let intro = decode_static_sound(intro_bytes, StaticSoundSettings::default())?;
+            let loop_sound = decode_static_sound(loop_bytes, StaticSoundSettings::default())?;
+            if intro.sample_rate != loop_sound.sample_rate {
+                return Err(EthornellError::Other(format!(
+                    "BGM pair sample-rate mismatch: intro={}Hz loop={}Hz",
+                    intro.sample_rate, loop_sound.sample_rate
+                )));
+            }
 
-        let loop_start = intro.frames.len();
-        let mut frames = Vec::with_capacity(loop_start.saturating_add(loop_sound.frames.len()));
-        frames.extend_from_slice(&intro.frames);
-        frames.extend_from_slice(&loop_sound.frames);
+            let loop_start = intro.frames.len();
+            let mut frames = Vec::with_capacity(loop_start.saturating_add(loop_sound.frames.len()));
+            frames.extend_from_slice(&intro.frames);
+            frames.extend_from_slice(&loop_sound.frames);
 
-        let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
-        if looped {
-            settings = settings
-                .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
+            let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
+            if looped {
+                settings = settings
+                    .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
+            }
+            let mut data = StaticSoundData {
+                sample_rate: intro.sample_rate,
+                frames: frames.into(),
+                settings,
+            };
+            apply_decode_gain(&mut data, decode_gain);
+            self.start_static_sound(channel, data)
         }
-        let mut data = StaticSoundData {
-            sample_rate: intro.sample_rate,
-            frames: frames.into(),
-            settings,
-        };
-        apply_decode_gain(&mut data, decode_gain);
-        self.start_static_sound(channel, data)
     }
 
     fn play_on_channel_inner(
@@ -300,13 +328,67 @@ impl<B: Backend> AudioSystem<B> {
         if !restart && self.channel_is_active(channel) {
             return Ok(false);
         }
+        // The Ogg box's end-of-stream listener (sub_4AA420) seeks back to the
+        // header's loop start (+0x1C), not to the first sample.
+        let loop_start = buriko_wave_loop_start(bytes).min(i64::MAX as u64) as i64;
+        #[cfg(not(target_arch = "wasm32"))]
+        if declared_frame_count(bytes).is_some_and(|frames| frames > STREAMED_FRAMES) {
+            let settings = streaming_settings(volume, playback_rate, panning, fade_in_ms);
+            let loop_start = looped.then_some(loop_start as usize);
+            return self.start_streamed(channel, None, bytes, loop_start, decode_gain, settings);
+        }
         let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
         if looped {
-            settings = settings.loop_region(..);
+            settings = settings.loop_region(PlaybackPosition::Samples(loop_start)..);
         }
         let mut data = decode_static_sound(bytes, settings)?;
         apply_decode_gain(&mut data, decode_gain);
         self.start_static_sound(channel, data)
+    }
+
+    /// Plays `body`, after `intro` if given, decoding while it plays. A loop
+    /// returns to `loop_start` frames into the body.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_streamed(
+        &mut self,
+        channel: i32,
+        intro: Option<&[u8]>,
+        body: &[u8],
+        loop_start: Option<usize>,
+        decode_gain: f64,
+        mut settings: StreamingSoundSettings,
+    ) -> Result<bool> {
+        let part = |bytes: &[u8]| {
+            (
+                unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes).to_vec(),
+                declared_frame_count(bytes),
+            )
+        };
+        let decoder =
+            streamed::StreamedDecoder::new(intro.map(part), part(body), decode_gain.max(0.0) as f32)
+                .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
+        let (intro_rate, body_rate) = decoder.sample_rates();
+        if intro_rate != body_rate {
+            return Err(EthornellError::Other(format!(
+                "BGM pair sample-rate mismatch: intro={intro_rate}Hz loop={body_rate}Hz"
+            )));
+        }
+        if let Some(loop_start) = loop_start {
+            let loop_start = decoder.body_start().saturating_add(loop_start);
+            settings = settings
+                .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
+        }
+        let handle = self
+            .manager
+            .play(StreamingSoundData::from_decoder(decoder, settings))
+            .map_err(|err| EthornellError::Other(format!("play audio stream failed: {err}")))?;
+        if let Some(mut previous) = self.channels.remove(&channel) {
+            let _ = previous.stop(Tween::default());
+        }
+        if let Some(mut previous) = self.streams.insert(channel, handle) {
+            let _ = previous.stop(Tween::default());
+        }
+        Ok(true)
     }
 
     fn start_static_sound(&mut self, channel: i32, data: StaticSoundData) -> Result<bool> {
@@ -337,13 +419,17 @@ impl<B: Backend> AudioSystem<B> {
         volume: f64,
         start_ms: u64,
     ) -> Result<()> {
-        let mut settings = StreamingSoundSettings::default()
+        #[cfg(not(target_arch = "wasm32"))]
+        let (settings, load) = (StreamingSoundSettings::default(), StreamingSoundData::from_cursor);
+        #[cfg(target_arch = "wasm32")]
+        let (settings, load) = (StaticSoundSettings::default(), StaticSoundData::from_cursor);
+        let mut settings = settings
             .volume(volume.clamp(0.0, 1.0))
             .playback_region(Duration::from_millis(start_ms).as_secs_f64()..);
         if looped {
             settings = settings.loop_region(..);
         }
-        let data = StreamingSoundData::from_cursor(Cursor::new(bytes), settings)
+        let data = load(Cursor::new(bytes), settings)
             .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
         let handle = self
             .manager
@@ -512,6 +598,15 @@ fn validate_playback_parameters(volume: f64, gain: f64, rate: f64, panning: f64)
 
 /// Decodes a whole sound, cut to the length its file declares
 /// (`declared_frame_count`).
+/// BURIKO wave box header +0x1C: the sample a looping stream returns to.
+fn buriko_wave_loop_start(bytes: &[u8]) -> u64 {
+    if probe_audio(bytes).kind == AudioKind::BurikoWaveBoxOgg {
+        read_u32(bytes, 0x1C).map_or(0, u64::from)
+    } else {
+        0
+    }
+}
+
 fn decode_static_sound(bytes: &[u8], settings: StaticSoundSettings) -> Result<StaticSoundData> {
     let payload = unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes);
     let mut data = StaticSoundData::from_cursor(Cursor::new(payload.to_vec()), settings)
@@ -566,6 +661,31 @@ fn ogg_end_position(data: &[u8]) -> Option<u64> {
     }
     let granule = u64::from_le_bytes(page[6..14].try_into().ok()?);
     (granule != u64::MAX).then_some(granule)
+}
+
+/// Sounds longer than this (~20 s at 48 kHz, 8 MB decoded) are decoded
+/// while they play, not up front.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAMED_FRAMES: usize = 1 << 20;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn streaming_settings(
+    volume: f64,
+    playback_rate: f64,
+    panning: f64,
+    fade_in_ms: u64,
+) -> StreamingSoundSettings {
+    let mut settings = StreamingSoundSettings::default()
+        .volume(volume.clamp(0.0, 1.0))
+        .playback_rate(playback_rate.clamp(0.01, 16.0))
+        .panning(panning.clamp(0.0, 1.0));
+    if fade_in_ms > 0 {
+        settings = settings.fade_in_tween(Tween {
+            duration: Duration::from_millis(fade_in_ms),
+            ..Tween::default()
+        });
+    }
+    settings
 }
 
 fn playback_settings(

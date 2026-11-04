@@ -1,0 +1,98 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f2ee;
+  --fg: #1d1b18;
+  --muted: #6b665e;
+  --accent: #8a3b2a;
+  --panel: #ffffff;
+  --line: #d9d4cb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161514;
+    --fg: #ebe7e0;
+    --muted: #a39d93;
+    --accent: #e08a6f;
+    --panel: #22201e;
+    --line: #3a3733;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#launcher {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 3rem 1rem;
+}
+h1 { margin: 0 0 1rem; font-weight: 600; }
+code { font-size: 0.9em; }
+.row { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.5rem 0 0.5rem; }
+.button {
+  display: inline-block;
+  padding: 0.6rem 1.1rem;
+  border-radius: 0.4rem;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  user-select: none;
+}
+.button.secondary {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--line);
+}
+.hint { color: var(--muted); font-size: 0.9rem; min-height: 1.5em; }
+details { margin-top: 1rem; }
+details label { display: block; margin: 0.4rem 0; }
+#stage {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#stage[hidden] { display: none; }
+#screen {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  outline: none;
+}
+dialog {
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--fg);
+  max-width: min(32rem, calc(100vw - 2rem));
+  padding: 1.25rem;
+}
+dialog::backdrop { background: rgb(0 0 0 / 0.5); }
+dialog h2 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+dialog p { white-space: pre-wrap; }
+#prompt-fields label { display: block; margin: 0.5rem 0; }
+#prompt-fields input, #prompt-fields select {
+  display: block;
+  width: 100%;
+  margin-top: 0.2rem;
+  padding: 0.4rem;
+  font: inherit;
+}
+#prompt-fields .options button { display: block; width: 100%; margin: 0.3rem 0; }
+menu { display: flex; justify-content: flex-end; gap: 0.5rem; padding: 0; margin: 1rem 0 0; }
+menu button, #prompt-fields .options button {
+  padding: 0.45rem 1rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+menu button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }

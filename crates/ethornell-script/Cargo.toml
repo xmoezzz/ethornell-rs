@@ -11,3 +11,6 @@ ethornell-core = { path = "../ethornell-core" }
 serde.workspace = true
 byteorder.workspace = true
 encoding_rs.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

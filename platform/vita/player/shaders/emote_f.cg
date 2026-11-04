@@ -1,0 +1,44 @@
+// E-mote object fragment (render/shaders/emote.wgsl fs_main). Stencil masks
+// use it too, with colour writes off: the discards shape the mask.
+float4 native_texture_stage(float4 c, float blend_mode)
+{
+    // blend_mode is an integer bit field: bits 4..7 (0x10: doubled colour)
+    // and the low mode in bits 0..3 and 8..15.
+    float mode = floor(blend_mode + 0.5);
+    float high = floor(mode / 16.0);
+    float nibble = high - 16.0 * floor(high / 16.0);
+    float low = mode - 16.0 * high + 256.0 * floor(mode / 256.0);
+    float3 rgb = c.rgb;
+    if (nibble == 1.0) {
+        rgb = clamp(rgb * 2.0, 0.0, 1.0);
+    }
+    if (low == 3.0 || low == 4.0) {
+        rgb = rgb * c.a;
+    } else if (low == 5.0) {
+        rgb = float3(1.0, 1.0, 1.0) - rgb;
+    }
+    return float4(rgb, c.a);
+}
+
+float4 main(
+    float4 model_texcoord : TEXCOORD0,
+    float4 color : TEXCOORD1,
+    float4 clip_rect : TEXCOORD2,
+    float4 wipe_blend : TEXCOORD3,
+    uniform sampler2D sprite_tex : TEXUNIT0) : COLOR
+{
+    float2 model_position = model_texcoord.xy;
+    if (model_position.x < clip_rect.x || model_position.y < clip_rect.y
+        || model_position.x > clip_rect.z || model_position.y > clip_rect.w) {
+        discard;
+    }
+    float4 c = tex2D(sprite_tex, model_texcoord.zw) * color;
+    if (wipe_blend.z > 0.5) {
+        c = float4(c.rgb, clamp(c.a * wipe_blend.x + wipe_blend.y, 0.0, 1.0));
+    }
+    c = native_texture_stage(c, wipe_blend.w);
+    if (c.a <= 0.003) {
+        discard;
+    }
+    return c;
+}

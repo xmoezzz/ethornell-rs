@@ -1,7 +1,8 @@
 use crate::MAIN_THREAD_ID;
+use crate::local_window::LocalWindow;
 use crate::{
-    ADDRESS_MASK, GraphApi, LOCAL_MEMORY_BASE, SoundApi, SysApi, Value, Vm, VmRunOptions,
-    VmStopReason,
+    ADDRESS_MASK, GraphApi, HEAP_MEMORY_BASE, LOCAL_MEMORY_BASE, SoundApi, SysApi, Value, Vm,
+    VmRunOptions, VmStopReason,
 };
 use ethornell_script::BpProgram;
 use std::sync::Arc;
@@ -12,6 +13,12 @@ pub(crate) struct AsyncProgramTask {
     pub(crate) vm: Box<Vm>,
     pub(crate) runnable: bool,
     pub(crate) completed: bool,
+}
+
+impl AsyncProgramTask {
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 impl Vm {
@@ -46,26 +53,42 @@ impl Vm {
         args: Vec<Value>,
         trace_events: bool,
     ) -> Option<i32> {
+        self.spawn_async_program(program, args, None, trace_events)
+    }
+
+    /// A thread whose id was taken already (Sys81:44 numbers the child
+    /// before it reserves its blocks).
+    pub(crate) fn start_async_program_with_thread_id(
+        &mut self,
+        program: Value,
+        thread_id: i32,
+        trace_events: bool,
+    ) -> bool {
+        self.spawn_async_program(program, Vec::new(), Some(thread_id), trace_events)
+            .is_some()
+    }
+
+    fn spawn_async_program(
+        &mut self,
+        program: Value,
+        args: Vec<Value>,
+        thread_id: Option<i32>,
+        trace_events: bool,
+    ) -> Option<i32> {
         let Some(program) = self.value_program(program) else {
             return None;
         };
         let key = program_key(&program);
 
-        self.flush_shared_heap();
-        let mut vm = Vm::new();
+        // The new thread gets the globals and heap when it first runs (see
+        // `hand_over_memory`); until then it owns only its local region.
+        // Global user data follows the active process buffer during handover;
+        // an idle thread must not keep another 1 MiB snapshot of it.
+        let mut vm = Vm::with_buffers(Vec::new(), Vec::new());
         vm.native_abi_profile = self.native_abi_profile;
         vm.graph_text_encoding = self.graph_text_encoding;
-        vm.shared_heap = Arc::clone(&self.shared_heap);
         vm.system80_shared = Arc::clone(&self.system80_shared);
         vm.system81_shared = Arc::clone(&self.system81_shared);
-        vm.sync_shared_heap();
-        let shared_end = shared_memory_end(self);
-        vm.memory[..shared_end].copy_from_slice(&self.memory[..shared_end]);
-        vm.mem_values = self
-            .mem_values
-            .range(..LOCAL_MEMORY_BASE)
-            .map(|(addr, value)| (*addr, value.clone()))
-            .collect();
         vm.heap_ptr = self.heap_ptr;
         vm.record_tables = self.record_tables.clone();
         vm.next_record_table_handle = self.next_record_table_handle;
@@ -77,8 +100,7 @@ impl Vm {
         vm.save_data_integrity_enabled = self.save_data_integrity_enabled;
         vm.next_binary_or_bmv_async = self.next_binary_or_bmv_async;
         vm.exclusive_thread_id = self.exclusive_thread_id;
-        vm.global_config = self.global_config.clone();
-        vm.global_user_data = self.global_user_data.clone();
+        vm.global_size = self.global_size;
         vm.loaded_bcs_ranges = self.loaded_bcs_ranges.clone();
         vm.timing = self.timing.clone();
         vm.rng_seed = self.rng_seed;
@@ -89,9 +111,13 @@ impl Vm {
         vm.secondary_resource_root = self.secondary_resource_root.clone();
         vm.validated_file_root = self.validated_file_root.clone();
         vm.system_wait_state = self.system_wait_state;
-        vm.start(&program);
-        let thread_id = self.next_thread_id.max(1);
-        self.next_thread_id = self.next_thread_id.saturating_add(1).max(1);
+        vm.start_execution(&program, false);
+        vm.parked_local = Some(LocalWindow::from_code(&program.code));
+        let thread_id = thread_id.unwrap_or_else(|| {
+            let thread_id = self.next_thread_id.max(1);
+            self.next_thread_id = self.next_thread_id.saturating_add(1).max(1);
+            thread_id
+        });
         vm.next_thread_id = self.next_thread_id;
         vm.thread.set_thread_id(thread_id);
         vm.thread.set_root_thread_id(Some(self.thread.thread_id()));
@@ -328,8 +354,6 @@ impl Vm {
     where
         A: SysApi + GraphApi + SoundApi,
     {
-        self.flush_shared_heap();
-        self.sync_shared_heap();
         let trace_async = trace_events || std::env::var_os("TRACE_ASYNC_PROGRAMS").is_some();
 
         // Native `sub_48CD70` walks one flat CThread list. Status 3 replaces
@@ -382,8 +406,10 @@ impl Vm {
                 ..run_options.clone()
             };
             let mut task = self.async_tasks.remove(cursor);
-            task.vm.sync_shared_heap();
             transfer_async_shared_state(self, &mut task.vm);
+            let mut others = std::mem::take(&mut self.async_tasks);
+            lend_owner_window(self, &mut others, &mut task.vm);
+            self.async_tasks = others;
             let mut scheduler_tasks = std::mem::take(&mut self.async_tasks);
             scheduler_tasks.append(&mut task.vm.async_tasks);
             task.vm.async_tasks = scheduler_tasks;
@@ -393,7 +419,8 @@ impl Vm {
             } else {
                 self.root_procedure_active
             };
-            let report = task.vm.run_loaded(api, &options);
+            let report = task.vm.run_loaded_internal(api, &options, false);
+            self.pass_yields += task.vm.pass_yields;
             if options.collect_diagnostics || report.stop_reason.is_fatal() {
                 self.async_reports.push(report.clone());
             }
@@ -407,8 +434,6 @@ impl Vm {
                     "async VM host watchdog ended this scheduler slice"
                 );
             }
-            task.vm.flush_shared_heap();
-            self.sync_shared_heap();
             let root_messages = std::mem::take(&mut task.vm.pending_root_program_messages);
             let root_callbacks = std::mem::take(&mut task.vm.pending_root_program_callbacks);
             if trace_async {
@@ -450,11 +475,13 @@ impl Vm {
                 VmStopReason::Completed | VmStopReason::InterpreterTerminated
             ) {
                 task.completed = true;
+                task.vm.release_child_thread_regions();
                 if report.stop_reason != VmStopReason::InterpreterTerminated {
                     task.vm.thread.mark_terminated();
                 }
             }
             let mut scheduler_tasks = std::mem::take(&mut task.vm.async_tasks);
+            lend_owner_window(self, &mut scheduler_tasks, &mut task.vm);
             transfer_async_shared_state(&mut task.vm, self);
             self.thread.extend_messages(root_messages);
             for callback in root_callbacks {
@@ -463,9 +490,14 @@ impl Vm {
             scheduler_tasks.insert(cursor.min(scheduler_tasks.len()), task);
             self.async_tasks = scheduler_tasks;
             scheduler_hops += 1;
-            if report.stop_reason.is_fatal() {
+            if report.stop_reason.is_fatal()
+                || report.stop_reason == VmStopReason::InterpreterTerminated
+            {
                 // Keep the failing context and report its actual thread/PC to
                 // the root host. It is not a successfully completed coroutine.
+                // Sys80:6A (status 6) from any thread ends the whole
+                // interpreter: sub_48D860 returns it to WinMain, which exits
+                // (endsys._bp quits from a child thread).
                 self.refresh_thread_links();
                 return Some(report);
             }
@@ -522,91 +554,6 @@ impl Vm {
         }
     }
 
-    pub(crate) fn mark_shared_heap_dirty(&mut self, range: std::ops::Range<usize>) {
-        if range.start >= range.end {
-            return;
-        }
-        let mut start = range.start;
-        let mut end = range.end;
-        self.shared_heap_dirty.retain(|existing| {
-            if existing.end < start || existing.start > end {
-                true
-            } else {
-                start = start.min(existing.start);
-                end = end.max(existing.end);
-                false
-            }
-        });
-        self.shared_heap_dirty.push(start..end);
-    }
-
-    fn flush_shared_heap(&mut self) {
-        if self.shared_heap_dirty.is_empty() {
-            return;
-        }
-        let ranges = std::mem::take(&mut self.shared_heap_dirty);
-        let mut shared = self
-            .shared_heap
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        shared.generation = shared.generation.saturating_add(1);
-        let generation = shared.generation;
-        for range in ranges {
-            if shared.bytes.len() < range.end {
-                shared.bytes.resize(range.end, 0);
-            }
-            shared.bytes[range.clone()].copy_from_slice(&self.memory[range.clone()]);
-            let value_range = range.start as u32..range.end as u32;
-            shared
-                .values
-                .extract_if(value_range.clone(), |_, _| true)
-                .for_each(drop);
-            shared.values.extend(
-                self.mem_values
-                    .range(value_range)
-                    .map(|(addr, value)| (*addr, value.clone())),
-            );
-            shared
-                .journal
-                .push(super::SharedHeapJournalEntry { generation, range });
-        }
-        self.shared_heap_generation = generation;
-    }
-
-    fn sync_shared_heap(&mut self) {
-        let shared = self
-            .shared_heap
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.shared_heap_generation == shared.generation {
-            return;
-        }
-        let first = shared
-            .journal
-            .partition_point(|entry| entry.generation <= self.shared_heap_generation);
-        let ranges = shared.journal[first..]
-            .iter()
-            .map(|entry| entry.range.clone())
-            .collect::<Vec<_>>();
-        for range in ranges {
-            if self.memory.len() < range.end {
-                self.memory.resize(range.end, 0);
-            }
-            self.memory[range.clone()].copy_from_slice(&shared.bytes[range.clone()]);
-            let value_range = range.start as u32..range.end as u32;
-            self.mem_values
-                .extract_if(value_range.clone(), |_, _| true)
-                .for_each(drop);
-            self.mem_values.extend(
-                shared
-                    .values
-                    .range(value_range)
-                    .map(|(addr, value)| (*addr, value.clone())),
-            );
-        }
-        self.shared_heap_generation = shared.generation;
-    }
-
     fn async_program_key(&self, value: &Value) -> Option<String> {
         if matches!(value, Value::Int(_) | Value::Ptr(_)) {
             let thread_id = value.as_i32();
@@ -627,7 +574,7 @@ impl Vm {
             Value::Program(program) => Some((*program).clone()),
             Value::Ptr(ptr) => self
                 .mem_values
-                .get(&Self::value_key(ptr))
+                .get(&self.value_key(ptr))
                 .and_then(|value| {
                     if let Value::Program(program) = value {
                         Some((**program).clone())
@@ -637,7 +584,7 @@ impl Vm {
                 }),
             Value::Int(ptr) => {
                 self.mem_values
-                    .get(&Self::value_key(ptr as u32))
+                    .get(&self.value_key(ptr as u32))
                     .and_then(|value| {
                         if let Value::Program(program) = value {
                             Some((**program).clone())
@@ -651,6 +598,23 @@ impl Vm {
     }
 }
 
+/// A DCTChildThread runs in its owner's local window: swapped in after the
+/// shared state reaches it and back out before it leaves (the swap is its
+/// own inverse). The owner is the scheduling VM or another idle task.
+fn lend_owner_window(scheduler: &mut Vm, tasks: &mut [AsyncProgramTask], child: &mut Vm) {
+    let Some(owner) = child.local_window_owner else {
+        return;
+    };
+    if scheduler.thread.thread_id() == owner {
+        crate::child_thread::lend_local_window(scheduler, child);
+    } else if let Some(task) = tasks
+        .iter_mut()
+        .find(|task| task.vm.thread.thread_id() == owner)
+    {
+        crate::child_thread::lend_local_window(&mut task.vm, child);
+    }
+}
+
 fn program_key(program: &BpProgram) -> String {
     program
         .script_name
@@ -659,10 +623,102 @@ fn program_key(program: &BpProgram) -> String {
         .to_string()
 }
 
-fn shared_memory_end(vm: &Vm) -> usize {
-    (vm.heap_ptr as usize)
-        .min(LOCAL_MEMORY_BASE as usize)
-        .min(vm.memory.len())
+/// Hands the process memory -- globals and the shared heap, as one buffer --
+/// to the thread about to run, without copying it. Only threads' local
+/// regions (`LOCAL_MEMORY_BASE..HEAP_MEMORY_BASE`, and their shadow values)
+/// stay with each thread. The idle side keeps a buffer whose globals and heap
+/// are stale; it gets the live one back before it runs again. Sharing the
+/// heap by copying it instead cost every idle thread a full heap.
+///
+/// The idle side keeps only its local region (`parked_local`), not a buffer
+/// of stale globals: one process buffer exists, plus one local region per
+/// thread.
+fn hand_over_memory(source: &mut Vm, destination: &mut Vm) {
+    let local = LOCAL_MEMORY_BASE as usize..HEAP_MEMORY_BASE;
+    let mut live = std::mem::take(&mut source.memory);
+    if live.len() < HEAP_MEMORY_BASE {
+        live.resize(HEAP_MEMORY_BASE, 0);
+    }
+    let mut scratch = std::mem::take(&mut source.local_window_scratch);
+    let mut window = take_local_window(destination);
+    let bounds = live.local_bounds();
+    let incoming_bounds = window.prefix_lengths();
+    window.exchange_bounded(&mut live[local], &mut scratch, bounds);
+    live.set_local_bounds(incoming_bounds);
+    source.parked_local = Some(window);
+    destination.memory = live;
+    destination.local_window_scratch = scratch;
+
+    let local_keys = LOCAL_MEMORY_BASE..HEAP_MEMORY_BASE as u32;
+    let source_locals = source
+        .mem_values
+        .extract_if(local_keys.clone(), |_, _| true)
+        .collect::<Vec<_>>();
+    let destination_locals = destination
+        .mem_values
+        .extract_if(local_keys, |_, _| true)
+        .collect::<Vec<_>>();
+    std::mem::swap(&mut source.mem_values, &mut destination.mem_values);
+    destination.mem_values.extend(destination_locals);
+    source.mem_values.clear();
+    source.mem_values.extend(source_locals);
+}
+
+/// A thread's own local region, out of its parked copy or its buffer (a new
+/// thread starts with a buffer of its own). The buffer is released.
+pub(crate) fn take_local_window(vm: &mut Vm) -> LocalWindow {
+    let local = LOCAL_MEMORY_BASE as usize..HEAP_MEMORY_BASE;
+    if let Some(window) = vm.parked_local.take() {
+        vm.memory = Vec::new().into();
+        return window;
+    }
+    let mut buffer = std::mem::take(&mut vm.memory).into_vec();
+    if buffer.is_empty() {
+        return LocalWindow::default();
+    }
+    if buffer.len() < HEAP_MEMORY_BASE {
+        buffer.resize(HEAP_MEMORY_BASE, 0);
+    }
+    buffer.truncate(HEAP_MEMORY_BASE);
+    buffer.drain(..LOCAL_MEMORY_BASE as usize);
+    debug_assert_eq!(buffer.len(), local.len());
+    LocalWindow::from_dense(buffer)
+}
+
+/// A byte of a thread's local region, parked or not (tests).
+#[cfg(test)]
+pub(crate) fn local_byte(vm: &Vm, addr: usize) -> u8 {
+    match vm.parked_local.as_ref() {
+        Some(window) => window.byte(addr - LOCAL_MEMORY_BASE as usize),
+        None => vm.memory[addr],
+    }
+}
+
+/// Exchange a parked local window with the active process buffer, including
+/// the write bounds. Child threads borrow their owner's window this way so a
+/// compact snapshot need not expand to 2 MiB merely to lend it for one pass.
+pub(crate) fn exchange_saved_local(vm: &mut Vm, window: &mut LocalWindow) {
+    if vm.memory.len() < HEAP_MEMORY_BASE {
+        vm.memory.resize(HEAP_MEMORY_BASE, 0);
+    }
+    let bounds = vm.memory.local_bounds();
+    let incoming_bounds = window.prefix_lengths();
+    window.exchange_bounded(
+        &mut vm.memory[LOCAL_MEMORY_BASE as usize..HEAP_MEMORY_BASE],
+        &mut vm.local_window_scratch, bounds,
+    );
+    vm.memory.set_local_bounds(incoming_bounds);
+}
+
+/// A thread's local region wherever it is: parked, or in its buffer.
+pub(crate) fn local_window_mut(vm: &mut Vm) -> &mut [u8] {
+    if vm.parked_local.is_none() && vm.memory.len() < HEAP_MEMORY_BASE {
+        vm.memory.resize(HEAP_MEMORY_BASE, 0);
+    }
+    match vm.parked_local.as_mut() {
+        Some(window) => window.as_mut_slice(),
+        None => &mut vm.memory[LOCAL_MEMORY_BASE as usize..HEAP_MEMORY_BASE],
+    }
 }
 
 fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
@@ -678,23 +734,7 @@ fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
             "VM indexed-record state transfer begin"
         );
     }
-    let shared_end = shared_memory_end(source);
-    if destination.memory.len() < shared_end {
-        destination.memory.resize(shared_end, 0);
-    }
-    destination.memory[..shared_end].copy_from_slice(&source.memory[..shared_end]);
-
-    // Leave thread-local and heap shadows in place. Only the global segment
-    // moves with the active thread; heap shadows use the dirty-range journal.
-    destination
-        .mem_values
-        .extract_if(..LOCAL_MEMORY_BASE, |_, _| true)
-        .for_each(drop);
-    destination.mem_values.extend(
-        source
-            .mem_values
-            .extract_if(..LOCAL_MEMORY_BASE, |_, _| true),
-    );
+    hand_over_memory(source, destination);
 
     std::mem::swap(&mut source.heap_ptr, &mut destination.heap_ptr);
     std::mem::swap(
@@ -705,6 +745,7 @@ fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
         &mut source.heap_free_blocks,
         &mut destination.heap_free_blocks,
     );
+    std::mem::swap(&mut source.target_heap, &mut destination.target_heap);
     std::mem::swap(&mut source.record_tables, &mut destination.record_tables);
     std::mem::swap(
         &mut source.next_record_table_handle,
@@ -723,7 +764,6 @@ fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
         &mut source.string_hash_tables,
         &mut destination.string_hash_tables,
     );
-    std::mem::swap(&mut source.resource_names, &mut destination.resource_names);
     std::mem::swap(
         &mut source.mediation_programs,
         &mut destination.mediation_programs,
@@ -741,7 +781,7 @@ fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
         &mut source.exclusive_thread_id,
         &mut destination.exclusive_thread_id,
     );
-    std::mem::swap(&mut source.global_config, &mut destination.global_config);
+    std::mem::swap(&mut source.global_size, &mut destination.global_size);
     std::mem::swap(
         &mut source.global_user_data,
         &mut destination.global_user_data,
@@ -878,40 +918,46 @@ mod tests {
             task.mem_values[&(LOCAL_MEMORY_BASE - 1)],
             Value::Str("root".into())
         );
-        for addr in [LOCAL_MEMORY_BASE, crate::HEAP_MEMORY_BASE as u32] {
-            assert_eq!(root.mem_values[&addr], Value::Str("root".into()));
-            assert_eq!(task.mem_values[&addr], Value::Str("task".into()));
-        }
+        // Locals stay with each thread; heap values travel with the memory.
+        assert_eq!(root.mem_values[&LOCAL_MEMORY_BASE], Value::Str("root".into()));
+        assert_eq!(task.mem_values[&LOCAL_MEMORY_BASE], Value::Str("task".into()));
+        let heap = HEAP_MEMORY_BASE as u32;
+        assert_eq!(task.mem_values[&heap], Value::Str("root".into()));
+        assert!(!root.mem_values.contains_key(&heap));
         transfer_async_shared_state(&mut task, &mut root);
         assert_eq!(
             root.mem_values[&(LOCAL_MEMORY_BASE - 1)],
             Value::Str("root".into())
         );
+        assert_eq!(root.mem_values[&heap], Value::Str("root".into()));
+        assert_eq!(root.mem_values[&LOCAL_MEMORY_BASE], Value::Str("root".into()));
     }
 
     #[test]
-    fn heap_sync_applies_all_ranges_in_each_unseen_generation() {
+    fn running_thread_holds_the_one_heap_and_idle_threads_keep_only_locals() {
         let mut root = Vm::new();
         let mut task = Vm::new();
-        task.shared_heap = Arc::clone(&root.shared_heap);
+        task.memory.truncate(HEAP_MEMORY_BASE);
+        let local = LOCAL_MEMORY_BASE as usize;
+        root.memory[local] = 1;
+        task.memory[local] = 2;
         let ptr = root.alloc_heap(32);
-        root.write_value(ptr, 2, &Value::Str("first".into()))
+        root.write_c_string_raw(ptr, "root").unwrap();
+        root.write_value(ptr + 16, 2, &Value::Str("value".into()))
             .unwrap();
-        root.write_value(ptr + 16, 2, &Value::Str("second".into()))
-            .unwrap();
-        root.flush_shared_heap();
-        task.sync_shared_heap();
-        assert_eq!(task.mem_values, root.mem_values);
 
-        root.write_c_string_raw(ptr, "raw").unwrap();
-        root.write_value(ptr + 16, 2, &Value::Str("updated".into()))
-            .unwrap();
-        root.flush_shared_heap();
-        task.sync_shared_heap();
-        assert_eq!(task.read_c_string(ptr).unwrap(), "raw");
-        assert_eq!(task.mem_values, root.mem_values);
-        task.sync_shared_heap();
-        assert_eq!(task.mem_values, root.mem_values);
+        transfer_async_shared_state(&mut root, &mut task);
+        assert_eq!(task.read_c_string(ptr).unwrap(), "root");
+        assert_eq!(task.read_value(ptr + 16, 2).unwrap(), Value::Str("value".into()));
+        assert_eq!((local_byte(&task, local), local_byte(&root, local)), (2, 1));
+        // The idle root keeps only its local region, not a heap copy.
+        assert!(root.memory.is_empty());
+        task.write_c_string_raw(ptr, "task").unwrap();
+
+        transfer_async_shared_state(&mut task, &mut root);
+        assert_eq!(root.read_c_string(ptr).unwrap(), "task");
+        assert_eq!((local_byte(&root, local), local_byte(&task, local)), (1, 2));
+        assert!(task.memory.is_empty());
     }
 
     #[test]
@@ -928,28 +974,108 @@ mod tests {
         assert_eq!(task.alloc_heap(160), first);
 
         transfer_async_shared_state(&mut task, &mut root);
-        assert!(root.heap_allocations.contains_key(&(first & ADDRESS_MASK)));
-        assert!(!task.heap_allocations.contains_key(&(first & ADDRESS_MASK)));
+        assert!(root.target_heap.translate(first).is_some());
+        assert!(task.target_heap.translate(first).is_none());
     }
 
     #[test]
     fn async_state_transfer_moves_system80_global_names_and_record_handle_counter() {
         let mut root = Vm::new();
-        root.resource_names.push("BG0001".into());
+        root.set_resource_names(vec!["BG0001".into()]);
         root.next_indexed_record_handle = 17;
 
         let mut task = Vm::new();
         transfer_async_shared_state(&mut root, &mut task);
-        assert_eq!(task.resource_names, vec!["BG0001".to_string()]);
+        assert_eq!(task.resource_names(), ["BG0001".to_string()]);
         assert_eq!(task.next_indexed_record_handle, 17);
 
-        task.resource_names.push("face".into());
+        task.set_resource_names(vec!["BG0001".into(), "face".into()]);
         task.next_indexed_record_handle = 18;
         transfer_async_shared_state(&mut task, &mut root);
         assert_eq!(
-            root.resource_names,
-            vec!["BG0001".to_string(), "face".to_string()]
+            root.resource_names(),
+            ["BG0001".to_string(), "face".to_string()]
         );
         assert_eq!(root.next_indexed_record_handle, 18);
+    }
+
+    #[test]
+    fn child_threads_borrow_locals_without_keeping_idle_windows() {
+        let program = ethornell_script::parse_bp_program(None, &[0x17]);
+        let mut root = Vm::new();
+        root.start(&program);
+        let local = LOCAL_MEMORY_BASE as usize;
+        root.memory[local + 32] = 0x12;
+        let code_byte = local + crate::CODE_WINDOW_OFFSET as usize + 17;
+        root.memory[code_byte] = 0x34;
+        let heap = root.alloc_heap(16);
+        root.write_c_string_raw(heap, "shared").unwrap();
+        let owner = root.thread.thread_id();
+        root.start_child_thread(64, 256, 256, 0, false).unwrap();
+        root.start_child_thread(64, 256, 256, 0, false).unwrap();
+        let mut children = std::mem::take(&mut root.async_tasks);
+        for (index, child) in children.iter_mut().enumerate() {
+            assert_eq!(child.vm.local_window_owner, Some(owner));
+            assert!(child.vm.memory.is_empty());
+            assert!(child.vm.parked_local.is_none());
+            transfer_async_shared_state(&mut root, &mut child.vm);
+            crate::child_thread::lend_local_window(&mut root, &mut child.vm);
+            assert_eq!(child.vm.memory[local + 32], 0x12 + index as u8);
+            assert_eq!(child.vm.memory[code_byte], 0x34 + index as u8);
+            assert_eq!(child.vm.read_c_string(heap).unwrap(), "shared");
+            child.vm.memory[local + 32] += 1;
+            child.vm.memory[code_byte] += 1;
+            crate::child_thread::lend_local_window(&mut root, &mut child.vm);
+            transfer_async_shared_state(&mut child.vm, &mut root);
+            assert!(child.vm.memory.is_empty());
+            assert!(child.vm.parked_local.as_ref().unwrap().is_empty());
+            assert!(child.vm.local_window_scratch.is_empty());
+            // The process scratch only stages compact prefixes; it never
+            // needs more storage than the former dense 2 MiB window.
+            assert!(root.local_window_scratch.capacity() <= crate::HEAP_OFFSET_BASE as usize);
+        }
+        assert_eq!(root.memory[local + 32], 0x14);
+        assert_eq!(root.memory[code_byte], 0x36);
+        assert_eq!(root.read_c_string(heap).unwrap(), "shared");
+    }
+
+    #[test]
+    fn new_async_thread_installs_code_without_a_full_process_buffer() {
+        let code = [0x02, 1, 2, 3, 4, 0x17];
+        let program = ethornell_script::parse_bp_program(None, &code);
+        let mut root = Vm::new();
+        root.start_async_program_with_args(Value::Program(Arc::new(program)), Vec::new(), false)
+            .unwrap();
+        let mut child = root.async_tasks.pop().unwrap().vm;
+        assert!(child.memory.is_empty());
+        transfer_async_shared_state(&mut root, &mut child);
+        assert_eq!(
+            &child.memory[(LOCAL_MEMORY_BASE + crate::CODE_WINDOW_OFFSET) as usize..][..code.len()],
+            &code,
+        );
+    }
+
+    #[test]
+    fn global_user_data_moves_between_threads_without_idle_snapshots() {
+        let mut root = Vm::new();
+        let last = root.global_user_data.len() - 1;
+        root.global_user_data[0] = 0x12;
+        root.global_user_data[last] = 0x34;
+        let program = ethornell_script::parse_bp_program(None, &[0x17]);
+        root.start_async_program_with_args(Value::Program(Arc::new(program)), Vec::new(), false)
+            .unwrap();
+        let mut child = root.async_tasks.pop().unwrap().vm;
+        assert!(child.global_user_data.is_empty());
+        let allocation = root.global_user_data.as_ptr();
+        transfer_async_shared_state(&mut root, &mut child);
+        assert!(root.global_user_data.is_empty());
+        assert_eq!(child.global_user_data.as_ptr(), allocation);
+        assert_eq!(child.global_user_data[0], 0x12);
+        assert_eq!(child.global_user_data[last], 0x34);
+        child.global_user_data[last] = 0x56;
+        transfer_async_shared_state(&mut child, &mut root);
+        assert!(child.global_user_data.is_empty());
+        assert_eq!(root.global_user_data.as_ptr(), allocation);
+        assert_eq!(root.global_user_data[last], 0x56);
     }
 }

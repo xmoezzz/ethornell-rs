@@ -125,14 +125,15 @@ impl RuntimeTraceApi {
         width: i32,
         height: i32,
     ) -> i32 {
-        if !(0..0x4000).contains(&destination) {
-            return 1;
-        }
+        // Source (2), size (3), then the allocation (1) in sub_407D90.
         let Some(source_info) = ethornell_vm::GraphApi::query_bitmap_info(self, source) else {
             return 2;
         };
         if width == 0 || height == 0 {
             return 3;
+        }
+        if !(0..0x4000).contains(&destination) {
+            return 1;
         }
         let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
             return 1;

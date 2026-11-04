@@ -109,6 +109,8 @@ final class GameViewController: UIViewController {
                 NSLog("ethornell: %@", event.text)
             case .confirmation:
                 showRequest(event)
+            case .dialog:
+                showDialog(event)
             case .closed:
                 stop()
                 onClose()
@@ -161,6 +163,77 @@ final class GameViewController: UIViewController {
                 self?.engine?.completeRequest(id, result: 0)
             })
         }
+        present(alert, animated: true)
+    }
+
+    /// An input dialog (kind 5). The engine filters and limits the answers
+    /// itself, so plain text fields are enough here.
+    private func showDialog(_ event: Engine.Event) {
+        let id = event.requestId
+        guard let engine, let request = engine.requestPayload(id),
+              let type = request["type"] as? String else { return }
+        let title = request["title"] as? String
+        let prompt = request["prompt"] as? String
+        let alert = UIAlertController(title: title, message: prompt, preferredStyle: .alert)
+        let cancel = UIAlertAction(title: NSLocalizedString("Cancel", comment: ""), style: .cancel) { [weak self] _ in
+            self?.engine?.completeDialog(id, answer: nil)
+        }
+        let texts = { (alert.textFields ?? []).map { $0.text ?? "" } }
+        let addField = { (placeholder: String, initial: String, numeric: Bool) in
+            alert.addTextField { field in
+                field.placeholder = placeholder
+                field.text = initial
+                field.keyboardType = numeric ? .numbersAndPunctuation : .default
+            }
+        }
+        switch type {
+        case "input":
+            for field in request["fields"] as? [[String: Any]] ?? [] {
+                addField(field["label"] as? String ?? "", field["initial"] as? String ?? "",
+                         field["numeric"] as? Bool ?? false)
+            }
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+                self?.engine?.completeDialog(id, answer: ["texts": texts()])
+            })
+        case "segmented":
+            let count = request["segments"] as? Int ?? 0
+            let numeric = request["numeric"] as? Bool ?? false
+            for index in 0..<count {
+                addField("\(index + 1)/\(count)", "", numeric)
+            }
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+                self?.engine?.completeDialog(id, answer: ["texts": texts()])
+            })
+        case "select":
+            for (index, option) in (request["options"] as? [String] ?? []).enumerated() {
+                alert.addAction(UIAlertAction(title: option, style: .default) { [weak self] _ in
+                    self?.engine?.completeDialog(id, answer: ["index": index])
+                })
+            }
+        case "date":
+            let fields = request["fields"] as? [String] ?? []
+            for index in 0..<4 {
+                addField(String(format: NSLocalizedString("Field %d", comment: ""), index + 1),
+                         index < fields.count ? fields[index] : "", false)
+            }
+            addField(NSLocalizedString("Month (1-12)", comment: ""),
+                     String((request["month"] as? Int ?? 0) + 1), true)
+            addField(NSLocalizedString("Day", comment: ""),
+                     String((request["day"] as? Int ?? 0) + 1), true)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+                let values = texts()
+                let number = { (index: Int) in Int(values[index].trimmingCharacters(in: .whitespaces)) ?? 1 }
+                self?.engine?.completeDialog(id, answer: [
+                    "texts": Array(values.prefix(4)),
+                    "month": number(4) - 1,
+                    "day": number(5) - 1,
+                ])
+            })
+        default:
+            engine.completeDialog(id, answer: nil)
+            return
+        }
+        alert.addAction(cancel)
         present(alert, animated: true)
     }
 

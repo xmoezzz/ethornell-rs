@@ -14,7 +14,7 @@ final class Engine {
 
     struct Event {
         enum Kind: UInt32 {
-            case diagnostic = 1, confirmation, closed, title
+            case diagnostic = 1, confirmation, closed, title, dialog
         }
         let kind: Kind
         let requestId: UInt64
@@ -120,6 +120,33 @@ final class Engine {
             result: result,
             text: EthornellStringV1(ptr: nil, len: 0, reserved: 0))
         _ = ethornell_ios_complete_request(handle, requestId, &response)
+    }
+
+    /// The JSON description of a dialog request (kind 5).
+    func requestPayload(_ requestId: UInt64) -> [String: Any]? {
+        let size = ethornell_ios_request_payload(handle, requestId, nil, 0)
+        guard size > 1 else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(size))
+        guard ethornell_ios_request_payload(handle, requestId, &buffer, UInt32(size)) == size else {
+            return nil
+        }
+        let data = Data(String(cString: buffer).utf8)
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Answers a dialog request; `answer` nil cancels it.
+    func completeDialog(_ requestId: UInt64, answer: [String: Any]?) {
+        var object = answer ?? [:]
+        object["accepted"] = answer != nil
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: data, encoding: .utf8) else { return }
+        _ = Engine.withStringV1(json) { text in
+            var response = EthornellResponseV1(
+                struct_size: UInt32(MemoryLayout<EthornellResponseV1>.size),
+                result: 0,
+                text: text)
+            return ethornell_ios_complete_request(handle, requestId, &response)
+        }
     }
 
     static func lastError() -> String {

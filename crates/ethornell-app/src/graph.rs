@@ -17,6 +17,21 @@ pub(crate) const NATIVE_DISPLAY_Z: i32 = 100;
 // slot before BP execution; save, message, and system scripts all depend on it.
 pub(crate) const NATIVE_SCREEN_BITMAP: i32 = 3790;
 
+/// CDspObj+0x12C owns this immutable bit plane, independently of its bitmap.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeHitMask {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bits: Vec<u8>,
+}
+impl NativeHitMask {
+    pub(crate) fn hit(&self, x: i32, y: i32) -> i32 {
+        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height { return 0; }
+        let stride = (self.width as usize + 7) / 8;
+        i32::from(self.bits[y as usize * stride + x as usize / 8] & (1 << (x & 7)))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeGraphObjectProperties {
     /// Exact target base field image.  The semantic fields below are portable
@@ -36,6 +51,7 @@ pub(crate) struct RuntimeGraphObjectProperties {
     /// Base CDspObj generated hit-mask source installed by Graph90:3C /
     /// sub_443A40 -> sub_41BC70. It controls pointer acceptance only.
     pub(crate) hit_mask_resource: Option<i32>,
+    pub(crate) hit_mask: Option<NativeHitMask>,
     pub(crate) properties: BTreeMap<u32, (i32, i32)>,
     pub(crate) named_properties: BTreeMap<String, i32>,
 }
@@ -52,6 +68,7 @@ impl Default for RuntimeGraphObjectProperties {
             format_resource: None,
             aux_resource: None,
             hit_mask_resource: None,
+            hit_mask: None,
             properties: BTreeMap::new(),
             named_properties: BTreeMap::new(),
         }
@@ -124,6 +141,15 @@ impl RuntimeGraphObjectProperties {
     }
 
     pub(crate) fn opacity(&self) -> f32 {
+        // BackRPL and Sprite mode 4 use SetAlpha to scale their wave
+        // samples (409F30), independently of source coverage. Sprite's
+        // vector blitter reads only mask alpha and its multiplier.
+        if self.background.is_some_and(|b| matches!(b.class, crate::native_background::NativeBackgroundClass::BackD | crate::native_background::NativeBackgroundClass::BackDst | crate::native_background::NativeBackgroundClass::BackGrd | crate::native_background::NativeBackgroundClass::BackRpl | crate::native_background::NativeBackgroundClass::BackStr | crate::native_background::NativeBackgroundClass::BackRtt | crate::native_background::NativeBackgroundClass::BackMsc)) {
+            return 1.0;
+        }
+        if self.background.is_none() && self.named_properties.get("target-object-mode") == Some(&4) {
+            return ((self.alpha_multiplier.wrapping_mul(256i32.wrapping_sub(self.mask_alpha)) >> 8) as f32 / 256.0).clamp(0.0,1.0);
+        }
         let transparency = self.transparency_parameter();
         (1.0 - transparency as f32 / 256.0).clamp(0.0, 1.0)
     }
@@ -388,7 +414,7 @@ impl RuntimeSurface {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimeGraphDrawItem {
     pub(crate) owner_object: Option<i32>,
     pub(crate) key: String,
@@ -453,7 +479,7 @@ pub(crate) fn native_draw_order(item: &RuntimeGraphDrawItem) -> (i32, u64, i32) 
     (item.z, order, hit)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RuntimeClipRect {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -991,7 +1017,7 @@ impl NativeMode5NodeArgs {
         })
     }
 
-    fn perspective_scale_fixed(self) -> u32 {
+    pub(crate) fn perspective_scale_fixed(self) -> u32 {
         let perspective = self.perspective.max(0) as u64;
         if perspective == 0 || self.position_z == 0 {
             return 0x1_0000;

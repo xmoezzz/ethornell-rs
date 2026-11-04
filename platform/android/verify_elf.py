@@ -22,7 +22,7 @@ assert loads and relro
 symbols = subprocess.check_output([readelf, '--dyn-syms', '-W', library], text=True)
 assert 'android_main' not in symbols
 assert 'ANativeActivity_onCreate' not in symbols
-expected = {'ethornell_android_' + name for name in ['abi_version','build_info','last_error','init_context','create','set_surface','detach_surface','step','input','set_paused','request_close','poll_event','complete_request','destroy']}
+expected = {'ethornell_android_' + name for name in ['abi_version','build_info','last_error','init_context','create','set_surface','detach_surface','step','input','set_paused','request_close','poll_event','complete_request','request_payload','destroy']}
 defined = set()
 for line in symbols.splitlines():
     columns = line.split()
@@ -36,4 +36,4 @@ allowed = {'libandroid.so','libdl.so','liblog.so','libc.so','libm.so','libvulkan
 assert needed and needed <= allowed, needed - allowed
 assert 'BIND_NOW' in dynamic or re.search(r'FLAGS_1.*NOW', dynamic)
 assert 'TEXTREL' not in dynamic
-print('ELF AArch64, 14 defined host API symbols, no activity glue, NEEDED allowlist, NOW/RELRO and 16KB LOAD/RELRO: OK')
+print('ELF AArch64, 15 defined host API symbols, no activity glue, NEEDED allowlist, NOW/RELRO and 16KB LOAD/RELRO: OK')

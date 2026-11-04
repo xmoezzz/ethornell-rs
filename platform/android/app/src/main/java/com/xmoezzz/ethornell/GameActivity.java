@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.text.InputType;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.KeyEvent;
@@ -18,9 +19,17 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.window.OnBackInvokedDispatcher;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -131,6 +140,11 @@ public final class GameActivity extends Activity
                 case NativeEngine.EVENT_TITLE:
                     ui.post(() -> setTitle(message));
                     break;
+                case NativeEngine.EVENT_DIALOG: {
+                    String payload = NativeEngine.nativeRequestPayload(handle, requestId);
+                    ui.post(() -> showDialog(requestId, payload));
+                    break;
+                }
                 default:
                     break;
             }
@@ -175,6 +189,142 @@ public final class GameActivity extends Activity
             builder.setPositiveButton(android.R.string.ok, (d, w) -> complete(requestId, 0));
         }
         builder.show();
+    }
+
+    /**
+     * An input dialog (event kind 5). The engine filters and limits the
+     * answers itself, so plain text fields are enough here.
+     */
+    private void showDialog(long requestId, String payload) {
+        JSONObject request;
+        try {
+            request = new JSONObject(payload == null ? "" : payload);
+        } catch (JSONException e) {
+            completeDialog(requestId, null);
+            return;
+        }
+        String type = request.optString("type");
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(request.optString("title", null))
+                .setCancelable(false)
+                .setNegativeButton(android.R.string.cancel, (d, w) -> completeDialog(requestId, null));
+        String prompt = request.optString("prompt", "");
+        List<EditText> fields = new ArrayList<>();
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        int padding = (int) (16 * getResources().getDisplayMetrics().density);
+        form.setPadding(padding, 0, padding, 0);
+        switch (type) {
+            case "input": {
+                JSONArray specs = request.optJSONArray("fields");
+                for (int i = 0; specs != null && i < specs.length(); i++) {
+                    JSONObject spec = specs.optJSONObject(i);
+                    fields.add(addField(form, spec.optString("label"), spec.optString("initial"),
+                            spec.optBoolean("numeric")));
+                }
+                break;
+            }
+            case "segmented": {
+                int count = request.optInt("segments");
+                for (int i = 0; i < count; i++) {
+                    fields.add(addField(form, (i + 1) + "/" + count, "", request.optBoolean("numeric")));
+                }
+                break;
+            }
+            case "select": {
+                JSONArray options = request.optJSONArray("options");
+                String[] labels = new String[options == null ? 0 : options.length()];
+                for (int i = 0; i < labels.length; i++) {
+                    labels[i] = options.optString(i);
+                }
+                builder.setItems(labels, (d, which) -> {
+                    JSONObject answer = new JSONObject();
+                    try {
+                        answer.put("index", which);
+                    } catch (JSONException e) {
+                        throw new IllegalStateException(e);
+                    }
+                    completeDialog(requestId, answer);
+                }).show();
+                return;
+            }
+            case "date": {
+                JSONArray initial = request.optJSONArray("fields");
+                for (int i = 0; i < 4; i++) {
+                    fields.add(addField(form, getString(R.string.dialog_field, i + 1),
+                            initial == null ? "" : initial.optString(i), false));
+                }
+                fields.add(addField(form, getString(R.string.dialog_month),
+                        String.valueOf(request.optInt("month") + 1), true));
+                fields.add(addField(form, getString(R.string.dialog_day),
+                        String.valueOf(request.optInt("day") + 1), true));
+                break;
+            }
+            default:
+                completeDialog(requestId, null);
+                return;
+        }
+        if (!prompt.isEmpty()) {
+            builder.setMessage(prompt);
+        }
+        builder.setView(form).setPositiveButton(android.R.string.ok, (d, w) -> {
+            JSONObject answer = new JSONObject();
+            JSONArray texts = new JSONArray();
+            try {
+                if (type.equals("date")) {
+                    for (int i = 0; i < 4; i++) {
+                        texts.put(fields.get(i).getText().toString());
+                    }
+                    answer.put("month", number(fields.get(4)) - 1);
+                    answer.put("day", number(fields.get(5)) - 1);
+                } else {
+                    for (EditText field : fields) {
+                        texts.put(field.getText().toString());
+                    }
+                }
+                answer.put("texts", texts);
+            } catch (JSONException e) {
+                throw new IllegalStateException(e);
+            }
+            completeDialog(requestId, answer);
+        }).show();
+    }
+
+    private EditText addField(LinearLayout form, String hint, String initial, boolean numeric) {
+        EditText field = new EditText(this);
+        field.setHint(hint);
+        field.setText(initial);
+        field.setSingleLine(true);
+        if (numeric) {
+            field.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
+        }
+        form.addView(field);
+        return field;
+    }
+
+    private static int number(EditText field) {
+        try {
+            return Integer.parseInt(field.getText().toString().trim());
+        } catch (NumberFormatException e) {
+            return 1;
+        }
+    }
+
+    /** {@code answer} null cancels the dialog. */
+    private void completeDialog(long requestId, JSONObject answer) {
+        String json;
+        try {
+            JSONObject object = answer == null ? new JSONObject() : answer;
+            object.put("accepted", answer != null);
+            json = object.toString();
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        engine.post(() -> {
+            if (handle != 0) {
+                NativeEngine.nativeCompleteDialog(handle, requestId, json);
+            }
+        });
     }
 
     private void complete(long requestId, int result) {

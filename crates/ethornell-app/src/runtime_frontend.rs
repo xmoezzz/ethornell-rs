@@ -81,7 +81,15 @@ fn drive_frame(
         apply_headless_input_event(&mut runtime.api, event);
     }
 
-    runtime.run_frame(pacing, elapsed_ms, audio_elapsed_ms)
+    // sub_48D480 times the update pass and keeps it pending (sub_401830(0));
+    // the frontend's composition pass commits the sample.
+    runtime.api.performance_profile.begin();
+    let report = runtime.run_frame(pacing, elapsed_ms, audio_elapsed_ms);
+    runtime.api.performance_profile.end(false);
+    if let Some(restarted) = runtime.take_restart() {
+        *runtime = restarted;
+    }
+    report
 }
 
 #[cfg(test)]

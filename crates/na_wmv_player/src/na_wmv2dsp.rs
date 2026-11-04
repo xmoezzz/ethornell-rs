@@ -58,16 +58,15 @@ fn wmv2_idct_row(b: &mut [i16]) {
 }
 
 #[inline(always)]
-// Keep the stride * row + column layout explicit for every row.
 fn wmv2_idct_col(block: &mut [i16; 64], col: usize) {
     // step 1, with extended precision
-    let b1 = block[8 * 1 + col] as i32;
+    let b1 = block[8 + col] as i32;
     let b7 = block[8 * 7 + col] as i32;
     let b5 = block[8 * 5 + col] as i32;
     let b3 = block[8 * 3 + col] as i32;
     let b2 = block[8 * 2 + col] as i32;
     let b6 = block[8 * 6 + col] as i32;
-    let b0 = block[8 * 0 + col] as i32;
+    let b0 = block[col] as i32;
     let b4 = block[8 * 4 + col] as i32;
 
     let a1 = (W1 * b1 + W7 * b7 + 4) >> 3;
@@ -84,8 +83,8 @@ fn wmv2_idct_col(block: &mut [i16; 64], col: usize) {
     let s2 = (181i32 * (a1 - a5 - a7 + a3) + 128) >> 8;
 
     // step 3
-    block[8 * 0 + col] = ((a0 + a2 + a1 + a5 + (1 << 13)) >> 14) as i16;
-    block[8 * 1 + col] = ((a4 + a6 + s1 + (1 << 13)) >> 14) as i16;
+    block[col] = ((a0 + a2 + a1 + a5 + (1 << 13)) >> 14) as i16;
+    block[8 + col] = ((a4 + a6 + s1 + (1 << 13)) >> 14) as i16;
     block[8 * 2 + col] = ((a4 - a6 + s2 + (1 << 13)) >> 14) as i16;
     block[8 * 3 + col] = ((a0 - a2 + a7 + a3 + (1 << 13)) >> 14) as i16;
 

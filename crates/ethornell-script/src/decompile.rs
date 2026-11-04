@@ -20,7 +20,7 @@ pub fn decompile_bp(program: &BpProgram, options: &DecompileOptions) -> String {
     if let Some(name) = &program.script_name {
         state.lines.push(format!("// script {name}"));
     }
-    for function in &program.functions {
+    for function in program.functions.iter() {
         state
             .lines
             .push(format!("// function sub_{:08X}", function.offset));
@@ -307,7 +307,7 @@ struct DecompileState {
 impl DecompileState {
     fn visit(&mut self, instruction: &BpInstruction) {
         let offset = instruction.offset;
-        let name = instruction.opcode_name.as_str();
+        let name = instruction.opcode.name();
         match name {
             "push_byte" | "push_word" | "push_dword" => {
                 self.push(format!("{}", operand_i32(instruction).unwrap_or_default()));
@@ -538,7 +538,7 @@ impl DecompileState {
 
     fn emit_dispatch(&mut self, offset: u64, instruction: &BpInstruction) {
         let Some(key) = instruction_call_key(instruction) else {
-            self.emit(offset, format!("{}(<bad-id>);", instruction.opcode_name));
+            self.emit(offset, format!("{}(<bad-id>);", instruction.opcode.name()));
             return;
         };
         let name = key

@@ -146,10 +146,53 @@ impl TextRuntime {
     }
 
     pub(crate) fn start_styled_message(&mut self, parsed: ParsedMessageMarkup, target_node: i32) {
+        self.start_continued_message(parsed, target_node, 0);
+    }
+
+    /// Start a message whose first `committed_chars` characters are text the
+    /// window already shows (an earlier message on the same page): they stay
+    /// visible and only the rest is typed out.
+    pub(crate) fn start_continued_message(
+        &mut self,
+        parsed: ParsedMessageMarkup,
+        target_node: i32,
+        committed_chars: usize,
+    ) {
         self.full_text = parsed.text;
-        let plan = build_reveal_plan(&self.full_text, &parsed.timeline);
-        self.visible_chars = plan.initial_visible_chars;
-        self.reveal_boundaries = plan.boundaries;
+        let committed_chars = committed_chars.min(self.full_text.chars().count());
+        let new_text = self
+            .full_text
+            .chars()
+            .skip(committed_chars)
+            .collect::<String>();
+        let new_marks = parsed
+            .timeline
+            .iter()
+            .filter_map(|mark| match *mark {
+                RuntimeTimelineMark::SetTime { at_char, units } => {
+                    Some(RuntimeTimelineMark::SetTime {
+                        at_char: at_char.checked_sub(committed_chars)?,
+                        units,
+                    })
+                }
+                RuntimeTimelineMark::Event {
+                    at_char,
+                    ordinal,
+                    id,
+                } => Some(RuntimeTimelineMark::Event {
+                    at_char: at_char.checked_sub(committed_chars)?,
+                    ordinal,
+                    id,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let plan = build_reveal_plan(&new_text, &new_marks);
+        self.visible_chars = committed_chars + plan.initial_visible_chars;
+        self.reveal_boundaries = plan
+            .boundaries
+            .into_iter()
+            .map(|boundary| boundary + committed_chars)
+            .collect();
         self.reveal_wait_units = plan.wait_units;
         self.timeline_events = plan.events;
         self.timeline_ms = 0;
@@ -164,8 +207,8 @@ impl TextRuntime {
         self.ruby_spans = parsed.ruby_spans;
         self.style_spans = parsed.style_spans;
         self.link_spans = parsed.link_spans;
-        if !self.full_text.is_empty() {
-            self.history.push(self.full_text.clone());
+        if !new_text.is_empty() {
+            self.history.push(new_text);
             if self.history.len() > 200 {
                 self.history.remove(0);
             }

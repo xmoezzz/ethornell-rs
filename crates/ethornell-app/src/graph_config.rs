@@ -16,7 +16,10 @@ pub(crate) struct RuntimeGraphConfig {
     /// synchronous after the first one.
     pub(crate) sync_load_hold_ms: i32,
     pub(crate) enabled: i32,
-    pub(crate) display_mode: (i32, i32),
+    /// Graph90:0C (dword_565B54, dword_565B58): whether CDspObjWindow draws
+    /// its own buffer (sub_42B520), and the global transparency combined
+    /// with each window's. Both start at 0 (.bss).
+    pub(crate) window_buffer: (i32, i32),
     pub(crate) renderer_options: (i32, i32),
     pub(crate) bitmap_priorities: BTreeMap<i32, i32>,
     pub(crate) fonts: Vec<RuntimeFontRegistration>,
@@ -32,7 +35,7 @@ impl Default for RuntimeGraphConfig {
             center: (-1, -1),
             sync_load_hold_ms: 0,
             enabled: 0,
-            display_mode: (0, 0),
+            window_buffer: (0, 0),
             // sub_442850 -> sub_43E490(1, 0): draw gate on, background
             // inactive.
             renderer_options: (1, 0),

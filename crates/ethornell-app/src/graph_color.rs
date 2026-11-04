@@ -1,5 +1,3 @@
-use ethornell_image::DecodedImage;
-
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeColorLut {
     channels: [[u8; 256]; 3],
@@ -13,56 +11,21 @@ impl RuntimeColorLut {
         {
             return None;
         }
-        // sub_40A070 consumes the descriptor from the last pair to the first:
-        // native bitmap words are BGRA, while DecodedImage is RGBA.
+        // sub_40A060 builds the B table (+2052) from the last pair, G
+        // (+1028) from the middle one and R (+4) from the first: the
+        // tables are kept in BGRA lane order. Matched with 90:CD under
+        // Unicorn (bitmap_kernels vectors).
         let points = [points[2], points[1], points[0]];
         Some(Self {
             channels: points.map(|point| spline_channel(point[0], point[1])),
         })
     }
 
-    pub(crate) fn apply(
-        &self,
-        source: &DecodedImage,
-        color_before: i32,
-        amount_before: i32,
-        color_after: i32,
-        amount_after: i32,
-    ) -> DecodedImage {
-        let mut output = source.clone();
-        let before = packed_color(color_before);
-        let after = packed_color(color_after);
-        let amount_before = amount_before.clamp(0, 256);
-        let amount_after = amount_after.clamp(0, 256);
-
-        for pixel in output.rgba.as_chunks_mut::<4>().0 {
-            let luminance =
-                (i32::from(pixel[0]) * 77 + i32::from(pixel[1]) * 150 + i32::from(pixel[2]) * 29)
-                    >> 8;
-            for channel in 0..3 {
-                let original = i32::from(pixel[channel]);
-                let toned = luminance * i32::from(before[channel]) / 255;
-                let mixed = lerp_256(original, toned, amount_before).clamp(0, 255) as usize;
-                let mapped = i32::from(self.channels[channel][mixed]);
-                let tinted = mapped * i32::from(after[channel]) / 255;
-                pixel[channel] = lerp_256(mapped, tinted, amount_after).clamp(0, 255) as u8;
-            }
-        }
-        output
+    /// The three lookup tables of the target record, by BGRA lane:
+    /// [B (+2052, point 2), G (+1028, point 1), R (+4, point 0)].
+    pub(crate) fn lane_tables(&self) -> &[[u8; 256]; 3] {
+        &self.channels
     }
-}
-
-fn packed_color(value: i32) -> [u8; 3] {
-    let value = value as u32;
-    [
-        ((value >> 16) & 0xff) as u8,
-        ((value >> 8) & 0xff) as u8,
-        (value & 0xff) as u8,
-    ]
-}
-
-fn lerp_256(from: i32, to: i32, amount: i32) -> i32 {
-    from + (((to - from) * amount) >> 8)
 }
 
 fn spline_channel(control_x: i32, control_y: i32) -> [u8; 256] {
@@ -105,15 +68,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_identity_control_points_preserve_pixels() {
+    fn native_identity_control_points_are_identity_tables() {
         let lut = RuntimeColorLut::from_control_points([[128, 128]; 3]).unwrap();
-        let source = DecodedImage {
-            width: 1,
-            height: 1,
-            rgba: vec![24, 90, 201, 77],
-        };
-        let output = lut.apply(&source, 0x00ff_ffff, 0, 0x00ff_ffff, 0);
-        assert_eq!(output.rgba, source.rgba);
+        for table in lut.lane_tables() {
+            assert!(table.iter().enumerate().all(|(index, &value)| usize::from(value) == index));
+        }
     }
 
     #[test]

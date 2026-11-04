@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Parser)]
 #[command(name = "ethornell")]
 #[command(about = "Rust Ethornell / BURIKO General Interpreter runtime tools")]
-#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -33,6 +32,9 @@ struct Cli {
     /// the program), a folder dialog asks for one; a folder dropped on the
     /// program arrives here.
     game: Option<PathBuf>,
+    /// Display text: auto, cp932 (Shift-JIS), or gbk. Overrides ETHORNELL_TEXT_ENCODING.
+    #[arg(long, global = true)]
+    text_encoding: Option<ethornell_app::TextEncoding>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -312,12 +314,16 @@ impl MagicStats {
 /// Plays a game without a command line: the folder given (dropped on the
 /// program) or one chosen in a dialog. Errors are shown in a dialog too, as
 /// there may be no terminal to print them.
-fn play(game: Option<PathBuf>) -> anyhow::Result<()> {
+fn play(
+    game: Option<PathBuf>,
+    text_encoding: Option<ethornell_app::TextEncoding>,
+) -> anyhow::Result<()> {
     let Some(game) = game.or_else(ethornell_app::choose_game_folder) else {
         return Ok(());
     };
     let result = GameRoot::new(game).map_err(anyhow::Error::from).and_then(|game_root| {
         ethornell_app::run(ethornell_app::AppConfig {
+            text_encoding,
             game_root,
             trace: false,
             fail_on_stub: false,
@@ -336,8 +342,11 @@ fn play(game: Option<PathBuf>) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    if cli.game.is_some() && cli.command.is_some() {
+        bail!("a game folder and a subcommand cannot be combined");
+    }
     let Some(command) = cli.command else {
-        return play(cli.game);
+        return play(cli.game, cli.text_encoding);
     };
 
     match command {
@@ -420,6 +429,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let game_root = GameRoot::new(game)?;
             ethornell_app::run(ethornell_app::AppConfig {
+                text_encoding: cli.text_encoding,
                 game_root,
                 trace,
                 fail_on_stub,
@@ -918,7 +928,7 @@ fn run_bcs_catalog(game: PathBuf, json: bool) -> anyhow::Result<()> {
 
 fn print_script_summary(label: &str, bytes: &[u8], program: &ethornell_script::BpProgram) {
     let mut calls: BTreeMap<String, usize> = BTreeMap::new();
-    for inst in &program.instructions {
+    for inst in program.instructions.iter() {
         if let Some(name) = inst.known_call {
             *calls.entry(name.to_string()).or_default() += 1;
         }
@@ -1622,7 +1632,7 @@ fn print_call_site_instruction(marker: &str, inst: &BpInstruction) {
         .unwrap_or_default();
     println!(
         "{marker} {:08X} {:>4} {:<14} {:<28} raw={:02X?}{}",
-        inst.offset, inst.opcode_hex, inst.opcode_name, operands, inst.raw, known
+        inst.offset, inst.opcode_hex(), inst.opcode.name(), operands, inst.raw, known
     );
 }
 
@@ -1751,9 +1761,32 @@ fn print_disasm(
                 .unwrap_or_default();
             println!(
                 "{:08X} {:>4} {:<14} {:<28} raw={:02X?}{}{}",
-                inst.offset, inst.opcode_hex, inst.opcode_name, operands, inst.raw, known, warning
+                inst.offset, inst.opcode_hex(), inst.opcode.name(), operands, inst.raw, known, warning
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod encoding_cli_tests {
+    use super::*;
+    use ethornell_app::TextEncoding;
+
+    #[test]
+    fn encoding_option_works_for_direct_launch_and_run() {
+        for args in [
+            vec!["ethornell", "--text-encoding", "auto", "game"],
+            vec!["ethornell", "run", "--game", "game", "--text-encoding", "auto"],
+            vec!["ethornell", "--text-encoding", "auto", "run", "--game", "game"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().text_encoding,
+                Some(TextEncoding::Auto),
+            );
+        }
+        let cli = Cli::try_parse_from(["ethornell", "run", "--game", "game"]).unwrap();
+        assert_eq!(cli.text_encoding, None); // environment, then Auto
+        assert!(Cli::try_parse_from(["ethornell", "--text-encoding", "utf8", "game"]).is_err());
+    }
 }

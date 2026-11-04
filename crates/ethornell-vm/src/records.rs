@@ -6,7 +6,8 @@ pub(crate) struct RecordTableState {
     pub(crate) record_size: u32,
     pub(crate) cursor: u32,
     pub(crate) keys: std::collections::BTreeMap<u32, String>,
-    pub(crate) records: std::collections::BTreeMap<u32, u32>,
+    /// Record bytes live in host memory (operator new in sub_452CD0).
+    pub(crate) records: std::collections::BTreeMap<u32, IndexedRecordEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +30,7 @@ impl Vm {
             return;
         }
         self.trace_watch_write(ptr, size, 0, "clear_shadow_values");
-        let start = Self::value_key(ptr);
+        let start = self.value_key(ptr);
         let end = start.saturating_add(size as u32);
         self.mem_values
             .extract_if(start..end, |_, _| true)
@@ -41,8 +42,8 @@ impl Vm {
             return;
         }
         self.clear_shadow_values(dst, size);
-        let src_start = Self::value_key(src);
-        let dst_start = Self::value_key(dst);
+        let src_start = self.value_key(src);
+        let dst_start = self.value_key(dst);
         let end = src_start.saturating_add(size as u32);
         let copied: Vec<_> = self
             .mem_values
@@ -83,9 +84,9 @@ impl Vm {
     pub(crate) fn remember_script_record(&mut self, ptr: u32, text: &str) -> VmResult<()> {
         self.write_c_string_raw(ptr, text)?;
         self.script_records
-            .insert(Self::value_key(ptr), text.to_string());
+            .insert(self.value_key(ptr), text.to_string());
         self.mem_values
-            .insert(Self::value_key(ptr), Value::Str(text.to_string()));
+            .insert(self.value_key(ptr), Value::Str(text.to_string()));
         Ok(())
     }
 
@@ -93,7 +94,7 @@ impl Vm {
         if size == 0 || self.script_records.is_empty() {
             return Ok(());
         }
-        let start = Self::value_key(ptr);
+        let start = self.value_key(ptr);
         let end = start.saturating_add(size as u32);
         let records: Vec<_> = self
             .script_records
@@ -110,6 +111,18 @@ impl Vm {
     }
 
     pub(crate) fn decode_sdc_records(&mut self, src: u32, dst: u32) -> VmResult<i32> {
+        let Some(unpacked) = self.decode_sdc_from_memory(src, dst)? else {
+            return Ok(0);
+        };
+        let range = self.resolve_write_range(dst, unpacked.len())?;
+        self.memory[range].copy_from_slice(&unpacked);
+        self.clear_shadow_values(dst, unpacked.len());
+        Ok(unpacked.len() as i32)
+    }
+
+    /// sub_4943E0 into a host buffer: None when the magic, the checksum or
+    /// the LZ stream is bad (the target returns 0 then).
+    fn decode_sdc_from_memory(&self, src: u32, dst: u32) -> VmResult<Option<Vec<u8>>> {
         const HEADER_SIZE: usize = 32;
         const MAGIC: &[u8; 16] = b"SDC FORMAT 1.00\0";
 
@@ -121,7 +134,7 @@ impl Vm {
                 header = %header.iter().take(16).map(|byte| format!("{byte:02X}")).collect::<String>(),
                 "SDC header magic mismatch"
             );
-            return Ok(0);
+            return Ok(None);
         }
 
         let seed = u32::from_le_bytes(header[16..20].try_into().unwrap());
@@ -138,7 +151,7 @@ impl Vm {
                     %error,
                     "SDC packed payload is outside VM memory"
                 );
-                return Ok(0);
+                return Ok(None);
             }
         };
         let mut packed = self.memory[packed].to_vec();
@@ -155,7 +168,7 @@ impl Vm {
                 expected_xor = format_args!("0x{expected_xor:04X}"),
                 "SDC checksum mismatch"
             );
-            return Ok(0);
+            return Ok(None);
         }
 
         let mut state = seed;
@@ -189,19 +202,21 @@ impl Vm {
                     %error,
                     "SDC LZ decompression failed"
                 );
-                return Ok(0);
+                return Ok(None);
             }
         };
-        let range = self.resolve_write_range(dst, unpacked.len())?;
-        self.memory[range].copy_from_slice(&unpacked);
-        self.clear_shadow_values(dst, unpacked.len());
-        Ok(unpacked.len() as i32)
+        Ok(Some(unpacked))
     }
 
     pub(crate) fn decode_sdc_struct_array(&mut self, src: u32, dst: u32) -> VmResult<i32> {
         const STRUCT_MAGIC: &[u8; 16] = b"DCFS FORMAT 1.00";
 
         let decoded_len = self.read_int(src.saturating_add(24), 2)? as usize;
+        // Sys80:C4 writes a 32-byte SDC header when the record count is zero.
+        // A fresh game can pass this empty history to Sys80:C5.
+        if decoded_len == 0 {
+            return Ok(0);
+        }
         if decoded_len < 24 {
             tracing::warn!(
                 src = format_args!("0x{src:08X}"),
@@ -210,12 +225,11 @@ impl Vm {
             );
             return Ok(0);
         }
-        let temporary = self.alloc_heap(decoded_len as u32);
-        if temporary == 0 {
-            tracing::warn!(decoded_len, "SDC/DCFS temporary allocation failed");
+        // The target decodes into operator new[] memory, not the VM heap.
+        let Some(mut encoded) = self.decode_sdc_from_memory(src, dst)? else {
             return Ok(0);
-        }
-        let written = self.decode_sdc_records(src, temporary)?;
+        };
+        let written = encoded.len() as i32;
         if written <= 0 || written as usize > decoded_len {
             tracing::warn!(
                 src = format_args!("0x{src:08X}"),
@@ -223,7 +237,6 @@ impl Vm {
                 written,
                 "SDC/DCFS outer decompression failed or exceeded its target allocation"
             );
-            let _ = self.free_heap(temporary);
             return Ok(0);
         }
         if written as usize != decoded_len {
@@ -239,15 +252,13 @@ impl Vm {
                 "SDC/DCFS decoded byte count differs from allocation; continuing like target"
             );
         }
-        let range = self.resolve_range(temporary, decoded_len)?;
-        let encoded = self.memory[range].to_vec();
+        encoded.resize(encoded.len().max(decoded_len), 0);
         if encoded.get(..STRUCT_MAGIC.len()) != Some(STRUCT_MAGIC) {
             tracing::warn!(
                 src = format_args!("0x{src:08X}"),
                 decoded_header = %encoded.iter().take(16).map(|byte| format!("{byte:02X}")).collect::<String>(),
                 "DCFS structure magic mismatch"
             );
-            let _ = self.free_heap(temporary);
             return Ok(0);
         }
 
@@ -259,22 +270,19 @@ impl Vm {
                 record_count,
                 "DCFS structure dimensions are invalid"
             );
-            let _ = self.free_heap(temporary);
             return Ok(0);
         }
         let total_output = match record_size.checked_mul(record_count) {
             Some(total) => total,
             None => {
                 tracing::warn!(record_size, record_count, "DCFS output size overflow");
-                let _ = self.free_heap(temporary);
-                return Ok(0);
+                    return Ok(0);
             }
         };
         let first_end = match 24usize.checked_add(record_size) {
             Some(end) => end,
             None => {
-                let _ = self.free_heap(temporary);
-                return Ok(0);
+                    return Ok(0);
             }
         };
         let Some(first) = encoded.get(24..first_end) else {
@@ -284,7 +292,6 @@ impl Vm {
                 record_count,
                 "DCFS first record is truncated"
             );
-            let _ = self.free_heap(temporary);
             return Ok(0);
         };
         let mut records = Vec::with_capacity(total_output);
@@ -307,8 +314,7 @@ impl Vm {
                             %error,
                             "DCFS run-length stream is truncated"
                         );
-                        let _ = self.free_heap(temporary);
-                        return Ok(0);
+                                    return Ok(0);
                     }
                 };
                 if record.len().saturating_add(count) > record_size {
@@ -319,8 +325,7 @@ impl Vm {
                         record_size,
                         "DCFS run exceeds record boundary"
                     );
-                    let _ = self.free_heap(temporary);
-                    return Ok(0);
+                            return Ok(0);
                 }
                 if literal {
                     let end = input.saturating_add(count);
@@ -332,8 +337,7 @@ impl Vm {
                             decoded_len,
                             "DCFS literal run is truncated"
                         );
-                        let _ = self.free_heap(temporary);
-                        return Ok(0);
+                                    return Ok(0);
                     };
                     record.extend_from_slice(bytes);
                     input = end;
@@ -349,7 +353,6 @@ impl Vm {
         let range = self.resolve_write_range(dst, records.len())?;
         self.memory[range].copy_from_slice(&records);
         self.clear_shadow_values(dst, records.len());
-        let _ = self.free_heap(temporary);
         tracing::info!(
             src = format_args!("0x{src:08X}"),
             dst = format_args!("0x{dst:08X}"),
@@ -362,6 +365,36 @@ impl Vm {
         Ok(record_count as i32)
     }
 
+    /// memcpy out of VM memory, keeping the typed shadow values.
+    fn capture_record(&self, src: u32, size: u32) -> VmResult<IndexedRecordEntry> {
+        let range = self.resolve_range(src, size as usize)?;
+        let start = self.value_key(src);
+        let end = start.saturating_add(size);
+        Ok(IndexedRecordEntry {
+            bytes: self.memory[range].to_vec(),
+            shadow_values: self
+                .mem_values
+                .range(start..end)
+                .map(|(addr, value)| (*addr - start, value.clone()))
+                .collect(),
+        })
+    }
+
+    /// memcpy back into VM memory with the record's shadow values.
+    fn restore_record(&mut self, dst: u32, entry: &IndexedRecordEntry) -> VmResult<()> {
+        let range = self.resolve_write_range(dst, entry.bytes.len())?;
+        self.memory[range].copy_from_slice(&entry.bytes);
+        self.clear_shadow_values(dst, entry.bytes.len());
+        let start = self.value_key(dst);
+        self.mem_values.extend(
+            entry
+                .shadow_values
+                .iter()
+                .map(|(offset, value)| (start.saturating_add(*offset), value.clone())),
+        );
+        Ok(())
+    }
+
     pub(crate) fn sys_record_table_open(&mut self, slot: u32, record_size: u32) -> VmResult<i32> {
         const INVALID_RECORD_SIZE: i32 = 0x8000_0001u32 as i32;
         if record_size <= 1 {
@@ -372,7 +405,7 @@ impl Vm {
         self.next_record_table_handle = handle.wrapping_add(1).max(1);
         self.write_int(slot, 2, handle)?;
         self.record_tables.insert(
-            Self::value_key(handle),
+            self.value_key(handle),
             RecordTableState {
                 slot,
                 record_size,
@@ -402,53 +435,30 @@ impl Vm {
             Value::Ptr(0) | Value::Int(0) | Value::None => String::new(),
             value => value.as_i32().to_string(),
         };
-        let handle_key = Self::value_key(handle);
-        let Some((index, record_size, record_ptr)) =
-            self.record_tables.get(&handle_key).map(|table| {
-                let existing = table
-                    .keys
-                    .iter()
-                    .find_map(|(index, saved)| (saved == &key).then_some(*index));
-                let index = existing.unwrap_or(table.cursor);
-                (index, table.record_size, table.records.get(&index).copied())
-            })
-        else {
-            return Ok(TABLE_NOT_FOUND);
+        let handle_key = self.value_key(handle);
+        let entry = match self.record_tables.get(&handle_key) {
+            Some(table) => self.capture_record(src, table.record_size)?,
+            None => return Ok(TABLE_NOT_FOUND),
         };
-
-        let record_ptr = if let Some(record_ptr) = record_ptr {
-            record_ptr
-        } else {
-            let record_ptr = self.alloc_heap(record_size);
-            let table = self
-                .record_tables
-                .get_mut(&handle_key)
-                .expect("record table disappeared while inserting");
-            table.cursor = table.cursor.saturating_add(1);
-            table.keys.insert(index, key.clone());
-            table.records.insert(index, record_ptr);
-            record_ptr
+        // sub_452CD0: overwrite the record with this key, else append.
+        let table = self.record_tables.get_mut(&handle_key).expect("checked above");
+        let index = match table.keys.iter().find_map(|(index, saved)| (saved == &key).then_some(*index)) {
+            Some(index) => index,
+            None => {
+                let index = table.cursor;
+                table.cursor = table.cursor.saturating_add(1);
+                table.keys.insert(index, key);
+                index
+            }
         };
-        self.copy_record_into_table(record_ptr, src, record_size as usize)?;
-        tracing::debug!(
-            handle,
-            index,
-            key,
-            record_size,
-            src = format_args!("0x{src:08X}"),
-            record_ptr = format_args!("0x{record_ptr:08X}"),
-            "RecordTableInsert"
-        );
+        table.records.insert(index, entry);
         Ok(0)
     }
 
     pub(crate) fn sys_record_table_close(&mut self, handle: u32) -> i32 {
         const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
-        let Some(table) = self.record_tables.remove(&Self::value_key(handle)) else {
+        if self.record_tables.remove(&self.value_key(handle)).is_none() {
             return TABLE_NOT_FOUND;
-        };
-        for record_ptr in table.records.into_values() {
-            let _ = self.free_heap(record_ptr);
         }
         0
     }
@@ -457,7 +467,7 @@ impl Vm {
         const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
         const KEY_NOT_FOUND: i32 = 0x8000_0003u32 as i32;
 
-        let handle_key = Self::value_key(handle);
+        let handle_key = self.value_key(handle);
         let key = match self.normalize_record_key(key) {
             Value::Str(text) => text,
             Value::Ptr(0) | Value::Int(0) | Value::None => String::new(),
@@ -474,10 +484,7 @@ impl Vm {
             return KEY_NOT_FOUND;
         };
         table.keys.remove(&index);
-        let record_ptr = table.records.remove(&index);
-        if let Some(record_ptr) = record_ptr {
-            let _ = self.free_heap(record_ptr);
-        }
+        table.records.remove(&index);
         0
     }
 
@@ -490,7 +497,7 @@ impl Vm {
     ) -> VmResult<Value> {
         const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
         const RECORD_NOT_FOUND: i32 = 0x8000_0003u32 as i32;
-        let handle_key = Self::value_key(handle);
+        let handle_key = self.value_key(handle);
         let Some(table) = self.record_tables.get(&handle_key) else {
             return Ok(Value::Int(TABLE_NOT_FOUND));
         };
@@ -513,19 +520,10 @@ impl Vm {
         let Some(selected) = selected else {
             return Ok(Value::Int(RECORD_NOT_FOUND));
         };
-        let Some(src) = table.records.get(&selected).copied() else {
+        let Some(entry) = table.records.get(&selected).cloned() else {
             return Ok(Value::Int(RECORD_NOT_FOUND));
         };
-        let record_size = table.record_size;
-        self.copy_buffer(dst, src, record_size as usize)?;
-        tracing::debug!(
-            handle,
-            selected,
-            record_size,
-            src = format_args!("0x{src:08X}"),
-            dst = format_args!("0x{dst:08X}"),
-            "RecordTableFetch"
-        );
+        self.restore_record(dst, &entry)?;
         Ok(Value::Int(0))
     }
 
@@ -542,7 +540,7 @@ impl Vm {
         self.next_indexed_record_handle = handle.wrapping_add(1).max(1);
         self.write_value(slot, 2, &Value::Int(handle as i32))?;
         self.indexed_record_tables.insert(
-            Self::value_key(handle),
+            self.value_key(handle),
             IndexedRecordState {
                 slot,
                 capacity,
@@ -551,7 +549,6 @@ impl Vm {
             },
         );
 
-        self.ensure_indexed_record_globals(record_size)?;
 
         if std::env::var_os("DEBUG").is_some() {
             tracing::info!(
@@ -568,7 +565,7 @@ impl Vm {
     }
 
     pub(crate) fn sys_indexed_record_close(&mut self, handle: u32) -> i32 {
-        if let Some(state) = self.indexed_record_tables.remove(&Self::value_key(handle)) {
+        if let Some(state) = self.indexed_record_tables.remove(&self.value_key(handle)) {
             if std::env::var_os("DEBUG").is_some() {
                 tracing::info!(
                     thread_id = self.thread.thread_id(),
@@ -587,7 +584,7 @@ impl Vm {
     }
 
     pub(crate) fn sys_indexed_record_count(&mut self, dst: u32, handle: u32) -> VmResult<i32> {
-        let Some(state) = self.indexed_record_tables.get(&Self::value_key(handle)) else {
+        let Some(state) = self.indexed_record_tables.get(&self.value_key(handle)) else {
             if std::env::var_os("DEBUG").is_some() {
                 tracing::info!(
                     thread_id = self.thread.thread_id(),
@@ -616,7 +613,7 @@ impl Vm {
     }
 
     pub(crate) fn sys_indexed_record_push(&mut self, handle: u32, src: u32) -> VmResult<i32> {
-        let key = Self::value_key(handle);
+        let key = self.value_key(handle);
         let Some(state) = self.indexed_record_tables.get(&key) else {
             if std::env::var_os("DEBUG").is_some() {
                 tracing::info!(
@@ -633,7 +630,7 @@ impl Vm {
         let capacity = state.capacity as usize;
         let slot = state.slot;
         let src_range = self.resolve_range(src, size)?;
-        let src_start = Self::value_key(src);
+        let src_start = self.value_key(src);
         let src_end = src_start.saturating_add(state.record_size);
         let shadow_values = self
             .mem_values
@@ -665,25 +662,26 @@ impl Vm {
         &mut self,
         dst: u32,
         handle: u32,
-        index: u32,
+        index: i32,
     ) -> VmResult<i32> {
-        let Some(state) = self.indexed_record_tables.get(&Self::value_key(handle)) else {
+        let Some(state) = self.indexed_record_tables.get(&self.value_key(handle)) else {
             return Ok(1);
         };
-        let Some(entry) = state.records.get(index as usize).cloned() else {
+        let Some(entry) = usize::try_from(index)
+            .ok()
+            .and_then(|index| state.records.get(index))
+            .cloned()
+        else {
             return Ok(2);
         };
+        // sub_46C8E0: memcpy of the stored record.
         let size = state.record_size as usize;
         let record_size = state.record_size;
         let capacity = state.capacity;
-        self.ensure_writable(dst, size);
-        if Self::should_clear_indexed_record_target(dst) {
-            self.clear_record_buffer(dst, size);
-        }
-        let start = Self::memory_addr(dst) as usize;
-        self.memory[start..start + size].copy_from_slice(&entry.bytes);
+        let range = self.resolve_write_range(dst, size)?;
+        self.memory[range].copy_from_slice(&entry.bytes);
         self.clear_shadow_values(dst, size);
-        let dst_start = Self::value_key(dst);
+        let dst_start = self.value_key(dst);
         self.mem_values.extend(
             entry
                 .shadow_values
@@ -714,11 +712,15 @@ impl Vm {
         Ok(0)
     }
 
-    pub(crate) fn sys_indexed_record_remove(&mut self, handle: u32, start: u32, count: u32) -> i32 {
-        let Some(state) = self.indexed_record_tables.get_mut(&Self::value_key(handle)) else {
+    pub(crate) fn sys_indexed_record_remove(&mut self, handle: u32, start: i32, count: u32) -> i32 {
+        let Some(state) = self.indexed_record_tables.get_mut(&self.value_key(handle)) else {
             return 1;
         };
-        let start = start as usize;
+        // sub_46C940: skip `start` records (signed walk; running out is 2),
+        // then delete up to `count` (unsigned) records.
+        let Ok(start) = usize::try_from(start) else {
+            return 2;
+        };
         if start >= state.records.len() {
             return 2;
         }
@@ -727,48 +729,6 @@ impl Vm {
             .min(state.records.len());
         state.records.drain(start..end);
         0
-    }
-
-    fn ensure_indexed_record_globals(&mut self, record_size: u32) -> VmResult<()> {
-        const PRIMARY_BASE: u32 = 0x0004_cad8;
-        let Some(total) = record_size.checked_mul(2) else {
-            return Ok(());
-        };
-        self.ensure_writable(PRIMARY_BASE, total as usize);
-        Ok(())
-    }
-
-    fn ensure_writable(&mut self, ptr: u32, size: usize) {
-        let start = Self::memory_addr(ptr) as usize;
-        let end = start.saturating_add(size);
-        if end > self.memory.len() {
-            self.memory.resize(end, 0);
-        }
-    }
-
-    fn clear_record_buffer(&mut self, ptr: u32, size: usize) {
-        if size == 0 {
-            return;
-        }
-        self.ensure_writable(ptr, size);
-        let start = Self::memory_addr(ptr) as usize;
-        let end = start.saturating_add(size);
-        self.memory[start..end].fill(0);
-        self.clear_shadow_values(ptr, size);
-        self.trace_watch_write(ptr, size, 0, "clear_record_buffer");
-    }
-
-    fn should_clear_indexed_record_target(ptr: u32) -> bool {
-        const PRIMARY_GLOBAL_RECORD: u32 = 0x0004_cad8;
-        Self::memory_addr(ptr) != PRIMARY_GLOBAL_RECORD
-    }
-
-    fn copy_record_into_table(&mut self, dst: u32, src: u32, size: usize) -> VmResult<()> {
-        let end = Self::memory_addr(dst) as usize + size;
-        if end > self.memory.len() {
-            self.memory.resize(end, 0);
-        }
-        self.copy_buffer(dst, src, size)
     }
 
     fn normalize_record_key(&self, key: Value) -> Value {
@@ -1003,7 +963,7 @@ mod tests {
         assert_eq!(vm.sys_indexed_record_load(dst, handle, 0).unwrap(), 0);
         assert_eq!(vm.read_int(dst, 2).unwrap(), 30);
         assert_eq!(
-            vm.mem_values.get(&Vm::value_key(dst + 4)),
+            vm.mem_values.get(&vm.value_key(dst + 4)),
             Some(&Value::Str("record-30".into()))
         );
         assert_eq!(vm.sys_indexed_record_load(dst, handle, 1).unwrap(), 0);

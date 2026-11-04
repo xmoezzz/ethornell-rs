@@ -1,0 +1,27 @@
+[package]
+name = "ethornell-web"
+version = "0.1.0"
+edition.workspace = true
+
+# The browser build: a wasm-bindgen module that platform/wasm runs in a
+# dedicated worker (see platform/wasm/README.md).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+ethornell-app = { path = "../ethornell-app", default-features = false, features = ["host-driven"] }
+ethornell-archive = { path = "../ethornell-archive" }
+ethornell-audio = { path = "../ethornell-audio" }
+ethornell-core = { path = "../ethornell-core" }
+ethornell-render = { path = "../ethornell-render", default-features = false }
+ab_glyph.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["OffscreenCanvas"] }

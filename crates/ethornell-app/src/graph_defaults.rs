@@ -169,7 +169,9 @@ impl TextLayoutDefaults {
         if divisor == 0 {
             return false;
         }
-        self.scale_reciprocal_16_16 = divisor.wrapping_add(0xffff) / divisor;
+        // sub_407B60 divides unsigned.
+        self.scale_reciprocal_16_16 =
+            ((divisor as u32).wrapping_add(0xffff) / divisor as u32) as i32;
         true
     }
 }
@@ -293,11 +295,10 @@ impl GraphRuntimeDefaults {
     }
 
     pub(crate) fn configure_shadow(&mut self, x: i32, y: i32, alpha: i32) {
-        if (0..=100).contains(&x) && (0..=100).contains(&y) && (0..=256).contains(&alpha) {
-            self.shadow_x = x;
-            self.shadow_y = y;
-            self.shadow_alpha = alpha;
-        }
+        // sub_463790 stores the checked values as they are.
+        self.shadow_x = x;
+        self.shadow_y = y;
+        self.shadow_alpha = alpha;
     }
 
     pub(crate) fn shadow_parameters(&self) -> Option<(i32, i32, i32)> {

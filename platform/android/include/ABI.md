@@ -34,6 +34,25 @@ clock timestamps do not poison an otherwise healthy session. Genuine runtime,
 GPU, audio and policy failures do. A black-bar pointer release cancels its
 gesture (including queued edges) rather than generating an UP over old content.
 
+Input dialogs (UserB0 text, two-field, segmented, list and date prompts)
+suspend the VM in the same way and arrive as event kind 5, whose text names
+the dialog type (`input`, `segmented`, `select`, `date`). Fetch the full
+request with `request_payload` and answer with `complete_request`, putting a
+JSON object in the response text (the integer result is ignored):
+
+| type | request fields | answer |
+| --- | --- | --- |
+| `input` | `title`, `fields[]` of `{label, initial, max_bytes, numeric}` (1 or 2) | `texts[]`, one per field |
+| `segmented` | `title`, `prompt`, `segments`, `max_bytes`, `numeric` | `texts[]`, one per segment |
+| `select` | `title`, `prompt`, `options[]` | `index` (zero-based) |
+| `date` | `fields[4]`, `month`, `day` (zero-based) | `texts[4]`, `month`, `day` |
+
+Every answer carries `"accepted": true`; `{"accepted": false}` cancels. The
+engine applies the desktop filters itself (`numeric` keeps digits and a
+leading minus, segments keep ASCII letters and digits, `max_bytes` counts
+Shift-JIS bytes), so the host may show plain text fields. A malformed answer
+is an error, not a cancel.
+
 Resources are read-only and user_root is a separate explicitly writable root.
 Do not expose whole-game save export until game-specific user-file behavior is
 verified. Resource and guest system-string encodings are not graph encoding.
@@ -44,7 +63,7 @@ await a serial engine-thread barrier before export. Pause without its command
 ACK is not a flush barrier. A post-rename sync error means committed but
 durability uncertain. See `STORAGE.md` for the exact storage contract.
 No shell execution, DLL loading or unrestricted filesystem/URL access is
-authorized by this interface. Full IME, arbitrary file pickers, movie audio,
+authorized by this interface. Arbitrary file pickers, movie audio,
 BMV/WMV/MP4 and complete SWF playback are not claimed v1 capabilities. Existing
 MPEG video-only / Ruffle limitations remain visible diagnostics, not promises.
 

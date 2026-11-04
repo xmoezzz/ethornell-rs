@@ -10,4 +10,7 @@
     <string name="delete">删除</string>
     <string name="delete_confirm">删除 %1$s 及其文件？存档会保留。</string>
     <string name="engine_error">游戏已停止</string>
+    <string name="dialog_field">字段 %1$d</string>
+    <string name="dialog_month">月（1-12）</string>
+    <string name="dialog_day">日</string>
 </resources>

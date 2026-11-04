@@ -48,7 +48,7 @@ impl Vm {
             }
             opcodes::SYS_SET_THREAD_TIMER => {
                 let mut call = self.scheduler_call_frame(opcode)?;
-                let duration_ms = call.pop_i32("duration_ms")?.max(0);
+                let duration_ms = call.pop_i32("duration_ms")?;
                 call.require_consumed()?;
                 self.thread
                     .set_deadline_from_now(self.timing.tick_count(), duration_ms);
@@ -65,10 +65,10 @@ impl Vm {
             }
             opcodes::SYS_SET_AND_QUERY_THREAD_TIMER => {
                 let mut call = self.scheduler_call_frame(opcode)?;
-                let duration_ms = call.pop_i32("duration_ms")?.max(0);
+                // sub_489C20 -> sub_445680 extends the existing deadline.
+                let duration_ms = call.pop_i32("duration_ms")?;
                 call.require_consumed()?;
-                self.thread
-                    .set_deadline_from_now(self.timing.tick_count(), duration_ms);
+                self.thread.extend_deadline(duration_ms);
                 let active = self.thread.remaining_deadline_ms(self.timing.tick_count()) != 0;
                 if trace_events || self.collect_diagnostics {
                     tracing::debug!(
@@ -120,7 +120,7 @@ impl Vm {
                 // With input enabled the scope is registered exactly like
                 // 0x80:0x18 and primed by one discarded sub_46DF00 query.
                 let deadline_tick =
-                    (self.timing.tick_count().max(0) as u32).wrapping_add(duration_ms as u32);
+                    (self.timing.tick_count() as u32).wrapping_add(duration_ms as u32);
                 if input_enabled {
                     api.register_input_scope(input_scope);
                 }
@@ -155,10 +155,14 @@ impl Vm {
                 Ok(Some(Value::None))
             }
             opcodes::SYS_SELECT_BOOTSTRAP => {
-                // Native pop order is archive namespace, then root/archive path.
-                let archive_namespace = self.pop_string_lossy()?;
-                let root_or_archive_path = self.pop_string_lossy()?;
-                api.select_bootstrap(&root_or_archive_path, &archive_namespace);
+                // sub_489FD0 pops the program file, then the root/archive
+                // path, and returns status 5 (the main loop re-initializes
+                // the engine and starts the selected program).
+                let file = self.pop_string_lossy()?;
+                let path = self.pop_string_lossy()?;
+                let (root, archive) = bootstrap_root_and_archive(api, &path);
+                api.select_bootstrap(root.as_deref(), &archive, &file);
+                self.halted = true;
                 self.scheduler_signal = Some(SchedulerSignal::EndPass);
                 Ok(Some(Value::None))
             }
@@ -217,5 +221,61 @@ impl Vm {
     fn scheduler_call_frame(&mut self, opcode: NativeOpcode) -> VmResult<NativeCallFrame> {
         let args = self.take_dispatch_call_frame(opcode.group, opcode.id)?;
         Ok(NativeCallFrame::new(opcode, args))
+    }
+}
+
+/// sub_465650: "." keeps the default root and system.arc; a missing path is
+/// split by _splitpath into root (drive + directory) and archive (name +
+/// extension); an existing directory becomes the root; an existing file
+/// splits at its last backslash (none: default root, the path as archive).
+fn bootstrap_root_and_archive<A: SysApi>(api: &mut A, path: &str) -> (Option<String>, String) {
+    const DEFAULT_ARCHIVE: &str = "system.arc";
+    if path == "." {
+        return (None, DEFAULT_ARCHIVE.into());
+    }
+    if !api.path_exists(path) {
+        let split = path.rfind(['\\', '/']).map_or(0, |index| index + 1);
+        let split = if split == 0 && path.as_bytes().get(1) == Some(&b':') { 2 } else { split };
+        return (Some(path[..split].to_string()), path[split..].to_string());
+    }
+    if api.directory_exists(path) {
+        return (Some(path.to_string()), DEFAULT_ARCHIVE.into());
+    }
+    match path.rfind('\\') {
+        Some(index) => (Some(path[..index].to_string()), path[index + 1..].to_string()),
+        None => (None, path.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NativeCallFrame;
+
+    struct Paths;
+
+    impl SysApi for Paths {
+        fn call_sys(&mut self, _call: &mut NativeCallFrame) -> VmResult<Value> {
+            Ok(Value::None)
+        }
+        fn path_exists(&mut self, path: &str) -> bool {
+            matches!(path, "C:\\Game" | "C:\\Game\\data.arc" | "data.arc")
+        }
+        fn directory_exists(&mut self, path: &str) -> bool {
+            path == "C:\\Game"
+        }
+    }
+
+    #[test]
+    fn bootstrap_paths_follow_sub_465650() {
+        let resolve = |path: &str| bootstrap_root_and_archive(&mut Paths, path);
+        assert_eq!(resolve("."), (None, "system.arc".into()));
+        assert_eq!(resolve("C:\\Game"), (Some("C:\\Game".into()), "system.arc".into()));
+        assert_eq!(resolve("C:\\Game\\data.arc"), (Some("C:\\Game".into()), "data.arc".into()));
+        assert_eq!(resolve("data.arc"), (None, "data.arc".into()));
+        // Missing: _splitpath into drive + directory and name + extension.
+        assert_eq!(resolve("D:\\Other\\boot.arc"), (Some("D:\\Other\\".into()), "boot.arc".into()));
+        assert_eq!(resolve("E:boot.arc"), (Some("E:".into()), "boot.arc".into()));
+        assert_eq!(resolve("boot.arc"), (Some(String::new()), "boot.arc".into()));
     }
 }

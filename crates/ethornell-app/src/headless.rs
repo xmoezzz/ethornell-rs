@@ -48,7 +48,7 @@ impl HeadlessInputScript {
         }
     }
 
-    fn parse(source: &str) -> Result<Self, String> {
+    pub(crate) fn parse(source: &str) -> Result<Self, String> {
         let mut actions = VecDeque::new();
         for raw_token in source.split(',') {
             let token = raw_token.trim();

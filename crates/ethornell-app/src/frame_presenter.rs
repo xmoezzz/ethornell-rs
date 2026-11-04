@@ -183,6 +183,9 @@ fn compose_commands(
             })
             .unwrap_or((0.0, 0.0, 1.0));
         let layout = api.formatted_text_layout(node);
+        // Laid-out (window) text starts a line every `layout.line_height`,
+        // as the CPU compositor and the ruby above it do.
+        let node_line_height = node.formatted_layout.then_some(layout.line_height);
         let x = parent.0 + node.x;
         let cursor_y = parent.1 + node.y;
         let y = cursor_y + layout.body_y_offset;
@@ -239,6 +242,7 @@ fn compose_commands(
                         color[3] * effect.concentration as f32 / 256.0,
                     ],
                     size,
+                    line_height: node_line_height,
                     styles: shadow_styles,
                     glow: None,
                     clip,
@@ -254,6 +258,7 @@ fn compose_commands(
                         y: y + dy as f32,
                         color: [0.0, 0.0, 0.0, color[3] * alpha],
                         size,
+                        line_height: node_line_height,
                         styles: shadow_styles,
                         glow: None,
                         clip,
@@ -268,6 +273,7 @@ fn compose_commands(
             y,
             color,
             size,
+            line_height: node_line_height,
             styles,
             glow,
             clip,
@@ -287,6 +293,7 @@ fn compose_commands(
                     y: y + dy as f32,
                     color: [0.0, 0.0, 0.0, color[3] * alpha],
                     size,
+                    line_height: None,
                     styles: Vec::new(),
                     glow: None,
                     clip,
@@ -299,6 +306,7 @@ fn compose_commands(
                 y,
                 color,
                 size,
+                line_height: None,
                 styles: Vec::new(),
                 glow: None,
                 clip,
@@ -315,6 +323,7 @@ fn compose_commands(
             y: y + 2.0,
             color: [0.0, 0.0, 0.0, 0.9],
             size,
+            line_height: None,
             styles: Vec::new(),
             glow: None,
             clip: None,
@@ -326,6 +335,7 @@ fn compose_commands(
             y,
             color: [0.95, 0.95, 0.95, 1.0],
             size,
+            line_height: None,
             styles: Vec::new(),
             glow: None,
             clip: None,
@@ -491,6 +501,32 @@ mod tests {
         assert!(check_frame_budget(0, 0, MAX_FRAME_TEXT_BYTES + 1).is_err());
         assert!(validate_text("test", f32::NAN).is_err());
         assert!(validate_text("test", f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn window_text_lines_are_the_window_pitch_apart() {
+        // Wonderful Everyday's message window: font 28 and Graph91:89
+        // spacing 25 make a line every 35 pixels (sub_42C4C0); the GPU drew
+        // lines at the font's own height (about 28 pixels).
+        let mut api = api();
+        let window = api.alloc_window_surface(1280, 300).unwrap();
+        api.set_graph_object_draw_enabled(window, true);
+        api.graph_surfaces.get_mut(&window).unwrap().line_spacing_percent = 25;
+        api.surface_text_states.entry(window).or_default().font_size = 28;
+        api.start_native_message("ab\ncd".into(), Some(window));
+        api.reveal_text_on_input();
+        let commands = compose_commands(&api, Vec::new(), &BTreeMap::new()).unwrap();
+        let pitches = commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::DrawText {
+                    text, line_height, ..
+                } if text == "ab\ncd" => Some(*line_height),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!pitches.is_empty());
+        assert!(pitches.iter().all(|pitch| *pitch == Some(35.0)));
     }
 
     #[test]

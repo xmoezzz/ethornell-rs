@@ -3,6 +3,8 @@ use ethornell_vm::SysApi;
 
 #[derive(Default)]
 pub(super) struct NativeSystemState {
+    #[cfg(any(target_os="vita",target_os="horizon"))]
+    pub(super) mutex_names: BTreeMap<String,u64>,
     pub(super) main_loop_wait_override: i32,
     pub(super) drag_drop_enabled: bool,
     pub(super) fullscreen_hotkeys_enabled: bool,
@@ -11,13 +13,13 @@ pub(super) struct NativeSystemState {
     pub(super) cursor_index: i32,
     pub(super) native_close_mode: i32,
     pub(super) raster_wait_enabled: i32,
-    pub(super) bootstrap_root_or_archive: String,
-    pub(super) bootstrap_namespace: String,
+    /// Sys80:6B: (root, archive, file) of the pending engine restart.
+    pub(super) bootstrap_request: Option<(Option<String>, String, String)>,
     cursor_button_mode: i32,
     pub(super) uninstaller_mutex_name: String,
-    pub(super) restart_working_directory: String,
-    pub(super) restart_command_line: String,
-    pub(super) restart_error_message: String,
+    /// Sys80:E1: (current directory, command line, error message) run by
+    /// WinMain after the loop.
+    pub(super) restart: Option<(String, String, Option<String>)>,
 }
 
 impl NativeSystemState {
@@ -28,6 +30,13 @@ impl NativeSystemState {
 }
 
 impl RuntimeTraceApi {
+    /// Whether the file Sys80:3C waits for can be found (loose or archived).
+    /// GetFileAttributesA succeeds without FILE_ATTRIBUTE_DIRECTORY
+    /// (sub_466D00); archives are not searched.
+    pub(super) fn required_file_present(&mut self, path: &str) -> bool {
+        self.disk_file_exists(path)
+    }
+
     pub(super) fn dispatch_native_system(
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
@@ -40,7 +49,7 @@ impl RuntimeTraceApi {
 
         let value = match id {
             // sub_49A240 is the WM_ACTIVATE/minimize latch.
-            0x0E => ethornell_vm::Value::Int(i32::from(self.pending_window_minimize)),
+            0x0E => ethornell_vm::Value::Int(i32::from(self.window_minimize_latch)),
             0x1D => {
                 let input_descriptor = pop_int_value(stack).unwrap_or_default();
                 let scope = pop_int_value(stack).unwrap_or_default();
@@ -78,16 +87,14 @@ impl RuntimeTraceApi {
             0x24 => {
                 let recursive = pop_int_value(stack).unwrap_or_default() != 0;
                 let pattern = pop_string_value(stack).unwrap_or_default();
+                // sub_467110 recurses through strrchr(pattern, '\\'); a
+                // pattern without a backslash finds nothing below.
+                let recursive = recursive && pattern.contains('\\');
                 let count = self
                     .enumerate_native_paths(&pattern, recursive, 0, false)
                     .len()
                     .min(i32::MAX as usize) as i32;
                 ethornell_vm::Value::Int(count)
-            }
-            // VM owns the destination buffer for 0x26.
-            0x26 => {
-                let _ = pop_args(stack, 4);
-                ethornell_vm::Value::Int(0)
             }
             0x27 => {
                 let from = pop_string_value(stack).unwrap_or_default();
@@ -99,12 +106,7 @@ impl RuntimeTraceApi {
                     runtime_file_path_from_root(&self.manager, &self.native_root, &from),
                     runtime_file_path_from_root(&self.manager, &self.native_root, &to),
                 ) {
-                    (Some(from), Some(to)) => {
-                        if let Some(parent) = to.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        std::fs::rename(from, to).is_ok()
-                    }
+                    (Some(from), Some(to)) => win32_move_file(&from, &to),
                     _ => false,
                 };
                 tracing::info!(from, to, ok, "MoveFile");
@@ -114,41 +116,23 @@ impl RuntimeTraceApi {
             // presents Retry/Quit until media becomes available or the user
             // quits. The middle string is popped but unused by the target.
             0x3C => {
-                let message = pop_string_value(stack).unwrap_or_default();
-                let _ignored_context = pop_string_value(stack).unwrap_or_default();
-                let file = pop_string_value(stack).unwrap_or_default();
-                let title = self
-                    .pending_window_title
-                    .clone()
-                    .unwrap_or_else(|| "Ethornell".to_string());
+                // sub_466D00: the VM has resolved the file to primary root +
+                // name. MessageBox(caption, text, OK|CANCEL); Cancel asks to
+                // quit (YES|NO) and YES returns 0 without exiting; every other
+                // answer checks again.
+                let text = pop_string_value(stack).unwrap_or_default();
+                let caption = pop_string_value(stack).unwrap_or_default();
+                let path = pop_string_value(stack).unwrap_or_default();
                 let found = loop {
-                    if find_runtime_file_from_root(&self.manager, &self.native_root, "", &file)
-                        .is_some_and(|path| path.is_file())
-                        || find_runtime_resource(&self.manager, "", &file).is_some()
-                    {
-                        tracing::info!(file, "Sys80_3C_RequiredResourceFound");
+                    if self.required_file_present(&path) {
                         break true;
                     }
-                    tracing::warn!(file, "Sys80_3C_RequiredResourceMissing");
-                    let retry = host_dialog::show_message(
-                        host_dialog::MessageDialogKind::RetryCancel,
-                        &title,
-                        &message,
-                        true,
-                    )
-                    .unwrap_or(false);
-                    if !retry {
+                    tracing::warn!(path, "Sys80_3C_RequiredResourceMissing");
+                    if !retry_or_quit_prompt(&caption, &text) {
                         break false;
                     }
                 };
                 ethornell_vm::Value::Int(i32::from(found))
-            }
-            0x3E => {
-                let path = pop_string_value(stack).unwrap_or_default();
-                if let Some(policy) = file_policy::active() { return Some(Ok(ethornell_vm::Value::Int(i32::from(policy.metadata(&path).is_some_and(|m| m.is_dir()))))); }
-                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
-                    .is_some_and(|path| path.is_dir());
-                ethornell_vm::Value::Int(i32::from(exists))
             }
             0x53 => ethornell_vm::Value::None,
             // VM-owned scheduler boundary. Target ABI proves that 0x54
@@ -159,10 +143,7 @@ impl RuntimeTraceApi {
                 let _arg0_unrecovered = stack.pop();
                 ethornell_vm::Value::None
             }
-            0x5D => {
-                let _enabled = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::None
-            }
+            0x5D => unreachable!("exclusive-thread ownership is handled by the VM scheduler"),
             0x63 => {
                 let argument = pop_int_value(stack).unwrap_or_default();
                 self.native_system.display_scaling_mode = i32::from(argument == 0);
@@ -181,11 +162,6 @@ impl RuntimeTraceApi {
                     pop_int_value(stack).unwrap_or_default() != 0;
                 self.dropped_files.clear();
                 ethornell_vm::Value::None
-            }
-            // VM owns the output string.
-            0x6D => {
-                let _destination = stack.pop();
-                ethornell_vm::Value::Int(0)
             }
             0x6E => {
                 self.native_system.raster_wait_enabled = pop_int_value(stack).unwrap_or_default();
@@ -216,11 +192,14 @@ impl RuntimeTraceApi {
             .and_then(|name| name.to_str())
             .unwrap_or("*");
         let parent = pattern_path.parent().unwrap_or_else(|| Path::new(""));
-        let Some(root) = runtime_file_path_from_root(
-            &self.manager,
-            &self.native_root,
-            &parent.to_string_lossy(),
-        ) else {
+        // FindFirstFileA resolves a bare pattern such as "data0????.arc"
+        // against the working directory, the game root.
+        let root = if parent.as_os_str().is_empty() {
+            Some(self.native_root.clone())
+        } else {
+            runtime_file_path_from_root(&self.manager, &self.native_root, &parent.to_string_lossy())
+        };
+        let Some(root) = root else {
             return Vec::new();
         };
         let mut output = Vec::new();
@@ -234,6 +213,157 @@ impl RuntimeTraceApi {
             &mut output,
         );
         output
+    }
+}
+
+const WIN32_SETTABLE_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x100 | 0x1000 | 0x2000;
+#[cfg(unix)]
+const WIN32_ATTRIBUTE_XATTR: &[u8] = b"user.ethornell.win32-attributes\0";
+
+/// GetFileAttributesA: READONLY follows the host permission, DIRECTORY the
+/// file type; the other settable bits are what SetFileAttributesA stored
+/// (kept in an extended attribute), by default ARCHIVE for files as Windows
+/// sets it on every write. A file with no bit left reports NORMAL (0x80).
+pub(super) fn win32_file_attributes(path: &Path) -> Option<u32> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let stored = read_win32_attribute_xattr(path)
+        .unwrap_or(if metadata.is_dir() { 0 } else { 0x20 });
+    let mut attrs = stored & WIN32_SETTABLE_ATTRIBUTES & !1;
+    if metadata.permissions().readonly() {
+        attrs |= 1;
+    }
+    if metadata.is_dir() {
+        attrs |= 0x10;
+    } else if attrs == 0 {
+        attrs = 0x80;
+    }
+    Some(attrs)
+}
+
+/// SetFileAttributesA: keeps only the settable bits (NORMAL alone clears
+/// them), maps READONLY to the host permission and stores the rest.
+pub(super) fn set_win32_file_attributes(path: &Path, attrs: u32) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let attrs = attrs & WIN32_SETTABLE_ATTRIBUTES;
+    let mut permissions = metadata.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(attrs & 1 != 0);
+    if std::fs::set_permissions(path, permissions).is_err() {
+        return false;
+    }
+    write_win32_attribute_xattr(path, attrs & !1);
+    true
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn xattr_path(path: &Path) -> Option<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_win32_attribute_xattr(path: &Path) -> Option<u32> {
+    let path = xattr_path(path)?;
+    let mut value = [0u8; 4];
+    // SAFETY: valid NUL-terminated strings and a 4-byte buffer.
+    let read = unsafe {
+        libc::getxattr(path.as_ptr(), WIN32_ATTRIBUTE_XATTR.as_ptr().cast(), value.as_mut_ptr().cast(), 4, 0, 0)
+    };
+    (read == 4).then(|| u32::from_le_bytes(value))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_win32_attribute_xattr(path: &Path) -> Option<u32> {
+    let path = xattr_path(path)?;
+    let mut value = [0u8; 4];
+    // SAFETY: valid NUL-terminated strings and a 4-byte buffer.
+    let read = unsafe {
+        libc::getxattr(path.as_ptr(), WIN32_ATTRIBUTE_XATTR.as_ptr().cast(), value.as_mut_ptr().cast(), 4)
+    };
+    (read == 4).then(|| u32::from_le_bytes(value))
+}
+
+#[cfg(target_vendor = "apple")]
+fn write_win32_attribute_xattr(path: &Path, attrs: u32) {
+    if let Some(path) = xattr_path(path) {
+        let value = attrs.to_le_bytes();
+        // SAFETY: valid NUL-terminated strings and a 4-byte value.
+        unsafe {
+            libc::setxattr(path.as_ptr(), WIN32_ATTRIBUTE_XATTR.as_ptr().cast(), value.as_ptr().cast(), 4, 0, 0);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn write_win32_attribute_xattr(path: &Path, attrs: u32) {
+    if let Some(path) = xattr_path(path) {
+        let value = attrs.to_le_bytes();
+        // SAFETY: valid NUL-terminated strings and a 4-byte value.
+        unsafe {
+            libc::setxattr(path.as_ptr(), WIN32_ATTRIBUTE_XATTR.as_ptr().cast(), value.as_ptr().cast(), 4, 0);
+        }
+    }
+}
+
+// FreeBSD has extattr_* instead of xattrs; Windows and the web keep no
+// attribute store.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn read_win32_attribute_xattr(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn write_win32_attribute_xattr(_path: &Path, _attrs: u32) {}
+
+/// CopyFileA(..., FALSE): overwrites the destination (unless it is read-only),
+/// copies the data, the attributes (plus ARCHIVE) and the last-write time;
+/// a directory source fails.
+pub(super) fn win32_copy_file(from: &Path, to: &Path) -> bool {
+    let Ok(source) = std::fs::metadata(from) else {
+        return false;
+    };
+    if !source.is_file() {
+        return false;
+    }
+    if std::fs::metadata(to).is_ok_and(|meta| meta.permissions().readonly()) {
+        return false;
+    }
+    if std::fs::copy(from, to).is_err() {
+        return false;
+    }
+    if let (Ok(modified), Ok(file)) = (source.modified(), std::fs::File::options().write(true).open(to)) {
+        let _ = file.set_modified(modified);
+    }
+    let stored = read_win32_attribute_xattr(from).unwrap_or(0x20) & !1;
+    write_win32_attribute_xattr(to, stored | 0x20);
+    true
+}
+
+/// MoveFileA without flags: the destination must not exist (a case-only
+/// rename of the same file is allowed), its directory is not created, and a
+/// file may move across volumes by copy and delete; a directory may not.
+pub(super) fn win32_move_file(from: &Path, to: &Path) -> bool {
+    let Ok(source) = std::fs::symlink_metadata(from) else {
+        return false;
+    };
+    if std::fs::symlink_metadata(to).is_ok() && !same_file(from, to) {
+        return false;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => true,
+        Err(_) if source.is_file() && to.parent().is_some_and(Path::is_dir) => {
+            std::fs::copy(from, to).is_ok() && std::fs::remove_file(from).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 

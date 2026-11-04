@@ -11,4 +11,7 @@
     <string name="delete">Delete</string>
     <string name="delete_confirm">Delete %1$s and its files? Saves are kept.</string>
     <string name="engine_error">The game stopped</string>
+    <string name="dialog_field">Field %1$d</string>
+    <string name="dialog_month">Month (1-12)</string>
+    <string name="dialog_day">Day</string>
 </resources>

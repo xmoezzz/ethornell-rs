@@ -1,0 +1,21 @@
+// E-mote object vertex (render/shaders/emote.wgsl vs_main).
+void main(
+    float2 clip_position,
+    float2 model_position,
+    float2 texcoord,
+    float4 color,
+    float blend_mode,
+    float4 clip_rect,
+    float3 wipe,
+    out float4 out_pos : POSITION,
+    out float4 out_model_texcoord : TEXCOORD0,
+    out float4 out_color : TEXCOORD1,
+    out float4 out_clip_rect : TEXCOORD2,
+    out float4 out_wipe_blend : TEXCOORD3)
+{
+    out_pos = float4(clip_position, 0.0, 1.0);
+    out_model_texcoord = float4(model_position, texcoord);
+    out_color = color;
+    out_clip_rect = clip_rect;
+    out_wipe_blend = float4(wipe, blend_mode);
+}

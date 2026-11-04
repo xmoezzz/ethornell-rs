@@ -29,6 +29,130 @@ pub struct Packet {
     pub data: Vec<u8>,
 }
 
+/// A packet payload borrowed from an immutable input buffer.  This avoids a
+/// second full copy of large program streams when the caller can retain the
+/// source itself.
+#[derive(Clone, Debug)]
+pub struct PacketRange {
+    pub stream_type: StreamType,
+    pub pts_90k: Option<i64>,
+    pub range: std::ops::Range<usize>,
+}
+
+/// Locate elementary-stream payloads without copying them.
+pub fn packet_ranges(data: &[u8]) -> Vec<PacketRange> {
+    match detect_kind(data) {
+        ContainerKind::Es | ContainerKind::Auto => (!data.is_empty())
+            .then(|| PacketRange {
+                stream_type: StreamType::MpegVideo,
+                pts_90k: None,
+                range: 0..data.len(),
+            })
+            .into_iter()
+            .collect(),
+        ContainerKind::MpegPs => packet_ranges_ps(data),
+        ContainerKind::MpegTs => packet_ranges_ts(data),
+    }
+}
+
+fn packet_ranges_ps(data: &[u8]) -> Vec<PacketRange> {
+    let mut packets = Vec::new();
+    let mut pos = 0usize;
+    while let Some((start, sid)) = find_start_code(data, pos) {
+        let stream_type = if (0xE0..=0xEF).contains(&sid) {
+            StreamType::MpegVideo
+        } else if (0xC0..=0xDF).contains(&sid) {
+            StreamType::MpegAudio
+        } else {
+            pos = start + 4;
+            continue;
+        };
+        if start + 6 > data.len() {
+            break;
+        }
+        let pes_len = u16::from_be_bytes([data[start + 4], data[start + 5]]) as usize;
+        let end = if pes_len != 0 {
+            start.saturating_add(6).saturating_add(pes_len)
+        } else {
+            let mut search = start + 6;
+            let mut found = None;
+            while let Some((next, next_id)) = find_start_code(data, search) {
+                if next_id >= 0xB9 {
+                    found = Some(next);
+                    break;
+                }
+                search = next + 4;
+            }
+            found.unwrap_or(data.len())
+        };
+        if end > data.len() {
+            break;
+        }
+        let pes = &data[start..end];
+        let (pts_90k, offset) = parse_pes_header(pes).unwrap_or((None, 4));
+        if offset < pes.len() {
+            packets.push(PacketRange {
+                stream_type,
+                pts_90k,
+                range: start + offset..end,
+            });
+        }
+        pos = end;
+    }
+    packets
+}
+
+fn packet_ranges_ts(data: &[u8]) -> Vec<PacketRange> {
+    const TS_SIZE: usize = 188;
+    let mut packets = Vec::new();
+    let mut video_pid = None;
+    let mut audio_pid = None;
+    for start in (0..data.len().saturating_sub(TS_SIZE - 1)).step_by(TS_SIZE) {
+        let packet = &data[start..start + TS_SIZE];
+        if packet[0] != 0x47 {
+            continue;
+        }
+        let pusi = packet[1] & 0x40 != 0;
+        let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+        let afc = (packet[3] >> 4) & 3;
+        let mut offset = 4;
+        if afc == 2 || afc == 3 {
+            offset += 1 + usize::from(packet[offset]);
+        }
+        if afc == 0 || afc == 2 || offset >= TS_SIZE {
+            continue;
+        }
+        let payload = &packet[offset..];
+        if pusi && payload.len() >= 4 && payload[..3] == [0, 0, 1] {
+            match payload[3] {
+                0xE0..=0xEF if video_pid.is_none() => video_pid = Some(pid),
+                0xC0..=0xDF if audio_pid.is_none() => audio_pid = Some(pid),
+                _ => {}
+            }
+        }
+        let stream_type = if video_pid == Some(pid) {
+            StreamType::MpegVideo
+        } else if audio_pid == Some(pid) {
+            StreamType::MpegAudio
+        } else {
+            continue;
+        };
+        let (pts_90k, payload_offset) = if pusi {
+            parse_pes_header(payload).unwrap_or((None, 0))
+        } else {
+            (None, 0)
+        };
+        if payload_offset < payload.len() {
+            packets.push(PacketRange {
+                stream_type,
+                pts_90k,
+                range: start + offset + payload_offset..start + TS_SIZE,
+            });
+        }
+    }
+    packets
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainerKind {
     Auto,

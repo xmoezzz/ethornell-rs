@@ -15,21 +15,28 @@ pub(crate) fn duration_ms_to_ticks(duration_ms: i32) -> u32 {
     (duration_ms as u32).div_ceil(NATIVE_TICK_MS as u32)
 }
 
-/// The target engine treats a wall-clock jump larger than 500 ms as a pause.
-/// `sub_498720` subtracts that entire gap from its pause-adjusted engine clock
-/// instead of trying to catch the interpreter up with several synthetic frames.
-pub(crate) const ENGINE_PAUSE_GAP_MS: u64 = 500;
-
 /// Convert a wall-clock delta into target-style engine elapsed time.
 ///
+/// sub_499290 treats a wall-clock jump larger than dword_503DE8 (initially
+/// 500, Sys81:04 sets 50..=60000) as a pause and subtracts the whole gap
+/// from its pause-adjusted clock.
+///
 /// Normal GUI frames advance by their actual integer-millisecond delta. A gap
-/// larger than 500 ms is considered a pause and contributes no engine time.
-pub(crate) fn normalize_engine_elapsed_ms(elapsed_ms: u64) -> u64 {
-    if elapsed_ms > ENGINE_PAUSE_GAP_MS {
+/// larger than the threshold is a pause and contributes no engine time.
+pub(crate) fn normalize_engine_elapsed_ms(elapsed_ms: u64, threshold_ms: u32) -> u64 {
+    if elapsed_ms > u64::from(threshold_ms) {
         0
     } else {
         elapsed_ms
     }
+}
+
+/// Console suspension resets the host clock explicitly. A slow software
+/// effect is still an active frame; bound its delta so repeated slow frames
+/// cannot be discarded as pause gaps and freeze the effect's completion timer.
+#[cfg(any(test, feature = "console"))]
+pub(crate) fn console_engine_elapsed_ms(elapsed_ms: u64, threshold_ms: u32) -> u64 {
+    elapsed_ms.min(u64::from(threshold_ms))
 }
 
 #[cfg(test)]
@@ -49,11 +56,23 @@ mod tests {
 
     #[test]
     fn long_wall_clock_gap_is_treated_as_pause() {
-        assert_eq!(normalize_engine_elapsed_ms(0), 0);
-        assert_eq!(normalize_engine_elapsed_ms(16), 16);
-        assert_eq!(normalize_engine_elapsed_ms(17), 17);
-        assert_eq!(normalize_engine_elapsed_ms(500), 500);
-        assert_eq!(normalize_engine_elapsed_ms(501), 0);
-        assert_eq!(normalize_engine_elapsed_ms(5_000), 0);
+        assert_eq!(normalize_engine_elapsed_ms(0, 500), 0);
+        assert_eq!(normalize_engine_elapsed_ms(16, 500), 16);
+        assert_eq!(normalize_engine_elapsed_ms(17, 500), 17);
+        assert_eq!(normalize_engine_elapsed_ms(500, 500), 500);
+        assert_eq!(normalize_engine_elapsed_ms(501, 500), 0);
+        assert_eq!(normalize_engine_elapsed_ms(5_000, 500), 0);
+    }
+
+    #[test]
+    fn slow_console_frames_keep_timed_procedures_advancing() {
+        for threshold in [50, 500, 60_000] {
+            let elapsed = console_engine_elapsed_ms(u64::from(threshold) + 2_000, threshold);
+            assert_eq!(
+                normalize_engine_elapsed_ms(elapsed, threshold),
+                u64::from(threshold)
+            );
+            assert_eq!(console_engine_elapsed_ms(16, threshold), 16);
+        }
     }
 }

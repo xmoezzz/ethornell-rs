@@ -70,7 +70,7 @@ pub(crate) fn test_path_writable(path: &Path) -> bool {
 
 pub(crate) fn shell_open(target: &str) -> bool {
     if super::file_policy::restricted() { return false; }
-    if std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some() {
+    if std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some() || super::host_dialog::host_dialogs_suppressed() {
         return false;
     }
 
@@ -253,4 +253,105 @@ mod tests {
             Some("/games/tayutama2")
         );
     }
+}
+
+/// Milliseconds/nanoseconds since the host booted, the portable stand-in for
+/// GetTickCount/timeGetTime and QueryPerformanceCounter.
+#[cfg(unix)]
+pub(crate) fn host_uptime_ns() -> u64 {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime only writes the timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    (now.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(now.tv_nsec as u64)
+}
+
+#[cfg(windows)]
+pub(crate) fn host_uptime_ns() -> u64 {
+    unsafe extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+    // SAFETY: GetTickCount64 has no preconditions.
+    unsafe { GetTickCount64() }.wrapping_mul(1_000_000)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn host_uptime_ns() -> u64 {
+    0
+}
+
+/// sub_46FC50: `(GetSystemDefaultLangID() & 0x3FF) == LANG_JAPANESE`.
+#[cfg(target_os = "windows")]
+pub(crate) fn system_language_is_japanese() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemDefaultLangID() -> u16;
+    }
+    // SAFETY: no arguments, no preconditions.
+    unsafe { GetSystemDefaultLangID() & 0x3FF == 0x11 }
+}
+
+/// sub_46FC50 over the language of the current CoreFoundation locale.
+#[cfg(target_os = "macos")]
+pub(crate) fn system_language_is_japanese() -> bool {
+    use core::ffi::c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFLocaleCopyCurrent() -> *const c_void;
+        fn CFLocaleGetIdentifier(locale: *const c_void) -> *const c_void;
+        fn CFStringGetCString(string: *const c_void, buffer: *mut u8, size: isize, encoding: u32) -> u8;
+        fn CFRelease(object: *const c_void);
+    }
+    const UTF8: u32 = 0x0800_0100;
+    let mut buffer = [0u8; 64];
+    // SAFETY: the locale is released after use; the identifier is borrowed
+    // from it (Get rule) and copied into `buffer` before the release.
+    let copied = unsafe {
+        let locale = CFLocaleCopyCurrent();
+        if locale.is_null() {
+            return false;
+        }
+        let ok = CFStringGetCString(CFLocaleGetIdentifier(locale), buffer.as_mut_ptr(), buffer.len() as isize, UTF8);
+        CFRelease(locale);
+        ok != 0
+    };
+    copied && locale_name_is_japanese(&String::from_utf8_lossy(&buffer))
+}
+
+/// sub_46FC50 over the POSIX message locale.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub(crate) fn system_language_is_japanese() -> bool {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .is_some_and(|value| locale_name_is_japanese(&value))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn locale_name_is_japanese(name: &str) -> bool {
+    let language = name.split(['_', '-', '.', '@', '\0']).next().unwrap_or("");
+    language.eq_ignore_ascii_case("ja")
+}
+
+/// GetLogicalDriveStringsA, keeping DRIVE_REMOVABLE (2) and DRIVE_CDROM (5).
+#[cfg(target_os = "windows")]
+pub(crate) fn removable_drive_roots() -> Vec<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalDriveStringsA(length: u32, buffer: *mut u8) -> u32;
+        fn GetDriveTypeA(root: *const u8) -> u32;
+    }
+    let mut buffer = [0u8; 0x400];
+    // SAFETY: the buffer length is passed; the result is NUL-separated.
+    let length = unsafe { GetLogicalDriveStringsA(buffer.len() as u32, buffer.as_mut_ptr()) } as usize;
+    buffer[..length.min(buffer.len())]
+        .split(|&byte| byte == 0)
+        .filter(|root| !root.is_empty())
+        .filter(|root| {
+            let mut name = root.to_vec();
+            name.push(0);
+            // SAFETY: `name` is NUL-terminated.
+            matches!(unsafe { GetDriveTypeA(name.as_ptr()) }, 2 | 5)
+        })
+        .map(|root| String::from_utf8_lossy(root).into_owned())
+        .collect()
 }

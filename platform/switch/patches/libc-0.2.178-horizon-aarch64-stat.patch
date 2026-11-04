@@ -1,0 +1,22 @@
+--- a/src/unix/newlib/mod.rs
++++ b/src/unix/newlib/mod.rs
+@@ -3,2 +3,10 @@
+-pub type blkcnt_t = i32;
+-pub type blksize_t = i32;
++cfg_if! {
++    // devkitA64's newlib (Nintendo Switch): 64-bit block counts.
++    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
++        pub type blkcnt_t = c_long;
++        pub type blksize_t = c_long;
++    } else {
++        pub type blkcnt_t = i32;
++        pub type blksize_t = i32;
++    }
++}
+@@ -16,0 +25,6 @@
++    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
++        // devkitA64's newlib (Nintendo Switch): 16-bit device and inode
++        // numbers, as in its `struct stat` and `struct dirent`.
++        pub type dev_t = c_short;
++        pub type ino_t = c_ushort;
++        pub type off_t = i64;
