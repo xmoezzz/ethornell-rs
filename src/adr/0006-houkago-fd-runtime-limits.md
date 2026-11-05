@@ -2,6 +2,42 @@
 
 **Status:** Startup limits verified (2026-11-05); other version differences open.
 
+## Follow-up: BackML source-position curve
+
+The first heroine's route subsequently fails at Graph90:38, property 0x8E
+in scrgrp3._bp. The original BackML vtable at 0x511A84 points to the setter
+0x423C60, whose switch sends property 0x8E to 0x423A80. It stores one
+curve selector at object+0x184+88*selected_layer and ignores the extra
+operand. Existing rotation/scale fields and their curves are preserved.
+
+The draw path at 0x423EB1 calls 0x420010 with that selector before
+multiplying both source-coordinate deltas. The rotation and scale curves
+follow separately. This is a source-motion curve, not a rotation override
+or an unsupported property to ignore. Raw instructions and the switch
+tables are in `raw/houkago_cinderella_fd/backml_source_curve.asm`; cleaned
+reference is appended to `engine/backml.c`.
+
+The Rust layer records an optional source curve. An absent selector keeps
+the older engine's direct unsigned 8.24 multiplication. Once 0x8E is set,
+the source offsets use its 16.16 curve weight; zero/unknown selectors use
+the native signed linear fallback. A pixel regression samples a gradient
+at half progress: the quadratic curve moves both source coordinates half
+as far as the linear curve. The same test checks selected-layer isolation,
+preservation of rotation/scale settings, and the ignored extra operand.
+
+The first heroine reproduced the original fatal error before this change.
+Afterward, the five heroine openings completed offscreen runs of 10000,
+6500, 4600, 4600 and 4600 frames. A second first-heroine run used dense
+ordinary Enter presses for 9000 frames and rendered 82 distinct nonempty
+message strings. The first/second/fifth runs exercised property 0x8E.
+No VM-fatal stop occurred in these runs. All 520 app unit tests pass, and
+the CLI was rebuilt. Snapshots and input scripts are retained in the
+2026-11-05 `houkago-cinderella-fd/play` visualization artifacts.
+
+Deeper desktop runs also log 92:95 stubs and BGI.edb open/close prompts;
+those remain separate compatibility gaps. Passing these bounded replays
+does not establish full-route compatibility or absence of modal prompts.
+
 ## Evidence
 
 The supplied Japanese executable is identified by SHA256 in

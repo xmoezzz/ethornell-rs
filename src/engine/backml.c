@@ -29,3 +29,18 @@ static int interpolated_scale(int base,int delta,int curve_fixed16) {
  * private layer indices are not global render priorities. */
 /* Native uninitialized temporary/border pixels are zero in the portable
  * allocation. CPU font/GPU-independent rendering is shared with Effectors. */
+
+/* Houkago FD adds a source-position curve at layer+0x34 (88-byte records,
+ * vs the older 84). Evidence: raw/houkago_cinderella_fd/backml_source_curve.asm.
+ * BackML vtable 0x511A84+0x5C -> sub_423C60. Property 0x8E calls sub_423A80:
+ * store arg0 at object+0x184+88*selected_layer; arg1 is unused. It does not
+ * reset rotation, scales or their deltas. At draw (423EB1..423EF4), the
+ * selected curve feeds sub_420010 before multiplying BOTH source deltas.
+ * The rotation and scale curves (property0x8F) remain independent.
+ * Curve0 is truncating signed progress/256, not the older unsigned8.24
+ * direct multiply. A script without property0x8E retains the old path. */
+#include <stdint.h>
+extern int curve_fixed16(int curve, int progress8_24);
+static int source_curve_offset(int delta, int curve, int progress8_24) {
+    return (int)((int64_t)delta * curve_fixed16(curve,progress8_24) >> 16);
+}

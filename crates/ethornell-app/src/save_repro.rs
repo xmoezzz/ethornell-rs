@@ -79,14 +79,51 @@ fn game_input_repro() {
         .split(',')
         .filter_map(|frame| frame.trim().parse().ok())
         .collect();
+    // Optional external batches keep the same game alive while a repro
+    // navigates settings, holds Ctrl, or handles a route's choices.
+    // Each JSON batch is {"frames":N,"script":"...","tick_ms":optional};
+    // {"stop":true} exits. The default clock step is the native tick.
+    let control = std::env::var_os("ETHORNELL_REPRO_CONTROL").map(PathBuf::from);
+    let mut batch_frames = 0usize;
+    let mut tick_ms = NATIVE_TICK_MS;
     for frame in 0..frames {
+        if let Some(control) = control.as_ref() {
+            if batch_frames == 0 || control.exists() {
+                if let Some(path) = snapshot_path.as_ref() {
+                    snapshot::write_runtime_snapshot(&runtime.api, path).unwrap();
+                }
+                eprintln!("control paused frame={frame}");
+                let batch = loop {
+                    if let Ok(source) = std::fs::read_to_string(control) {
+                        let batch: serde_json::Value = serde_json::from_str(&source).unwrap();
+                        std::fs::remove_file(control).unwrap();
+                        break batch;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                if batch["stop"].as_bool() == Some(true) {
+                    break;
+                }
+                batch_frames = batch["frames"].as_u64().expect("batch frames") as usize;
+                assert!(batch_frames > 0);
+                if let Some(value) = batch["tick_ms"].as_u64() {
+                    assert!(value > 0);
+                    tick_ms = value;
+                }
+                script = batch["script"].as_str().map(|source| {
+                    HeadlessInputScript::parse(source).expect("batch input script")
+                });
+                eprintln!("control batch frame={frame} frames={batch_frames}");
+            }
+            batch_frames -= 1;
+        }
         let report = runtime_frontend::drive_runtime_frame(
             &mut runtime,
             &mut events,
             &mut script,
             pacing,
-            NATIVE_TICK_MS,
-            NATIVE_TICK_MS,
+            tick_ms,
+            tick_ms,
             None,
             "repro",
         );
