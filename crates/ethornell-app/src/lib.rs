@@ -7431,9 +7431,10 @@ impl RuntimeTraceApi {
         let source_image = crop_decoded_image(self.graph_images.get(&source_key)?, source_region);
         let composite_key = format!("runtime:bitmap:{destination}");
 
-        let mut destination_image = if let Some(image) = self.graph_images.get(&composite_key) {
-            image.clone()
-        } else if let Some((key, region)) = self
+        // A load or region rebind can replace this slot while its previous
+        // runtime image is still cached. Only the slot's current backing is
+        // authoritative; otherwise old expression pixels survive a reload.
+        let mut destination_image = if let Some((key, region)) = self
             .resource_image_region(destination)
             .map(|(key, region)| (key.to_string(), region))
         {
@@ -11987,6 +11988,57 @@ mod input_tests {
         assert_eq!(&result.rgba[4..7], &[200, 100, 50]);
         assert_eq!(&result.rgba[8..11], &[10, 20, 30]);
         assert_eq!(api.bitmap_formats[&7], 1);
+    }
+
+    #[test]
+    fn reloading_a_bitmap_before_blitting_discards_the_previous_expression() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let skin = [240, 200, 160, 255];
+        let first_face = [0, 0, 0, 255];
+        let next_face = [0, 0, 0, 255];
+        for (name, pixels) in [
+            ("body", vec![skin, skin, skin]),
+            ("face1", vec![first_face, [0; 4], [0; 4]]),
+            ("face2", vec![[0; 4], next_face, [0; 4]]),
+        ] {
+            let key = format!("test:{name}");
+            api.store_graph_image(
+                key.clone(),
+                DecodedImage {
+                    width: 3,
+                    height: 1,
+                    rgba: pixels.into_iter().flatten().collect(),
+                },
+            );
+            api.graph_image_formats.insert(key, 2);
+        }
+        let (destination, source) = (7, 8);
+        for face in ["face1", "face2"] {
+            assert!(api.load_graph_image_resource(destination, "test", "body"));
+            assert!(api.load_graph_image_resource(source, "test", face));
+            call_graph(
+                &mut api,
+                0x90,
+                0x18,
+                &mut vec![
+                    Value::Int(destination),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(source),
+                    Value::Int(1),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            [skin, next_face, skin].concat(),
+            "transparent parts of the new expression must reveal the reloaded body",
+        );
+        assert_eq!(api.graph_images["test:body"].rgba, skin.repeat(3));
     }
 
     #[test]
