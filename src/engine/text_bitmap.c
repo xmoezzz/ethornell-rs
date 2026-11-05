@@ -162,6 +162,11 @@ int Graph92_1E_DrawBitmapText(struct CThread *t)
 //           blitted at (0, 0) mode 1 parameter 256 - concentration, then
 //           the glyph at (dx, dy) mode 0. The record grows by 2dx x 2dy
 //           (dx x dy for mode 1).
+// Graph92:90 can subsequently install a message wait with an empty string
+// and a different style. With no new character records, sub_437940 has
+// nothing to blit: the window's committed pixels retain their original
+// glyph colour and shadow. Updating the global style for this wait does not
+// recolour or regenerate those existing glyph images.
 
 // --------------------------------------- Graph91:88 ConfigureWindowFont ---
 

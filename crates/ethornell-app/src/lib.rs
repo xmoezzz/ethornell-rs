@@ -16589,6 +16589,57 @@ mod input_tests {
         );
     }
 
+    #[test]
+    fn empty_styled_message_wait_preserves_the_already_drawn_text_style() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = message_window(&mut api);
+        api.surface_text_states.entry(window).or_default().font_size = 28;
+        // Draw a coloured sentence with a black edge, then install a wait
+        // with no new text and different colours (FTL scrmsg's two 92:90s).
+        let mut message = [
+            window, 0, 0x88ccff, 1, 0x88ccff, 1, 2, 5, 5, 0, 192, 1, 0, 1, 1,
+        ]
+        .map(Value::Int)
+        .to_vec();
+        message[1] = Value::Str("A completed sentence.".into());
+        call_graph(&mut api, 0x92, 0x90, &mut message).unwrap();
+        api.tick_text(10_000);
+        let node = api.text_runtime.target_node.unwrap();
+        let before = api.text_nodes[&node].clone();
+        let shadow = api.text_node_shadow(&before);
+
+        let mut wait = [
+            window, 0, 0xffffff, 1, 0xffffff, 1, 2, 5, 5, 0x88ccff, 192, 1, 0, 1, 1,
+        ]
+        .map(Value::Int)
+        .to_vec();
+        wait[1] = Value::Str(String::new());
+        call_graph(&mut api, 0x92, 0x90, &mut wait).unwrap();
+        api.tick_text(10_000);
+
+        let after = &api.text_nodes[&node];
+        assert_eq!(after.text, before.text);
+        assert_eq!(
+            after.color, before.color,
+            "a wait must not recolour committed glyphs"
+        );
+        assert_eq!(
+            api.text_node_shadow(after),
+            shadow,
+            "a wait must not replace the black edge"
+        );
+        assert_eq!(
+            api.system92_text_colour, 0xffffff,
+            "the native colour query still observes the wait's colour"
+        );
+        assert!(
+            api.native_message_active,
+            "the empty call must still install the message wait"
+        );
+    }
+
     fn message_window(api: &mut super::RuntimeTraceApi) -> i32 {
         let window = 0xB000_0000_u32 as i32;
         api.graph_surfaces
@@ -27717,6 +27768,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let int = |index: usize| value_to_i32(&args[index]);
                     self.set_message_text_style(
                         target,
+                        text.as_deref().unwrap_or_default(),
                         int(8),
                         [int(4), int(3), int(2), int(1), int(0)],
                     );
@@ -27836,6 +27888,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let int = |index: usize| value_to_i32(&args[index]);
                     self.set_message_text_style(
                         target,
+                        text.as_deref().unwrap_or_default(),
                         int(12),
                         [int(8), int(7), int(6), int(5), int(4)],
                     );

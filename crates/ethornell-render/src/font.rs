@@ -62,7 +62,7 @@ impl FontProvider {
                     break;
                 };
                 if Self::missing_glyphs(&font, required_text).is_empty() {
-                    tracing::debug!(face, "loaded system CJK font");
+                    tracing::debug!(path, face, "loaded system CJK font");
                     return Ok(font);
                 }
             }

@@ -84,14 +84,18 @@ fn relative(name: &str) -> Option<PathBuf> {
 }
 
 // Some BGI scripts build their user-data directory from the primary install
-// root. Only this conventional user-data subtree is a writable virtual alias;
-// arbitrary resource-root names remain read-only. It never denotes host IO in
-// the resource directory and never imports original save bytes.
+// root. This conventional user-data subtree and the engine's global database
+// are writable virtual aliases. BGI.gdb defaults to the install root when the
+// script has not set a validated user-data root (80:80/81, sub_46B960).
+// Arbitrary resource-root names remain read-only. These aliases never denote
+// host IO in the resource directory and never import original save bytes.
 pub(crate) fn user_data_alias(name: &str) -> String {
     let normalized=name.replace('\\',"/");
     if let Some(rest)=normalized.strip_prefix("bgi-resource/") {
         let first=rest.split('/').next().unwrap_or("");
-        if first.eq_ignore_ascii_case("UserData") {return format!("bgi-user/{rest}");}
+        if first.eq_ignore_ascii_case("UserData") || rest.eq_ignore_ascii_case("BGI.gdb") {
+            return format!("bgi-user/{rest}");
+        }
     }
     normalized
 }
@@ -1022,6 +1026,53 @@ mod tests {
         assert_eq!(std::fs::read(p.resource.join("UserData/original.sud")).unwrap(),b"original");
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn install_global_database_uses_private_storage_without_importing_original_data() {
+        use ethornell_vm::SysApi;
+        let (base, p) = roots("global-database");
+        std::fs::write(p.resource.join("BGI.gdb"), b"original global data").unwrap();
+        let mut api = super::super::RuntimeTraceApi::new_with_native_root(
+            p.open_manager().unwrap(),
+            p.resource.clone(),
+        );
+        api.host.enabled = true;
+        scope(&p, || {
+            assert!(api.read_user_file_bytes("bgi-resource\\BGI.gdb").is_none());
+            assert!(p.user_metadata("bgi-resource\\BGI.gdb").is_none());
+            assert!(api.write_file_bytes("bgi-resource\\BGI.gdb", b"private global data"));
+            assert_eq!(
+                api.read_user_file_bytes("bgi-resource\\bgi.GDB").unwrap(),
+                b"private global data"
+            );
+            assert_eq!(
+                api.read_user_file_bytes("bgi-user\\BGI.gdb").unwrap(),
+                b"private global data"
+            );
+            assert_eq!(p.user_metadata("bgi-resource\\BGI.gdb").unwrap().len(), 19);
+        });
+        assert_eq!(
+            std::fs::read(p.resource.join("BGI.gdb")).unwrap(),
+            b"original global data"
+        );
+        assert_eq!(
+            std::fs::read(p.user.join("BGI.gdb")).unwrap(),
+            b"private global data"
+        );
+        assert_eq!(
+            p.read_loose("bgi-resource\\BGI.gdb").unwrap(),
+            b"original global data"
+        );
+        for denied in [
+            "bgi-resource/story.arc",
+            "bgi-resource/BGI.gdb/../story.arc",
+            "bgi-resource/nested/BGI.gdb",
+            "bgi-resource/BGI.gdb.bak",
+        ] {
+            assert!(p.atomic_write(denied, b"bad").is_err(), "{denied}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn ambiguous_ascii_case_alias_does_not_select_arbitrary_directory_entry() {
         let (base, p) = roots("case-ambiguity");
