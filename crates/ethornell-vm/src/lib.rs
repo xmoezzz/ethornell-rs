@@ -37,6 +37,7 @@ mod program_thread;
 mod records;
 mod resource_io;
 mod scenario;
+mod stream_io;
 mod sentence_table;
 mod scheduler;
 mod system80_state;
@@ -9468,104 +9469,10 @@ impl Vm {
                     .insert(self.value_key(destination), Value::Str(text));
                 Value::None
             }
-            (0x81, 0x28) => {
-                let mode = self.pop_int()?;
-                let path = self.pop_string_lossy()?;
-                let handle_destination = self.pop_ptr()?;
-                let bytes = api.load_file_bytes("", &path).or_else(|| {
-                    api.allow_direct_filesystem_fallback()
-                        .then(|| std::fs::read(&path).ok())
-                        .flatten()
-                });
-                let status = if !(0..=2).contains(&mode) {
-                    1
-                } else if let Some(bytes) = bytes {
-                    let result = self
-                        .system81_shared
-                        .lock()
-                        .expect("system81 state poisoned")
-                        .open_resource_stream(path, mode, bytes);
-                    match result {
-                        Ok(handle) => {
-                            self.write_int(handle_destination, 2, handle)?;
-                            0
-                        }
-                        Err(system81_state::NATIVE_NOT_FOUND) => 2,
-                        Err(_) => 3,
-                    }
-                } else {
-                    3
-                };
-                Value::Int(status)
-            }
-            (0x81, 0x29) => {
-                let handle = self.pop_int()?;
-                let status_destination = self.pop_ptr()?;
-                let removed = self
-                    .system81_shared
-                    .lock()
-                    .expect("system81 state poisoned")
-                    .resource_streams
-                    .remove(&(handle as u32))
-                    .is_some();
-                if status_destination != 0 {
-                    self.write_int(status_destination, 2, if removed { 0 } else { 4 })?;
-                }
-                Value::Int(if removed { 0 } else { 4 })
-            }
-            (0x81, 0x2a) => {
-                let length = self.pop_int()?.max(0) as usize;
-                let destination = self.pop_ptr()?;
-                let handle = self.pop_int()? as u32;
-                let status_destination = self.pop_ptr()?;
-                let result = {
-                    let mut state = self
-                        .system81_shared
-                        .lock()
-                        .expect("system81 state poisoned");
-                    if let Some(stream) = state.resource_streams.get_mut(&handle) {
-                        let available = stream.bytes.len().saturating_sub(stream.cursor);
-                        let count = length.min(available);
-                        let bytes = stream.bytes[stream.cursor..stream.cursor + count].to_vec();
-                        stream.cursor += count;
-                        Some(bytes)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(bytes) = result {
-                    let range = self.resolve_range(destination, bytes.len())?;
-                    self.memory[range].copy_from_slice(&bytes);
-                    self.clear_shadow_values(destination, bytes.len());
-                    if status_destination != 0 {
-                        self.write_int(status_destination, 2, bytes.len() as u32)?;
-                    }
-                    Value::Int(0)
-                } else {
-                    Value::Int(4)
-                }
-            }
-            (0x81, 0x2b) => {
-                let offset = self.pop_int()?.max(0) as usize;
-                let handle = self.pop_int()? as u32;
-                let status_destination = self.pop_ptr()?;
-                let status = {
-                    let mut state = self
-                        .system81_shared
-                        .lock()
-                        .expect("system81 state poisoned");
-                    if let Some(stream) = state.resource_streams.get_mut(&handle) {
-                        stream.cursor = offset.min(stream.bytes.len());
-                        stream.cursor as i32
-                    } else {
-                        -1
-                    }
-                };
-                if status_destination != 0 {
-                    self.write_int(status_destination, 2, status as u32)?;
-                }
-                Value::Int(if status >= 0 { 0 } else { 4 })
-            }
+            (0x81, 0x28) => self.sys81_open_stream(api)?,
+            (0x81, 0x29) => self.sys81_close_stream()?,
+            (0x81, 0x2a) => self.sys81_transfer_stream(api)?,
+            (0x81, 0x2b) => self.sys81_seek_stream()?,
             (0x81, 0x2c) => {
                 let path = self.pop_string_lossy()?;
                 let write_time = self.pop_ptr()?;

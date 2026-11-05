@@ -5612,6 +5612,9 @@ impl RuntimeTraceApi {
         if let Some(mode) = self.graph90_sprite_mode(object) {
             // CDspObjSprite::GetProperty (sub_4288F0).
             match parameter {
+                // Houkago FD 42E330 -> 42D8E0: the stored primary bitmap
+                // at object+0x160, without mode or bitmap-existence checks.
+                0x10 => return Ok(vec![properties.format_resource.unwrap_or(-1)]),
                 0x41 => {
                     let rotation = properties.properties.get(&0x41).map(|pair| pair.0);
                     return match mode {
@@ -14426,10 +14429,13 @@ mod input_tests {
         let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut vec![]).unwrap() else {
             panic!()
         };
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![-1]));
         let mut configure = [sprite, 10, 20, 501, 1, 32, 123].map(Value::Int).to_vec();
         call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![501]));
         let mut property = [sprite, 0x10, 502, -999].map(Value::Int).to_vec();
         call_graph(&mut api, 0x90, 0x38, &mut property).unwrap();
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![502]));
         assert!(property.is_empty());
         let layer = &api.graph_layers[&sprite];
         assert_eq!(
@@ -14456,6 +14462,7 @@ mod input_tests {
                 .insert("target-object-mode".into(), mode);
             let mut ignored = [sprite, 0x10, -1, 0].map(Value::Int).to_vec();
             call_graph(&mut api, 0x90, 0x38, &mut ignored).unwrap();
+            assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![502]));
             assert_eq!(
                 api.graph_object_properties[&sprite].format_resource,
                 Some(502)

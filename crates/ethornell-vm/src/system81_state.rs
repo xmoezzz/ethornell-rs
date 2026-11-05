@@ -145,7 +145,7 @@ impl System81SharedState {
         if self
             .resource_streams
             .values()
-            .any(|stream| stream.path == path)
+            .any(|stream| stream.path.eq_ignore_ascii_case(&path))
         {
             return Err(NATIVE_NOT_FOUND);
         }

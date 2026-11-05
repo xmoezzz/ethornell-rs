@@ -35,7 +35,7 @@ the CLI was rebuilt. Snapshots and input scripts are retained in the
 2026-11-05 `houkago-cinderella-fd/play` visualization artifacts.
 
 Deeper desktop runs also log 92:95 stubs and BGI.edb open/close prompts;
-those remain separate compatibility gaps. Passing these bounded replays
+the stream failure is addressed below; 92:95 remains open. Passing these bounded replays
 does not establish full-route compatibility or absence of modal prompts.
 
 ## Evidence
@@ -94,9 +94,39 @@ Still open:
   is at 0x501818; the handlers are 0x48E480 (one pop, one push) and
   0x48E4A0 (two pops, one push). Audit their helper chains before adding a
   dispatch profile rather than assuming the existing Amachoco semantics.
-* The restricted host reaches a `BGI.edb` open-error prompt at frame 779.
-  This is separate from the desktop startup errors fixed here.
 * This change configures native logical region limits; the VM's existing
   fixed local backing windows remain unchanged. Accesses beyond their
   supported range need a separate memory-layout change. The title startup
   reproduction does not establish full-game compatibility.
+
+## Follow-up: Config sprite getter and diagnostic stream
+
+Config calls Graph91:38 property 0x10 in syswndfnc._bp to obtain a sprite's
+primary bitmap before compositing the menu. The supplied executable's
+42E330 -> 42D8E0 returns the DWORD at object+0x160, without mode gating or
+bitmap validation. This is a getter missing from the port, rather than a
+property to ignore. The Rust getter returns the retained bitmap number
+(or -1 before configuration), including after bitmap replacement.
+
+BGI.edb is written through Sys81:28..2B. The old implementation tried to
+read the file for every open mode and could not create it. file._bp then
+retries 40 times at 100 ms intervals, explaining pauses before the open
+error. Its close completion also incorrectly returned 0, whereas the
+script waits for a positive completion.
+
+The already recovered worker in raw/text_400000.c (4014D0) selects reads
+for mode 0 and writes for modes 1/2; close and successful seek complete
+with 1, transfer completes with a byte count, and failure/zero bytes with
+-1. UINT_MAX seeks to EOF, and an offset beyond EOF fails. stream_io.rs
+implements those results synchronously through the existing user-file
+API, including create/truncate and open-or-create. It does not synthesize
+a successful file open or suppress the script's diagnostic prompts.
+Asynchronous worker timing is still outside this implementation.
+
+Validation: 520 app and 294 VM unit tests pass. A 4100-frame native-clock
+replay entered Config from the title, visited display/text/sound/system
+pages and returned without a fatal error or diagnostic prompt. A separate
+5000-frame restricted-host first-heroine replay completed without a host
+fatal/prompt; its filesystem log confirms BGI.edb creation and append
+writes in private storage. Both replays captured logs only. This is
+bounded verification, not a full-route or graphics correctness claim.

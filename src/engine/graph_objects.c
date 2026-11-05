@@ -72,6 +72,11 @@ int Graph90_33_SetObjectPosition(struct CThread *t)
 
 // ------------------------------------- Graph90:57 ReplaceSpriteBitmap ---
 
+// Houkago FD adds sprite GetProperty 0x10: sub_42E330 branches to
+// sub_42D8E0 and writes object+0x160 (the primary bitmap number) to the
+// caller's output DWORD, returning success. No mode or bitmap lookup is
+// performed. syswndfnc._bp uses this to flatten the Config menu sprites.
+
 // Graph90:38 property 0x10 enters the very same sprite_replace_primary;
 // `extra` is ignored. Unlike selector 57, the property wrapper does NOT
 // first check bitmap < 0x4000: inert modes 1/3/4 accept any value, while
