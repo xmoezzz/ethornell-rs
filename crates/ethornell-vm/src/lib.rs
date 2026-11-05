@@ -2633,6 +2633,20 @@ impl Vm {
         vm
     }
 
+    /// Construct the main thread with the verified engine's region sizes.
+    /// Houkago FD sub_49A5AE uses 8 MiB code / 4 MiB data / 4096 slots;
+    /// the default constructor retains sub_48C990's older limits. Children
+    /// continue to use the region sizes supplied by Sys80:44.
+    pub fn with_main_thread_regions(
+        code_bytes: u32,
+        data_bytes: u32,
+        operand_slots: u32,
+    ) -> Self {
+        let mut vm = Self::new();
+        vm.thread.set_region_sizes(code_bytes, data_bytes, operand_slots);
+        vm
+    }
+
     /// Start the sub_499290 clock at `base_ms` (the host uptime for
     /// interactive runs).
     pub fn set_clock_base_ms(&mut self, base_ms: u32) {
@@ -18830,6 +18844,46 @@ mod tests {
         assert!(vm.async_tasks.is_empty());
         assert_eq!(vm.stack.last(), Some(&Value::Int(expected_base as i32)));
         assert_eq!(vm.target_loaded_programs.len(), 2);
+    }
+
+    #[test]
+    fn extended_main_thread_regions_load_modules_above_the_legacy_code_limit() {
+        for (mut vm, accepted) in [
+            (Vm::new(), false),
+            (Vm::with_main_thread_regions(0x800000, 0x400000, 4096), true),
+        ] {
+            let root = empty_loaded_program("root._bp".into());
+            let base = Vm::program_target_code_size(&root);
+            vm.start(&root);
+            let mut program = empty_loaded_program("worker._bp".into());
+            program.module_size = 600 * 1024;
+            program.code = std::sync::Arc::new(vec![0x42; program.module_size as usize]);
+            vm.stack.extend([
+                Value::Str("sysprg.arc".into()),
+                Value::Str("worker._bp".into()),
+            ]);
+            let instruction = test_instruction(0, 0x80, "sys1", vec![0x80, 0x40], Vec::new());
+            let result = vm.dispatch(&instruction, &mut MediationApi { program });
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(vm.target_loaded_programs.len(), 2);
+                assert_eq!(
+                    vm.read_int(super::CODE_SEGMENT | (base + 600 * 1024 - 1), 0)
+                        .unwrap(),
+                    0x42
+                );
+                let mut oversized = empty_loaded_program("oversized._bp".into());
+                oversized.module_size = 0x800000;
+                vm.stack.extend([
+                    Value::Str("sysprg.arc".into()),
+                    Value::Str("oversized._bp".into()),
+                ]);
+                assert!(
+                    vm.dispatch(&instruction, &mut MediationApi { program: oversized })
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

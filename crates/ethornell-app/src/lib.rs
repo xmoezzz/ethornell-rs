@@ -224,10 +224,26 @@ fn configured_game_id(manager: &ResourceManager) -> (String, &'static str) {
 
     (DEFAULT_GAME_ID.into(), "fallback")
 }
-fn confirmed_native_profile(
-    manager: &ResourceManager,
-    bootstrap: &[u8],
-) -> ethornell_vm::NativeAbiProfile {
+#[derive(Clone, Copy)]
+struct NativeRuntimeProfile {
+    abi: ethornell_vm::NativeAbiProfile,
+    se_channels: usize,
+    main_code_bytes: u32,
+    main_data_bytes: u32,
+}
+
+impl Default for NativeRuntimeProfile {
+    fn default() -> Self {
+        Self {
+            abi: ethornell_vm::NativeAbiProfile::Tayutama,
+            se_channels: 64,
+            main_code_bytes: 0x80000,
+            main_data_bytes: 0x40000,
+        }
+    }
+}
+
+fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
     // Session version detection uses two exact code-resource fingerprints,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
@@ -237,21 +253,40 @@ fn confirmed_native_profile(
             (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
         })
     }
+    let amachoco = NativeRuntimeProfile {
+        abi: ethornell_vm::NativeAbiProfile::Amachoco,
+        ..NativeRuntimeProfile::default()
+    };
     let expected_title = match (bootstrap.len(), fingerprint(bootstrap)) {
-        (10176, CONFIRMED_BOOTSTRAP_FNV) => Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV)),
+        (10176, CONFIRMED_BOOTSTRAP_FNV) => {
+            Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV, amachoco))
+        }
         // Japanese retail release, system.arc dated 2019-12-10.
-        (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a)),
+        (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a, amachoco)),
+        // Houkago Cinderella FD's validator sub_4A6C30 accepts SE 0..128.
+        // Its other new selectors remain unaudited; do not reuse Amachoco ABI.
+        (12608, 0x46f725982b5b8cd6) => Some((
+            20608,
+            0x603c84fe0ba8bc49,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
         _ => None,
     };
-    if let Some((title_len, title_hash)) = expected_title {
+    if let Some((title_len, title_hash, profile)) = expected_title {
         if let Ok(title) = manager.read_decoded_from_archive("sysprg.arc", "title._bp") {
             if title.len() == title_len && fingerprint(&title) == title_hash {
-                return ethornell_vm::NativeAbiProfile::Amachoco;
+                return profile;
             }
         }
     }
-    ethornell_vm::NativeAbiProfile::Tayutama
+    NativeRuntimeProfile::default()
 }
+
 const CONFIRMED_BOOTSTRAP_FNV: u64 = 0x9f5e9248ec3ad577;
 const CONFIRMED_TITLE_FNV: u64 = 0xc6bdd0d97d4f4893;
 const CONFIRMED_TITLE_LEN: usize = 26272;
@@ -1032,22 +1067,22 @@ struct RuntimeTraceApi {
     /// Independent BGM fade envelope selected by A0:18/A0:19 (target record +0x40).
     bgm_fade_volumes: [u8; 16],
     /// Target SE gain bank set by A0:09 (dword_55EE18 / sub_4A2DF0).
-    sound_primary_volumes: [u8; 64],
+    sound_primary_volumes: Vec<u8>,
     /// Target SE gain bank set by A0:2C (sub_4A2890).
-    sound_secondary_volumes: [u8; 64],
+    sound_secondary_volumes: Vec<u8>,
     /// Per-SE play volume selected by A0:24 (target record +0x28).
-    sound_play_volumes: [u8; 64],
+    sound_play_volumes: Vec<u8>,
     /// Independent SE fade envelope selected by A0:26 (target record +0x40).
-    sound_fade_volumes: [u8; 64],
+    sound_fade_volumes: Vec<u8>,
     /// GetTickCount-domain clock and the two independent sound envelopes.
     native_sound_tick: u32,
     bgm_play_ramps: [Option<NativeSoundRamp>; 16],
     bgm_fade_ramps: [Option<NativeSoundRamp>; 16],
-    sound_fade_ramps: [Option<NativeSoundRamp>; 64],
+    sound_fade_ramps: Vec<Option<NativeSoundRamp>>,
     bgm_channel_active: [bool; 16],
-    sound_channel_active: [bool; 64],
+    sound_channel_active: Vec<bool>,
     bgm_playback_clocks: [NativeAudioClock; 16],
-    sound_playback_clocks: [NativeAudioClock; 64],
+    sound_playback_clocks: Vec<NativeAudioClock>,
     /// Target A0:80-86 CD-audio device. On portable hosts this is backed by
     /// actual decoded track assets rather than an inert unsupported stub.
     native_cd_audio: NativeCdAudioState,
@@ -1446,18 +1481,18 @@ impl RuntimeTraceApi {
             bgm_secondary_volumes: [128; 16],
             bgm_play_volumes: [128; 16],
             bgm_fade_volumes: [128; 16],
-            sound_primary_volumes: [128; 64],
-            sound_secondary_volumes: [128; 64],
-            sound_play_volumes: [128; 64],
-            sound_fade_volumes: [128; 64],
+            sound_primary_volumes: vec![128; 64],
+            sound_secondary_volumes: vec![128; 64],
+            sound_play_volumes: vec![128; 64],
+            sound_fade_volumes: vec![128; 64],
             native_sound_tick: 0,
             bgm_play_ramps: [None; 16],
             bgm_fade_ramps: [None; 16],
-            sound_fade_ramps: [None; 64],
+            sound_fade_ramps: vec![None; 64],
             bgm_channel_active: [false; 16],
-            sound_channel_active: [false; 64],
+            sound_channel_active: vec![false; 64],
             bgm_playback_clocks: [NativeAudioClock::default(); 16],
-            sound_playback_clocks: [NativeAudioClock::default(); 64],
+            sound_playback_clocks: vec![NativeAudioClock::default(); 64],
             native_cd_audio: NativeCdAudioState::default(),
             audio_requests: VecDeque::new(),
             movie_audio_sent: BTreeMap::new(),
@@ -9502,14 +9537,20 @@ impl RuntimeEngine {
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
-        let mut vm = ethornell_vm::Vm::new();
-        vm.set_native_abi_profile(confirmed_native_profile(&manager, bytes));
+        let profile = confirmed_native_profile(&manager, bytes);
+        let mut vm = ethornell_vm::Vm::with_main_thread_regions(
+            profile.main_code_bytes,
+            profile.main_data_bytes,
+            4096,
+        );
+        vm.set_native_abi_profile(profile.abi);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
             vm,
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
+                api.configure_native_sound_channels(profile.se_channels);
                 api.native_dialog_presentation = native_dialog_presentation;
                 api
             },
@@ -29240,7 +29281,7 @@ fn native_audio_panning(value: i32) -> f64 {
     f64::from(value.clamp(0, 128)) / 128.0
 }
 
-fn set_sound_channel_active(active: &mut [bool; 64], channel: i32, value: bool) {
+fn set_sound_channel_active(active: &mut [bool], channel: i32, value: bool) {
     if let Some(slot) = usize::try_from(channel)
         .ok()
         .and_then(|index| active.get_mut(index))

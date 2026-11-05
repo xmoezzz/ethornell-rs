@@ -912,13 +912,22 @@ impl RuntimeEngine {
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.into()), bytes);
-        let mut vm = ethornell_vm::Vm::new();
-        vm.set_native_abi_profile(confirmed_native_profile(&manager, bytes));
+        let profile = confirmed_native_profile(&manager, bytes);
+        let mut vm = ethornell_vm::Vm::with_main_thread_regions(
+            profile.main_code_bytes,
+            profile.main_data_bytes,
+            4096,
+        );
+        vm.set_native_abi_profile(profile.abi);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
             vm,
-            api: RuntimeTraceApi::new_with_native_root(manager, root),
+            api: {
+                let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
+                api.configure_native_sound_channels(profile.se_channels);
+                api
+            },
             options: ethornell_vm::VmRunOptions {
                 max_steps: ethornell_vm::DEFAULT_COOPERATIVE_WATCHDOG_STEPS,
                 trace,

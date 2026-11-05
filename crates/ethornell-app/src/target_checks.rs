@@ -7,9 +7,9 @@ fn fail(message: String) -> VmResult<()> {
     Err(VmError::Runtime(message))
 }
 
-/// sub_4984C0: SE channel < 0x40.
-pub(crate) fn se_channel(value: i32) -> VmResult<()> {
-    if value as u32 >= 0x40 {
+/// sub_4984C0: SE channel < 64; Houkago FD sub_4A6C30 uses 128.
+pub(crate) fn se_channel(value: i32, channel_count: usize) -> VmResult<()> {
+    if value as u32 as usize >= channel_count {
         return fail(format!("無効な効果音番号 [ {value} ] が指定されました"));
     }
     Ok(())
