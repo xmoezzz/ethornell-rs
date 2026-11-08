@@ -24,7 +24,7 @@ web-sys = { version = "0.3", features = ["OffscreenCanvas"] }
 
 [target.'cfg(not(any(target_arch = "wasm32",target_os="vita",target_os="horizon")))'.dependencies.wgpu]
 workspace = true
-features = ["dx12", "metal", "webgpu"]
+features = ["dx12", "metal", "vulkan", "gles", "webgpu"]
 
 [target.'cfg(not(any(target_os="vita",target_os="horizon")))'.dependencies]
 winit = { workspace = true, optional = true }

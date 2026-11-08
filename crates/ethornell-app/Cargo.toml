@@ -37,7 +37,7 @@ chardetng = "0.1.17"
 
 [target.'cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))'.dependencies.wgpu]
 workspace = true
-features = ["dx12", "metal", "webgpu"]
+features = ["dx12", "metal", "vulkan", "gles", "webgpu"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
 workspace = true
@@ -47,5 +47,5 @@ features = ["webgl"]
 vitasdk-sys = { version = "=0.3.3", default-features = false, features = ["SceSysmem_stub"] }
 
 [target.'cfg(not(any(target_os="vita",target_os="horizon")))'.dependencies]
-ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", tag = "v0.4.1", features = ["default_font", "lzma", "mp3", "aac", "nellymoser"] }
-ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", tag = "v0.4.1" }
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", rev = "f64085ef12bd3c01995105c5ca20fee310fc6d87", features = ["default_font", "lzma", "mp3", "aac", "nellymoser"] }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", rev = "f64085ef12bd3c01995105c5ca20fee310fc6d87" }
