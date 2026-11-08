@@ -205,6 +205,16 @@ impl HostRuntime {
             return Err(EthornellError::Other("invalid GPU backend".into()));
         }
         let policy = file_policy::FilePolicy::new(&config.resource_root, &config.user_root)?;
+        Self::create_with_policy(config,policy)
+    }
+    /// Existing network capability; saves and locking stay on the local host.
+    #[cfg(all(fd_policy,any(feature="nfs",feature="smb")))]
+    pub fn create_with_resources(config:HostConfig,directory:game_network::Directory)->Result<Self> {
+        if config.backend>2 {return Err(EthornellError::Other("invalid GPU backend".into()));}
+        let policy=file_policy::FilePolicy::from_network_directory(directory,&config.user_root)?;
+        Self::create_with_policy(config,policy)
+    }
+    fn create_with_policy(config:HostConfig,policy:file_policy::FilePolicy)->Result<Self> {
         let writer_lock = policy.lock_writer()?;
         policy.validate_resource_tree().map_err(|e| {
             EthornellError::Other(format!("host_policy:301:{}", e.raw_os_error().unwrap_or(0)))

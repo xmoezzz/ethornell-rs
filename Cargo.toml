@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/game-network",
   "crates/ethornell-core",
   "crates/ethornell-archive",
   "crates/ethornell-image",

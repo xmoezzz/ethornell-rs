@@ -7,12 +7,15 @@ edition.workspace = true
 workspace = true
 
 [features]
+nfs = ["dep:game-network", "game-network/nfs"]
+smb = ["dep:game-network", "game-network/smb"]
 default = ["desktop-window"]
 desktop-window = ["winit", "ethornell-render/desktop-window"]
 host-driven = []
 console = ["host-driven", "ethornell-render/native-gpu"]
 
 [dependencies]
+game-network = { path = "../game-network", optional = true, default-features = false }
 ethornell-core = { path = "../ethornell-core" }
 ethornell-archive = { path = "../ethornell-archive" }
 ethornell-image = { path = "../ethornell-image" }

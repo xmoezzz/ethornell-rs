@@ -1,5 +1,7 @@
-//! A scoped per-session policy. Desktop calls have no policy. Host calls install
-//! it with an RAII guard, including during bootstrap and all native dispatch.
+#[cfg(all(fd_policy, any(feature="nfs", feature="smb")))]
+mod network;
+// A scoped per-session policy. Desktop calls have no policy. Host calls install
+// it with an RAII guard, including during bootstrap and all native dispatch.
 use std::{
     cell::RefCell,
     io::{self, Write},
@@ -39,6 +41,8 @@ pub(crate) type WriterLock = ();
 
 #[derive(Clone, Debug)]
 pub(crate) struct FilePolicy {
+    #[cfg(all(fd_policy, any(feature="nfs",feature="smb")))]
+    network:Option<std::sync::Arc<network::NetworkRoot>>,
     pub resource: PathBuf,
     pub user: PathBuf,
     #[cfg(fd_policy)]
@@ -306,6 +310,21 @@ fn case_component(
 
 #[cfg(fd_policy)]
 impl FilePolicy {
+    #[cfg(any(feature="nfs",feature="smb"))]
+    pub(crate) fn from_network_directory(directory:game_network::Directory,user:&Path)->io::Result<Self> {
+        Self::from_network_root(std::sync::Arc::new(network::NetworkRoot::from_directory(directory)?),user)
+    }
+    #[cfg(any(feature="nfs",feature="smb"))]
+    fn from_network_root(network:std::sync::Arc<network::NetworkRoot>,user:&Path)->io::Result<Self> {
+        let parent=user.parent().ok_or_else(||io::Error::other("network game user root needs a parent"))?;
+        let anchor=parent.join(".ethornell-network-resources");
+        std::fs::create_dir_all(&anchor)?;
+        std::fs::create_dir_all(user)?;
+        let mut policy=Self::new(&anchor,user)?;
+        policy.resource=network.mount.path().to_owned();
+        policy.network=Some(network);
+        Ok(policy)
+    }
     #[cfg(fd_policy)]
     pub fn lock_writer(&self) -> io::Result<WriterLock> {
         use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
@@ -344,6 +363,9 @@ impl FilePolicy {
     }
     /// A resource-root file of at most `limit` bytes.
     pub fn read_resource(&self, name: &str, limit: u64) -> io::Result<Vec<u8>> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if let Some(net)=&self.network {return net.read(name.strip_prefix("bgi-resource/").unwrap_or(name),limit);}
+
         use std::io::Read;
         let file = self.open_resource(name)?;
         let budget = || io::Error::new(io::ErrorKind::InvalidData, "resource file budget exceeded");
@@ -411,6 +433,9 @@ impl FilePolicy {
         Ok(dir)
     }
     pub fn open_manager(&self) -> ethornell_core::Result<ethornell_archive::ResourceManager> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if let Some(net)=&self.network {return net.manager(&self.resource);}
+
         use std::io::{Read, Seek, SeekFrom};
         let mut files = Vec::new();
         walk_directory(
@@ -450,6 +475,11 @@ impl FilePolicy {
         )
     }
     pub fn new(resource: &Path, user: &Path) -> io::Result<Self> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if resource.to_string_lossy().contains("://") {
+            let network=std::sync::Arc::new(network::NetworkRoot::connect(&resource.to_string_lossy())?);
+            return Self::from_network_root(network,user);
+        }
         fn open_root(path: &Path, stage: u32) -> io::Result<(PathBuf, std::fs::File)> {
             use std::{
                 ffi::CString,
@@ -520,6 +550,8 @@ impl FilePolicy {
             ));
         }
         Ok(Self {
+            #[cfg(any(feature="nfs",feature="smb"))]
+            network:None,
             resource,
             user,
             resource_dir: std::sync::Arc::new(resource_dir),
@@ -529,6 +561,9 @@ impl FilePolicy {
     /// ResourceManager caches archive descriptors. Reject links before opening
     /// its index so a game cannot smuggle an outside archive into that cache.
     pub fn validate_resource_tree(&self) -> io::Result<()> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if let Some(net)=&self.network {return net.validate();}
+
         walk_directory(
             &self.resource_dir,
             Path::new(""),
@@ -539,6 +574,15 @@ impl FilePolicy {
         )
     }
     pub fn metadata(&self, name: &str) -> Option<PolicyMetadata> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if let Some(net)=&self.network {
+            let normalized=name.replace('\\',"/");
+            if let Some(name)=normalized.strip_prefix("bgi-resource/") {return net.metadata(name);}
+            if !normalized.starts_with("bgi-user/") {
+                return self.metadata(&format!("bgi-user/{normalized}")).or_else(||net.metadata(&normalized));
+            }
+        }
+
         let normalized = name.replace('\\', "/");
         let (root, name, explicit) = if let Some(name) = normalized.strip_prefix("bgi-user/") {
             (&self.user_dir, name, true)
@@ -568,6 +612,15 @@ impl FilePolicy {
     pub fn user_metadata(&self,name:&str)->Option<PolicyMetadata> {self.metadata(&user_data_alias(name))}
     pub fn enumerate_user(&self,pattern:&str,recursive:bool,max_count:usize,directories:bool)->io::Result<Vec<String>> {self.enumerate(&user_data_alias(pattern),recursive,max_count,directories)}
     pub fn read_loose(&self, name: &str) -> io::Result<Vec<u8>> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if self.network.is_some() {
+            let normalized=name.replace('\\',"/");
+            if let Some(name)=normalized.strip_prefix("bgi-resource/") {return self.read_resource(name,256*1024*1024);}
+            if !normalized.starts_with("bgi-user/") && self.open_relative(&self.user_dir,&normalized,false).is_err_and(|e|e.kind()==io::ErrorKind::NotFound) {
+                return self.read_resource(&normalized,256*1024*1024);
+            }
+        }
+
         use std::io::Read;
         let normalized = name.replace('\\', "/");
         let (file, limit) = if let Some(name) = normalized.strip_prefix("bgi-resource/") {
@@ -609,6 +662,10 @@ impl FilePolicy {
         max_count: usize,
         directories: bool,
     ) -> io::Result<Vec<String>> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if let Some(net)=&self.network {
+            if let Some(name)=pattern.replace('\\',"/").strip_prefix("bgi-resource/") {return net.enumerate(name,recursive,max_count,directories);}
+        }
         let normalized = pattern.replace('\\', "/");
         let (base, name) = if let Some(name) = normalized.strip_prefix("bgi-resource/") {
             (&self.resource_dir, name)
