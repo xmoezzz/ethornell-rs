@@ -364,7 +364,15 @@ impl FilePolicy {
     /// A resource-root file of at most `limit` bytes.
     pub fn read_resource(&self, name: &str, limit: u64) -> io::Result<Vec<u8>> {
         #[cfg(any(feature="nfs",feature="smb"))]
-        if let Some(net)=&self.network {return net.read(name.strip_prefix("bgi-resource/").unwrap_or(name),limit);}
+        if let Some(net)=&self.network {
+            let budget=||io::Error::new(io::ErrorKind::InvalidData,"network user resource byte budget");
+            use std::io::Read;
+            match self.open_resource(name) {
+                Ok(file)=>{if file.metadata()?.len()>limit{return Err(budget());}let mut bytes=Vec::new();file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;if bytes.len() as u64>limit{return Err(budget());}return Ok(bytes);},
+                Err(e) if e.kind()==io::ErrorKind::NotFound=>return net.read(name.strip_prefix("bgi-resource/").unwrap_or(name),limit),
+                Err(e)=>return Err(e),
+            }
+        }
 
         use std::io::Read;
         let file = self.open_resource(name)?;
