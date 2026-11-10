@@ -24013,9 +24013,12 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 // sub_46FB30 budgets the object cache for the mode's size.
                 self.object_cache_budget_size = (width, height);
                 if width > 0 && height > 0 {
-                    self.screen_width = width;
-                    self.screen_height = height;
-                    self.graph90_refresh_background_screen_layout();
+                    // Guard against legacy display mode slots shrinking the virtual game canvas
+                    if width >= self.screen_width && height >= self.screen_height {
+                        self.screen_width = width;
+                        self.screen_height = height;
+                        self.graph90_refresh_background_screen_layout();
+                    }
                 }
                 if !fullscreen {
                     self.apply_windowed_client_size();
