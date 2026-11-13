@@ -11791,9 +11791,9 @@ impl Vm {
                 self.replace_operand(operand, Value::Str(String::new()));
                 continue;
             }
-            // sub_48DF50 turns a script pointer into a native `char *`; it does
-            // not look for a string elsewhere. Only untyped integers keep the
-            // descriptor fallback.
+            // Known text arguments are native char pointers (sub_48DF50),
+            // including control-only messages. Never reject them by a text
+            // plausibility heuristic or search neighbouring descriptor bytes.
             // A script may cut a double-byte character in half to make a
             // string fit (usdtwnd's save-slot excerpt loop); the lone lead
             // byte is not damage and must not send a valid pointer into the
@@ -11801,6 +11801,9 @@ impl Vm {
             let text = match original {
                 Value::Ptr(ptr) if ptr != 0 && self.shadow_string_at(ptr).is_some() => {
                     self.shadow_string_at(ptr).unwrap_or_default()
+                }
+                Value::Ptr(ptr) if ptr != 0 && text_slot => {
+                    self.value_as_string_with_encoding(original.clone(), encoding)?
                 }
                 Value::Ptr(ptr) if ptr != 0 => {
                     let direct = self.value_as_string_with_encoding(original.clone(), encoding)?;
@@ -11836,7 +11839,9 @@ impl Vm {
             // pointer that a renderer would draw as "0x...". Integers keep the
             // plausibility test because they may be plain numbers.
             let non_null_pointer = matches!(original, Value::Ptr(ptr) if ptr != 0);
-            if non_null_pointer && !text.starts_with("0x") {
+            if non_null_pointer && text_slot {
+                self.replace_operand(operand, Value::Str(text));
+            } else if non_null_pointer && !text.starts_with("0x") {
                 let cleaned = text.trim_matches('\0').trim_end_matches('\u{fffd}');
                 self.replace_operand(operand, Value::Str(cleaned.to_string()));
             } else if is_plausible_text_payload(&text) {
@@ -16903,6 +16908,38 @@ mod tests {
         assert_eq!(args[6], Value::Str("auxiliary text".into()));
         assert_eq!(args[20], Value::Int(20));
         assert_eq!(args[0], Value::Int(0));
+    }
+
+    #[test]
+    fn graph_text_control_pointer_does_not_read_adjacent_literals() {
+        let mut vm = Vm::new();
+        let pointer = crate::FRAME_SEGMENT | 0x3000;
+        for text in ["\u{c}", "\t", "\r\n", "\u{b}", "", "<ns>line</ns>", "0x1234"] {
+            vm.write_c_string_raw(pointer, text).unwrap();
+            let neighbour = pointer + text.len() as u32 + 1;
+            vm.write_c_string_raw(neighbour, "</ns>").unwrap();
+            vm.write_c_string_raw(neighbour + 6, "<NS>").unwrap();
+            let range = vm.resolve_range(pointer, text.len() + 12).unwrap();
+            let original = vm.memory[range.clone()].to_vec();
+            for (group, id, from_top) in [
+                (0x90, 0x90, 4),
+                (0x91, 0x91, 3), (0x91, 0x93, 4),
+                (0x91, 0x9c, 8), (0x91, 0x9c, 10),
+                (0x91, 0x9d, 9), (0x91, 0x9d, 11),
+                (0x92, 0x1c, 6), (0x92, 0x1d, 7),
+                (0x92, 0x1e, 5), (0x92, 0x1f, 0),
+                (0x92, 0x90, 13), (0x92, 0x91, 9),
+                (0x92, 0x9c, 14), (0x92, 0x9c, 17),
+            ] {
+                let count = super::documented_opcode(super::NativeOpcode { group, id }).unwrap().parameters.len();
+                vm.stack = vec![Value::Int(0); count];
+                let index = count - 1 - from_top;
+                vm.stack[index] = Value::Ptr(pointer);
+                vm.normalize_graph_string_args(group, id).unwrap();
+                assert_eq!(vm.stack[index], Value::Str(text.into()), "{group:02x}:{id:02x} slot {from_top}");
+                assert_eq!(&vm.memory[range.clone()], original.as_slice());
+            }
+        }
     }
 
     #[test]
