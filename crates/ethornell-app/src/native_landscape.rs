@@ -531,7 +531,7 @@ impl RuntimeTraceApi {
                     p[2] = cell.silhouette_value as u8;
                 }
                 if column.format == 2 {
-                    crate::bitmap_blend::blit_mode(
+                    crate::bitmap_blend::blit_mode_with_options(
                         &mut image,
                         column.format,
                         &silhouette,
@@ -544,10 +544,11 @@ impl RuntimeTraceApi {
                             0x20
                         },
                         256 - cell.silhouette_level,
+                        self.native_additive_coverage,
                     );
                 }
             }
-            crate::bitmap_blend::blit_mode(
+            crate::bitmap_blend::blit_mode_with_options(
                 &mut result,
                 df,
                 &image,
@@ -556,6 +557,7 @@ impl RuntimeTraceApi {
                 y + g.y,
                 blend,
                 alpha,
+                self.native_additive_coverage,
             );
             for &(id, transparency) in cell.guides.iter().flatten() {
                 if let Some(guide) = raster.guides.get(id as usize) {
@@ -565,7 +567,7 @@ impl RuntimeTraceApi {
                         - column.boundary * state.column_step
                         - guide.image.height as i32;
                     let ga = 256 - ((256 - alpha).wrapping_mul(256 - transparency) >> 8);
-                    crate::bitmap_blend::blit_mode(
+                    crate::bitmap_blend::blit_mode_with_options(
                         &mut result,
                         df,
                         &guide.image,
@@ -574,6 +576,7 @@ impl RuntimeTraceApi {
                         gy,
                         blend,
                         ga,
+                        self.native_additive_coverage,
                     );
                 }
             }

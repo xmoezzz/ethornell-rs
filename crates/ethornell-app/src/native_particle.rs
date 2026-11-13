@@ -284,6 +284,7 @@ impl ParticleWorld {
         height: u32,
         first: &[i32],
         banks: &ParticleBanks,
+        additive_coverage: bool,
     ) -> Vec<DecodedImage> {
         let mut planes = first
             .iter()
@@ -366,7 +367,7 @@ impl ParticleWorld {
                 0
             };
             let format = banks.primary.get(&(p.kind, p.bank)).map_or(2, |b| b.format);
-            crate::bitmap_blend::blit_mode(
+            crate::bitmap_blend::blit_mode_with_options(
                 &mut planes[plane],
                 2,
                 &image,
@@ -375,6 +376,7 @@ impl ParticleWorld {
                 y,
                 p.f[14],
                 transparency,
+                additive_coverage,
             );
         }
         planes

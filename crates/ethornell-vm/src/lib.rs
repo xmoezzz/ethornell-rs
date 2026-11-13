@@ -16,6 +16,8 @@ use std::sync::{
 
 mod async_program;
 mod child_thread;
+mod compact_bp;
+mod modern_bp;
 pub mod cpu_record;
 mod debug;
 mod extended_opcodes;
@@ -71,11 +73,14 @@ pub(crate) const FRAME_SEGMENT: u32 = 0x0800_0000;
 pub(crate) const CODE_SEGMENT: u32 = 0x0400_0000;
 /// Where the code region sits in the thread's local window (after the data
 /// region), and its largest size.
-const CODE_WINDOW_OFFSET: u32 = 0x0010_0000;
-const CODE_WINDOW_SIZE: u32 = HEAP_OFFSET_BASE - CODE_WINDOW_OFFSET;
-const HEAP_OFFSET_BASE: u32 = 0x0020_0000;
+// Physical capacity covers the recovered newer 4 MiB data / 8 MiB code
+// profiles. Per-thread reservations still enforce each revision's smaller
+// logical limits; neither region may alias the other or the heap.
+const CODE_WINDOW_OFFSET: u32 = 0x0040_0000;
+const CODE_WINDOW_SIZE: u32 = 0x0080_0000;
+const HEAP_OFFSET_BASE: u32 = CODE_WINDOW_OFFSET + CODE_WINDOW_SIZE;
 const HEAP_MEMORY_BASE: usize = (LOCAL_MEMORY_BASE + HEAP_OFFSET_BASE) as usize;
-const INITIAL_MEMORY_SIZE: usize = 16 * 1024 * 1024;
+const INITIAL_MEMORY_SIZE: usize = 32 * 1024 * 1024;
 const MAX_MEMORY_SIZE: usize = 256 * 1024 * 1024;
 const OPERAND_STACK_CAPACITY: usize = 4096;
 
@@ -1114,9 +1119,18 @@ pub trait SysApi {
         false
     }
 
+    fn user_ui_language(&mut self) -> i32 { 0x0409 }
+
     fn launcher_mode(&mut self) -> i32 {
         0
     }
+    /// Portable host registration for BP 0x73's company/product InstalledFolder.
+    /// It must persist metadata in the authorized user store, without requiring
+    /// access to a machine-wide Windows registry on other platforms.
+    fn register_installation(&mut self, _company: &str, _product: &str, _folder: &str) -> VmResult<()> {
+        Err(VmError::Runtime("installation metadata host is not connected".into()))
+    }
+
 
     fn take_frame_yield(&mut self) -> bool {
         false
@@ -1163,6 +1177,18 @@ pub trait GraphApi {
     ) -> bool {
         false
     }
+
+    /// Register a native named-font coverage transform and tracking descriptor.
+    fn register_named_font_transform(&mut self, _name: &str, _values: [i32; 5]) -> VmResult<()> {
+        Err(VmError::Runtime("named font transform host is not connected".into()))
+    }
+    fn set_named_font_tracking(&mut self, _name: &str, _tracking: i32) -> VmResult<()> {
+        Err(VmError::Runtime("named font tracking host is not connected".into()))
+    }
+
+    /// Last glyph's horizontal extent relative to the message's start,
+    /// stored by CDspObjWindow+0x3A0 (FD Graph92:95).
+    fn window_last_text_extent(&self, _window: i32) -> Option<i32> { None }
 
     /// Returns the two DWORD globals written by target helper sub_434410
     /// when Graph92:9B is called with selector 256.
@@ -2331,6 +2357,7 @@ fn placeholder_loaded_program(
 #[derive(Debug, Default)]
 pub struct Vm {
     native_abi_profile: NativeAbiProfile,
+    modern_pointer_tags: bool,
     trace_id: u64,
     pending_host_request: Option<host_request::PendingHostRequest>,
     ready_host_response: Option<HostResponse>,
@@ -2624,7 +2651,7 @@ impl Vm {
             native_abi_profile: NativeAbiProfile::default(),
             memory: memory.into(),
             parked_local: None,
-            heap_ptr: 0x0020_0000,
+            heap_ptr: HEAP_OFFSET_BASE,
             rng_seed: 1,
             system_wait_state: 1,
             next_indexed_record_handle: 1,
@@ -3210,7 +3237,7 @@ impl Vm {
             }
             BpOpcode::Known { code: 0x04, .. } => {
                 self.push_value(Value::Ptr(
-                    FRAME_SEGMENT | self.mem_ptr.saturating_sub(read_op_u32(instruction)),
+                    self.bp_frame_tag() | self.mem_ptr.saturating_sub(read_op_u32(instruction)),
                 ));
             }
             BpOpcode::Known { code: 0x05, .. } => {
@@ -3233,7 +3260,7 @@ impl Vm {
                         });
                     if let Some(target) = literal {
                         let base = self.program_code_bases.get(program_index).copied().unwrap_or_default();
-                        self.push_value(Value::Ptr(CODE_SEGMENT | base.wrapping_add(target - start)));
+                        self.push_value(Value::Ptr(self.bp_code_tag() | base.wrapping_add(target - start)));
                     } else {
                         self.push_value(Value::Str(text.clone()));
                     }
@@ -3242,7 +3269,7 @@ impl Vm {
                     let program = &self.programs[program_index];
                     let base = self.program_code_bases.get(program_index).copied().unwrap_or_default();
                     let address = base.wrapping_add(offset.wrapping_sub(Self::program_parser_code_start(program)));
-                    self.push_value(Value::Ptr(CODE_SEGMENT | address));
+                    self.push_value(Value::Ptr(self.bp_code_tag() | address));
                 }
             }
             BpOpcode::Known { code: 0x06, .. } => {
@@ -3250,6 +3277,22 @@ impl Vm {
                 // `insn_start + disp`, without a segment tag.
                 let code = self.code_offset_of(program_index, read_op_u32(instruction));
                 self.push_value(Value::Int(code as i32));
+            }
+            BpOpcode::Known { code: 0x03 | 0x0d | 0x0e | 0x13 | 0x36 | 0x37 | 0x3e | 0x3f | 0x45..=0x47 | 0x55 | 0xe3..=0xe7 | 0xec | 0xed, .. } => {
+                if let Some(target) = self.execute_modern_bp(instruction)? {
+                    let dest = self.code_offset_of(program_index, target);
+                    let (target_program, parser_offset) = self.resolve_code_target(program_index, dest);
+                    self.current_program = target_program;
+                    next_pc = self.jump_target_index(target_program, parser_offset)?;
+                }
+            }
+            BpOpcode::Known { code: 0x0f | 0x12 | 0x18..=0x1f | 0x2c..=0x2f | 0x3b | 0x3c, .. } => {
+                if let Some(target) = self.execute_compact_bp(instruction)? {
+                    let dest = self.code_offset_of(program_index, target);
+                    let (target_program, parser_offset) = self.resolve_code_target(program_index, dest);
+                    self.current_program = target_program;
+                    next_pc = self.jump_target_index(target_program, parser_offset)?;
+                }
             }
             BpOpcode::Known { code: 0x10, .. } => {
                 // sub_473880 pushes the raw frame-memory offset. Only opcode
@@ -3390,16 +3433,20 @@ impl Vm {
             }
             BpOpcode::Known { code: 0x15, .. } => {
                 let kind = read_op_u8(instruction);
-                let dest = self.pop_int()? as u32;
+                let dest = if kind & 8 != 0 {
+                    self.code_offset_of(program_index, compact_bp::inline_target(instruction)?)
+                } else {
+                    self.pop_int()? as u32
+                };
                 let value = self.pop_int()?;
-                let take = match kind {
+                let take = match kind & 7 {
                     0 => value != 0,
                     1 => value == 0,
                     2 => value > 0,
                     3 => value >= 0,
                     4 => value <= 0,
                     5 => value < 0,
-                    _ => true,
+                    _ => return Err(VmError::Runtime(format!("invalid BP branch predicate {kind:#x}"))),
                 };
                 if trace_vm_branches_enabled() {
                     tracing::debug!(
@@ -3423,8 +3470,13 @@ impl Vm {
                     next_pc = self.jump_target_index(target_program, parser_offset)?;
                 }
             }
-            BpOpcode::Known { code: 0x16, .. } => match {
-                let target = self.pop_value()?;
+            BpOpcode::Known { code: 0x16 | 0xee | 0xef, .. } => match {
+                let target = if code == 0xee {
+                    Value::Int(self.code_offset_of(program_index, read_op_u32(instruction)) as i32)
+                } else if code == 0xef {
+                    let packed = read_op_u32(instruction);
+                    self.read_value(packed & 0x3fff_ffff, compact_bp::width(packed >> 30))?
+                } else { self.pop_value()? };
                 if std::env::var_os("TRACE_SCRMAIN_DISPATCH").is_some()
                     && instruction.offset == 0x3f0
                     && self.program_name(program_index).contains("scrmain._bp")
@@ -3884,6 +3936,13 @@ impl Vm {
                 let freed = self.free_heap(ptr);
                 self.push_value(Value::Int(i32::from(freed)));
             }
+            BpOpcode::Known { code: 0x73, .. } => {
+                let folder = self.pop_string_lossy()?;
+                let product = self.pop_string_lossy()?;
+                let company = self.pop_string_lossy()?;
+                api.register_installation(&company, &product, &folder)?;
+                self.push_value(Value::Int(1));
+            }
             BpOpcode::Known { code: 0x74, .. } => {
                 self.execute_set_memory_mode()?;
             }
@@ -4306,7 +4365,25 @@ impl Vm {
                     self.note_stub("graph", code, id);
                     return Err(VmError::UnknownDispatch { group: code, id });
                 }
-                let result = if self.native_abi_profile == NativeAbiProfile::Amachoco
+                let result = if (code, id) == (0x92, 0x0e) && matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
+                    let pointer = self.pop_ptr()?;
+                    let count = self.pop_int()?;
+                    let name = self.pop_string_lossy()?;
+                    if !matches!(count, 4 | 5) { return Err(VmError::Runtime(format!("無効なパラメータ数 [ {count} ] が指定されました"))); }
+                    let mut values = [0; 5];
+                    for index in 0..count as usize { values[index] = self.read_int(pointer.wrapping_add(index as u32 * 4), 2)? as i32; }
+                    api.register_named_font_transform(&name, values)?;
+                    Value::None
+                } else if (code, id) == (0x92, 0x0f) && self.native_abi_profile == NativeAbiProfile::Modern {
+                    let tracking = self.pop_int()?;
+                    let name = self.pop_string_lossy()?;
+                    api.set_named_font_tracking(&name, tracking)?;
+                    Value::None
+                } else if (code, id) == (0x92, 0x95) && matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
+                    let window = self.pop_int()?;
+                    let value = api.window_last_text_extent(window).ok_or_else(|| VmError::Runtime("無効なウィンドウハンドルが指定されました".into()))?;
+                    Value::Int(value)
+                } else if self.native_abi_profile != NativeAbiProfile::Tayutama
                     && (code, id) == (0x91, 0x09)
                 {
                     // amachoco.exe sub_48AB80 -> sub_464380.
@@ -4317,7 +4394,7 @@ impl Vm {
                             .graph91_resource_mode = mode;
                     }
                     Value::Int(i32::from(valid))
-                } else if self.native_abi_profile == NativeAbiProfile::Amachoco
+                } else if matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern)
                     && (code, id) == (0x92, 0x99)
                 {
                     self.handle_character_widths_call(api)?
@@ -5987,15 +6064,11 @@ impl Vm {
             }
             BpOpcode::Unknown(code) => {
                 self.note_stub("opcode", code, 0);
-                if fail_on_stub {
-                    return Err(VmError::UnsupportedInstruction(code));
-                }
+                return Err(VmError::UnsupportedInstruction(code));
             }
             BpOpcode::Known { code, .. } => {
                 self.note_stub("opcode", code, 0);
-                if fail_on_stub {
-                    return Err(VmError::UnsupportedInstruction(code));
-                }
+                return Err(VmError::UnsupportedInstruction(code));
             }
         }
         self.trim_operand_stack();
@@ -6727,6 +6800,14 @@ impl Vm {
         }
         Ok(args)
     }
+    /// 2024+ BP uses code/data segment tags 0x10000000/0x20000000.
+    /// Call before start, together with the original runtime ABI profile.
+    pub fn set_modern_pointer_tags(&mut self, enabled: bool) {
+        self.modern_pointer_tags = enabled;
+    }
+    fn bp_frame_tag(&self) -> u32 { if self.modern_pointer_tags { 0x2000_0000 } else { FRAME_SEGMENT } }
+    fn bp_code_tag(&self) -> u32 { if self.modern_pointer_tags { 0x1000_0000 } else { CODE_SEGMENT } }
+
     pub fn set_native_abi_profile(&mut self,profile:NativeAbiProfile) {
         self.native_abi_profile=profile;
         for task in &mut self.async_tasks {task.vm.set_native_abi_profile(profile);}
@@ -6746,6 +6827,11 @@ impl Vm {
             && matches!((opcode.group, opcode.id), (0x81, 0x00) | (0x91, 0x09) | (0x92, 0x99))
         { return true; }
         if self.native_abi_profile==NativeAbiProfile::Amachoco && opcode.group==0x81 && matches!(opcode.id,0x21|0xD8|0xDA) {return true;}
+        if self.native_abi_profile == NativeAbiProfile::Anipani && (opcode.group, opcode.id) == (0x91, 0x09) { return true; }
+        if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern)
+            && matches!((opcode.group, opcode.id), (0x81, 0x00..=0x03) | (0x91, 0x05 | 0x09..=0x0a) | (0x92, 0x0e | 0x95 | 0x99))
+        { return true; }
+        if self.native_abi_profile == NativeAbiProfile::Modern && (opcode.group, opcode.id) == (0x92, 0x0f) { return true; }
         native_call::is_strictly_supported(opcode)
     }
 
@@ -7358,7 +7444,25 @@ impl Vm {
         VmError::Runtime(format!("無効なポインタ [ ${ptr:08X} ] にアクセスしようとしました"))
     }
 
+    /// Validate the complete local span, not only its first byte. A store
+    /// crossing the data/code seam must not touch another native region.
+    fn check_local_span(&self, ptr: u32, size: usize) -> VmResult<()> {
+        let region = if self.modern_pointer_tags && matches!(ptr >> 28, 1 | 2) {
+            Some((ptr >> 28, ptr & 0x0fff_ffff))
+        } else if matches!(ptr >> 26, 1 | 2) {
+            Some((ptr >> 26, ptr & 0x03ff_ffff))
+        } else { None };
+        if let Some((segment, offset)) = region {
+            let limit = if segment == 1 { CODE_WINDOW_SIZE } else { CODE_WINDOW_OFFSET };
+            if (offset as usize).checked_add(size).is_none_or(|end| end > limit as usize) {
+                return Err(Self::invalid_pointer(ptr));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_range(&self, ptr: u32, size: usize) -> VmResult<std::ops::Range<usize>> {
+        self.check_local_span(ptr, size)?;
         let addr = self.memory_addr(ptr);
         if addr == u32::MAX {
             return Err(Self::invalid_pointer(ptr));
@@ -7378,6 +7482,7 @@ impl Vm {
         ptr: u32,
         size: usize,
     ) -> VmResult<std::ops::Range<usize>> {
+        self.check_local_span(ptr, size)?;
         let addr = self.memory_addr(ptr);
         if addr == u32::MAX {
             return Err(Self::invalid_pointer(ptr));
@@ -9230,7 +9335,7 @@ impl Vm {
         id: u16,
     ) -> VmResult<Option<Value>> {
         let result = match (group, id) {
-            (0x81, 0x00) if self.native_abi_profile == NativeAbiProfile::Amachoco => {
+            (0x81, 0x00) if matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) => {
                 // sub_494EF0 -> sub_49EA60: 0 selects CP932, 1 selects UTF-8.
                 let mode = self.pop_int()?;
                 let valid = (0..=1).contains(&mode);
@@ -9239,6 +9344,14 @@ impl Vm {
                         .native_utf8_override = Some(mode == 1);
                 }
                 Value::Int(i32::from(valid))
+            }
+            (0x81, 0x01..=0x03) if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) => {
+                let requested = if id == 0x02 { Some(self.pop_int()?) } else { None };
+                let current = self.system81_shared.lock().expect("system81 state poisoned").ui_language;
+                let language = if requested == Some(0) || current.is_none() { api.user_ui_language() } else { current.unwrap() };
+                let language = requested.filter(|value| *value != 0).unwrap_or(language);
+                self.system81_shared.lock().expect("system81 state poisoned").ui_language = Some(language);
+                Value::Int(if id == 0x01 { i32::from(language & 0x3ff == 17) } else { language })
             }
             (0x80, 0x53) => {
                 // sub_489070 -> sub_48D190 arms the one-shot global gate.
@@ -12367,6 +12480,16 @@ impl Vm {
     /// Segment 0 is the global window, 2 the thread's frames, 0x10..0x3F
     /// heap blocks; an unmapped address returns `u32::MAX` (out of range).
     pub(crate) fn memory_addr(&self, ptr: u32) -> u32 {
+        if self.modern_pointer_tags && matches!(ptr >> 28, 1 | 2) {
+            let offset = ptr & 0x0fff_ffff;
+            return match ptr >> 28 {
+                1 if offset < CODE_WINDOW_SIZE => LOCAL_MEMORY_BASE + CODE_WINDOW_OFFSET + offset,
+                2 if offset < CODE_WINDOW_OFFSET => LOCAL_MEMORY_BASE + offset,
+                _ => u32::MAX,
+            };
+        }
+        // Internal frame/code operations retain their canonical tags. Heap
+        // addresses are bit-identical across the 26- and 28-bit layouts.
         if ptr >> 26 == 2 {
             // The data region shares the local window with the code region.
             let offset = ptr & 0x03FF_FFFF;

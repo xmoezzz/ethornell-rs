@@ -3,6 +3,8 @@
 //! tails are restored as zero, including bytes scripts cleared after a write.
 
 const REGION_BYTES: usize = super::CODE_WINDOW_OFFSET as usize;
+const CODE_BYTES: usize = super::CODE_WINDOW_SIZE as usize;
+const REGION_LIMITS: [usize; 2] = [REGION_BYTES, CODE_BYTES];
 const WINDOW_BYTES: usize = super::HEAP_OFFSET_BASE as usize;
 #[cfg(not(target_os = "vita"))]
 static ZERO_PAGE: [u8; 4096] = [0; 4096];
@@ -19,7 +21,7 @@ pub struct VmMemory {
 
 impl From<Vec<u8>> for VmMemory {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { bytes, local_bounds: [REGION_BYTES; 2] }
+        Self { bytes, local_bounds: REGION_LIMITS }
     }
 }
 impl std::ops::Deref for VmMemory {
@@ -28,7 +30,7 @@ impl std::ops::Deref for VmMemory {
 }
 impl std::ops::DerefMut for VmMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.local_bounds = [REGION_BYTES; 2];
+        self.local_bounds = REGION_LIMITS;
         &mut self.bytes
     }
 }
@@ -43,9 +45,10 @@ impl<I: std::slice::SliceIndex<[u8]>> std::ops::IndexMut<I> for VmMemory {
         let start = std::ptr::from_mut(output).cast::<u8>() as usize - base;
         let end = start + std::mem::size_of_val(output);
         for (region, bound) in self.local_bounds.iter_mut().enumerate() {
-            let base = super::LOCAL_MEMORY_BASE as usize + region * REGION_BYTES;
-            if start < base + REGION_BYTES && end > base {
-                *bound = (*bound).max((end - base).min(REGION_BYTES));
+            let base = super::LOCAL_MEMORY_BASE as usize + if region == 0 { 0 } else { REGION_BYTES };
+            let limit = REGION_LIMITS[region];
+            if start < base + limit && end > base {
+                *bound = (*bound).max((end - base).min(limit));
             }
         }
         output
@@ -57,7 +60,7 @@ impl VmMemory {
         if len != old_len && len.min(old_len) < super::HEAP_MEMORY_BASE
             && len.max(old_len) > super::LOCAL_MEMORY_BASE as usize
         {
-            self.local_bounds = [REGION_BYTES; 2];
+            self.local_bounds = REGION_LIMITS;
         }
         self.bytes.resize(len, value);
     }
@@ -107,7 +110,7 @@ fn nonzero_prefix(bytes: &[u8]) -> usize { nonzero_prefix_words(bytes) }
 
 impl LocalWindow {
     pub(crate) fn from_code(code: &[u8]) -> Self {
-        let code = &code[..code.len().min(REGION_BYTES)];
+        let code = &code[..code.len().min(CODE_BYTES)];
         Self {
             bytes: code[..nonzero_prefix(code)].to_vec(),
             data_len: 0,
@@ -146,9 +149,9 @@ impl LocalWindow {
     /// Exchange compact snapshots directly in the live window. The outgoing
     /// nonzero bounds prove the rest is already zero, so restoring an incoming
     /// snapshot only clears the outgoing tails that actually contained data.
-    /// No full 2 MiB staging image or final full-window copy is needed.
+    /// No full-window staging image or final full-window copy is needed.
     pub(crate) fn exchange(&mut self, live: &mut [u8], scratch: &mut Vec<u8>) {
-        self.exchange_bounded(live, scratch, [REGION_BYTES; 2]);
+        self.exchange_bounded(live, scratch, REGION_LIMITS);
     }
 
     pub(crate) fn prefix_lengths(&self) -> [usize; 2] {
@@ -254,7 +257,7 @@ mod tests {
         // get_mut goes through DerefMut, conservatively covering arbitrary
         // host changes through a Vec or mutable slice.
         *live.get_mut(base + WINDOW_BYTES - 1).unwrap() = 99;
-        assert_eq!(live.local_bounds(), [REGION_BYTES; 2]);
+        assert_eq!(live.local_bounds(), REGION_LIMITS);
         let bounds = live.local_bounds();
         saved.exchange_bounded(&mut live[base..base + WINDOW_BYTES], &mut scratch, bounds);
         assert_eq!(saved.byte(WINDOW_BYTES - 1), 99);
