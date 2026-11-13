@@ -11773,12 +11773,12 @@ impl Vm {
             } else {
                 encoding_rs::SHIFT_JIS
             };
-            // A text slot holds a `char *`, not a descriptor: an integer
-            // addressing an empty string is empty text. Searching around it
-            // picks up unrelated strings (Wonderful Everyday showed the tail
-            // of a sprite name for lines whose text part was empty).
-            if text_slot
-                && let Value::Int(value) = original
+            // Every declared string slot holds a `char *`, including image
+            // names. Preserve an integer-computed address of an empty string
+            // before descriptor fallback can read adjacent bytes. Pure
+            // Connect places "\0AutoSave\0" here: searching at +4 invented
+            // the image name "oSave" from a deliberately empty thumbnail.
+            if let Value::Int(value) = original
                 && value != 0
                 && self
                     .read_c_string_bytes(value as u32)
@@ -16546,6 +16546,20 @@ mod tests {
                 Value::Str("bg50d_a".into())
             ]
         );
+    }
+
+    #[test]
+    fn graph_resource_empty_string_does_not_consume_adjacent_autosave() {
+        let mut vm = Vm::new();
+        let empty = vm.alloc_heap(64);
+        vm.write_c_string_raw(empty, "").unwrap();
+        vm.write_c_string_raw(empty + 1, "AutoSave").unwrap();
+        for pointer in [Value::Int(empty as i32), Value::Ptr(empty)] {
+            vm.stack = vec![Value::Int(3790), Value::Str("data02xxx.arc".into()), pointer];
+            vm.normalize_graph_string_args(0x90, 0x10).unwrap();
+            assert_eq!(vm.stack.last(), Some(&Value::Str(String::new())));
+        }
+        assert_eq!(vm.read_c_string(empty + 1).unwrap(), "AutoSave");
     }
 
     #[test]
