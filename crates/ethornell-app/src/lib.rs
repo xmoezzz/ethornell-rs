@@ -29888,7 +29888,12 @@ fn run_headless(
             // presentation: every logical frame still traverses the shared
             // render tree and produces a complete offscreen framebuffer.
             // sub_462100: a frame that is not due shows the last one again.
-            let frame_composition = if runtime.api.take_present_due() || last_composition.is_none()
+            // A playing DirectShow movie updates independently of the graph
+            // scheduler (the scripts disable it during playback), so the
+            // headless compositor must re-derive the frame while a movie is
+            // active to pick up decoded samples.
+            let movie_playing = runtime.api.directshow_movie_draw_item().is_some();
+            let frame_composition = if runtime.api.take_present_due() || last_composition.is_none() || movie_playing
             {
                 runtime.api.performance_profile.begin();
                 let composition =

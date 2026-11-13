@@ -690,8 +690,13 @@ impl ApplicationHandler for WindowApp {
                     runtime.api.performance_profile.begin();
                 }
                 // sub_462100: without a due presentation the window shows the
-                // last composed frame again (WM_PAINT path).
-                if runtime.as_mut().is_some_and(|runtime| !runtime.api.take_present_due()) {
+                // last composed frame again (WM_PAINT path).  A playing
+                // DirectShow movie updates independently of the graph
+                // scheduler (the scripts disable it during playback), so the
+                // window must still re-derive the frame while a movie is
+                // active to pick up newly decoded samples.
+                let movie_playing = runtime.as_ref().is_some_and(|r| r.api.directshow_movie_draw_item().is_some());
+                if runtime.as_mut().is_some_and(|runtime| !runtime.api.take_present_due()) && !movie_playing {
                     if let Some(runtime) = runtime.as_mut() {
                         runtime.api.performance_profile.end(false);
                     }
