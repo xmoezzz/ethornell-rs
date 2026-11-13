@@ -22160,6 +22160,12 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             && find_runtime_resource(&self.manager, archive, entry).is_some()
     }
 
+    fn archive_entry_names(&mut self, archive: &str) -> Option<Vec<String>> {
+        let names = user_files::archive_directory_names(&self.manager, &self.native_root, archive);
+        tracing::debug!(archive, count = ?names.as_ref().map(Vec::len), "EnumerateArchiveDirectory");
+        names
+    }
+
     fn media_prompt(&mut self, title: &str, text: &str) -> bool {
         let retry = retry_or_quit_prompt(title, text);
         if !retry {
@@ -22456,7 +22462,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     ) -> Vec<String> {
         if let Some(policy) = file_policy::active() {
             return policy
-                .enumerate_user(pattern, recursive, max_count, false)
+                .enumerate_user(&user_files::native_enumeration_pattern(pattern), recursive, max_count, false)
                 .unwrap_or_default();
         }
         let normalized = pattern.replace('\\', "/");

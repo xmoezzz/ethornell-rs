@@ -518,6 +518,13 @@ pub trait SysApi {
         self.file_exists(archive, entry)
     }
 
+    /// Sys81:39: names in the archive's directory order, including an empty
+    /// directory. None means the requested archive is unavailable. This is
+    /// distinct from filesystem globbing and must use authorized archives.
+    fn archive_entry_names(&mut self, _archive: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// sub_465F80 once a media root exists: MessageBox(title, text,
     /// OK|CANCEL); true retries, false means the player confirmed quitting.
     fn media_prompt(&mut self, _title: &str, _text: &str) -> bool {
@@ -9680,25 +9687,34 @@ impl Vm {
                 }
             }
             (0x81, 0x39) => {
-                let destination = self.pop_ptr()?;
+                // BGI 1.610.1 (Pure Connect): 480E60 -> 45EAB0 -> 4063A0;
+                // 1.622: 48C8C0 -> 467FC0. Pop archive, size_out, buffer.
+                // A null buffer queries packed bytes; otherwise size_out
+                // receives the member count, preserving archive order.
+                let archive = self.pop_string_lossy()?;
                 let required_destination = self.pop_ptr()?;
-                let pattern = self.pop_string_lossy()?;
-                let entries = api.enumerate_user_files(&pattern, true, usize::MAX);
-                let mut packed = Vec::new();
-                for entry in &entries {
-                    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(entry);
-                    packed.extend_from_slice(&bytes);
-                    packed.push(0);
+                let destination = self.pop_ptr()?;
+                if let Some(entries) = api.archive_entry_names(&archive) {
+                    let mut packed = Vec::new();
+                    for entry in &entries {
+                        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(entry);
+                        packed.extend_from_slice(&bytes);
+                        packed.push(0);
+                    }
+                    let output = if destination == 0 { packed.len() } else { entries.len() };
+                    let output = u32::try_from(output)
+                        .map_err(|_| VmError::Runtime("archive directory size overflow".into()))?;
+                    if destination != 0 && !packed.is_empty() {
+                        let range = self.resolve_write_range(destination, packed.len())?;
+                        self.memory[range].copy_from_slice(&packed);
+                        self.clear_shadow_values(destination, packed.len());
+                    }
+                    self.write_int(required_destination, 2, output)?;
+                    Value::Int(required_destination as i32)
+                } else {
+                    // Native failure returns before touching either output.
+                    Value::Int(1)
                 }
-                if required_destination != 0 {
-                    self.write_int(required_destination, 2, packed.len() as u32)?;
-                }
-                if destination != 0 && !packed.is_empty() {
-                    let range = self.resolve_range(destination, packed.len())?;
-                    self.memory[range].copy_from_slice(&packed);
-                    self.clear_shadow_values(destination, packed.len());
-                }
-                Value::Int(entries.len().min(i32::MAX as usize) as i32)
             }
             (0x81, 0x3a) => {
                 let root = self.pop_int()?;
@@ -11757,12 +11773,12 @@ impl Vm {
             } else {
                 encoding_rs::SHIFT_JIS
             };
-            // A text slot holds a `char *`, not a descriptor: an integer
-            // addressing an empty string is empty text. Searching around it
-            // picks up unrelated strings (Wonderful Everyday showed the tail
-            // of a sprite name for lines whose text part was empty).
-            if text_slot
-                && let Value::Int(value) = original
+            // Every declared string slot holds a `char *`, including image
+            // names. Preserve an integer-computed address of an empty string
+            // before descriptor fallback can read adjacent bytes. Pure
+            // Connect places "\0AutoSave\0" here: searching at +4 invented
+            // the image name "oSave" from a deliberately empty thumbnail.
+            if let Value::Int(value) = original
                 && value != 0
                 && self
                     .read_c_string_bytes(value as u32)
@@ -14223,6 +14239,66 @@ mod tests {
     }
 
     #[test]
+    fn archive_enumeration_queries_bytes_then_writes_names_and_count() {
+        struct ArchiveApi;
+        impl SysApi for ArchiveApi {
+            fn call_sys(&mut self, _: &mut NativeCallFrame) -> super::VmResult<Value> {
+                Ok(Value::None)
+            }
+            fn archive_entry_names(&mut self, archive: &str) -> Option<Vec<String>> {
+                match archive {
+                    "animation.arc" => Some(vec!["AnimationSet000".into(), "Animation000".into()]),
+                    "empty.arc" => Some(Vec::new()),
+                    _ => None,
+                }
+            }
+            fn enumerate_user_files(&mut self, _: &str, _: bool, _: usize) -> Vec<String> {
+                panic!("archive directories must not use loose-file enumeration")
+            }
+        }
+        impl GraphApi for ArchiveApi {
+            fn call_graph(&mut self, _: &mut NativeCallFrame) -> super::VmResult<Value> {
+                Ok(Value::None)
+            }
+        }
+        impl SoundApi for ArchiveApi {
+            fn call_sound(&mut self, _: &mut NativeCallFrame) -> super::VmResult<Value> {
+                Ok(Value::None)
+            }
+        }
+        let op = test_instruction(0, 0x81, "sys2", vec![0x81, 0x39], Vec::new());
+        let mut vm = Vm::new();
+        let mut api = ArchiveApi;
+        let packed = b"AnimationSet000\0Animation000\0";
+        vm.stack.extend([Value::Ptr(0), Value::Ptr(0x100), Value::Str("animation.arc".into())]);
+        vm.dispatch(&op, &mut api).unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(0x100)));
+        assert_eq!(vm.read_int(0x100, 2).unwrap(), packed.len() as u32);
+
+        vm.memory[0x200..0x240].fill(0xa5);
+        vm.stack.extend([Value::Ptr(0x200), Value::Ptr(0x100), Value::Str("animation.arc".into())]);
+        vm.dispatch(&op, &mut api).unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(0x100)));
+        assert_eq!(vm.read_int(0x100, 2).unwrap(), 2);
+        assert_eq!(&vm.memory[0x200..0x200 + packed.len()], packed);
+        assert_eq!(vm.memory[0x200 + packed.len()], 0xa5);
+
+        for destination in [0, 0x200] {
+            vm.write_int(0x100, 2, 0x1234).unwrap();
+            vm.stack.extend([Value::Ptr(destination), Value::Ptr(0x100), Value::Str("absent.arc".into())]);
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack.pop(), Some(Value::Int(1)));
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), 0x1234);
+            assert_eq!(&vm.memory[0x200..0x200 + packed.len()], packed);
+
+            vm.stack.extend([Value::Ptr(destination), Value::Ptr(0x100), Value::Str("empty.arc".into())]);
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack.pop(), Some(Value::Int(0x100)));
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), 0);
+        }
+    }
+
+    #[test]
     fn file_enumeration_follows_the_find_first_file_walk() {
         let found = ["b.txt", "Sub\\z.txt", "a.txt", "Sub\\Deep\\y.txt", "Sub\\c.txt"]
             .map(String::from);
@@ -16470,6 +16546,20 @@ mod tests {
                 Value::Str("bg50d_a".into())
             ]
         );
+    }
+
+    #[test]
+    fn graph_resource_empty_string_does_not_consume_adjacent_autosave() {
+        let mut vm = Vm::new();
+        let empty = vm.alloc_heap(64);
+        vm.write_c_string_raw(empty, "").unwrap();
+        vm.write_c_string_raw(empty + 1, "AutoSave").unwrap();
+        for pointer in [Value::Int(empty as i32), Value::Ptr(empty)] {
+            vm.stack = vec![Value::Int(3790), Value::Str("data02xxx.arc".into()), pointer];
+            vm.normalize_graph_string_args(0x90, 0x10).unwrap();
+            assert_eq!(vm.stack.last(), Some(&Value::Str(String::new())));
+        }
+        assert_eq!(vm.read_c_string(empty + 1).unwrap(), "AutoSave");
     }
 
     #[test]
