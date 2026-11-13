@@ -146,21 +146,22 @@ struct MoviePacket {
 impl MovieDecoder {
     fn new(source: MovieBytes) -> Option<Self> {
         let bytes = source.as_slice();
-        let mut packets = Vec::new();
         let mut audio = Vec::new();
+
+        // MPEG Program Stream splits one picture's elementary-stream data
+        // across many small PES packets.  The video decoder needs the
+        // reassembled ES so that start-code pairs (which delimit slices)
+        // are not broken by PES boundaries.  Concatenate all video PES
+        // payloads into one contiguous buffer before chunking for decode.
+        let mut video_es = Vec::new();
+        let mut first_video_pts = None;
         for packet in packet_ranges(bytes) {
             match packet.stream_type {
                 StreamType::MpegVideo => {
-                    // Decode at most one bounded chunk when another frame is
-                    // needed, even when the container has one enormous PES.
-                    for start in (packet.range.start..packet.range.end).step_by(64 * 1024) {
-                        packets.push(MoviePacket {
-                            pts_90k: (start == packet.range.start)
-                                .then_some(packet.pts_90k)
-                                .flatten(),
-                            range: start..(start + 64 * 1024).min(packet.range.end),
-                        });
+                    if first_video_pts.is_none() {
+                        first_video_pts = packet.pts_90k;
                     }
+                    video_es.extend_from_slice(&bytes[packet.range]);
                 }
                 StreamType::MpegAudio => {
                     audio.extend_from_slice(&bytes[packet.range]);
@@ -168,9 +169,27 @@ impl MovieDecoder {
                 StreamType::Unknown => {}
             }
         }
+
+        if video_es.is_empty() {
+            return None;
+        }
+
+        let video_es = MovieBytes::from_vec(video_es);
+        let es_bytes = video_es.as_slice();
+
+        // Decode at most one bounded chunk when another frame is needed,
+        // even when the reassembled ES is one enormous buffer.
+        let mut packets = Vec::new();
+        for start in (0..es_bytes.len()).step_by(64 * 1024) {
+            packets.push(MoviePacket {
+                pts_90k: if start == 0 { first_video_pts } else { None },
+                range: start..(start + 64 * 1024).min(es_bytes.len()),
+            });
+        }
         if packets.is_empty() {
             return None;
         }
+
         // A file that isn't a movie (Graph90:F0 names movies by file, so a
         // script can name an image archive) can still pass the demuxer as one
         // video elementary stream through stray start codes in its data. Its
@@ -179,19 +198,19 @@ impl MovieDecoder {
         let mut decoder = Decoder::new();
         let first = &packets[0];
         let pending_frames = decoder
-            .decode_shared(&bytes[first.range.clone()], first.pts_90k)
+            .decode_shared(&es_bytes[first.range.clone()], first.pts_90k)
             .ok()?
             .into_iter()
             .collect();
         let frame_rate = packets
             .iter()
-            .find_map(|packet| sequence_frame_rate(&bytes[packet.range.clone()]))
+            .find_map(|packet| sequence_frame_rate(&es_bytes[packet.range.clone()]))
             .unwrap_or(25.0);
         let size = packets
             .iter()
-            .find_map(|packet| sequence_frame_size(&bytes[packet.range.clone()]));
+            .find_map(|packet| sequence_frame_size(&es_bytes[packet.range.clone()]));
         Some(Self {
-            source,
+            source: video_es,
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
             decoder,
