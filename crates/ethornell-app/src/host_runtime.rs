@@ -226,11 +226,13 @@ impl HostRuntime {
             (None, Some(path)) => {
                 ethornell_render::FontProvider::load_file(path, config.font_face_index)?
             }
-            (None, None) => ethornell_render::FontProvider::load_system_for_text(if config.gbk {
-                "A日本語中文简体繁體"
-            } else {
-                "A日本語中文"
-            })?,
+            (None, None) => {
+                let required = if config.gbk { "A日本語中文简体繁體" } else { "A日本語中文" };
+                match file_policy::scope(&policy, || game_font::load(&policy.resource, required)) {
+                    Some(font) => font,
+                    None => ethornell_render::FontProvider::load_system_for_text(required)?,
+                }
+            }
         };
         let manager = policy.open_manager()?;
         let bytes = manager.read_decoded_from_archive("system.arc", "ipl._bp")?;

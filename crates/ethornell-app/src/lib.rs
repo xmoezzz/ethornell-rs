@@ -18,6 +18,7 @@ mod debug_trace;
 mod display_tree;
 mod effects;
 mod file_policy;
+mod game_font;
 mod frame_presenter;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
@@ -374,8 +375,6 @@ pub fn show_error(title: &str, text: &str) {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
-    let font = snapshot::load_default_font()?;
-    let _font_session = snapshot::enter_font_session(&font);
     let headless = config.headless || std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some();
     // A full recursive magic probe opens every loose file in the game tree and
     // is diagnostic work, not runtime initialization. Keep it behind --trace;
@@ -408,6 +407,8 @@ pub fn run(config: AppConfig) -> Result<()> {
     };
     #[cfg(not(desktop_host))]
     let encoding = encoding_rs::SHIFT_JIS;
+    let font = snapshot::load_game_font(config.game_root.path(), encoding == encoding_rs::GBK)?;
+    let _font_session = snapshot::enter_font_session(&font);
     let bgm = load_runtime_bgm(&manager);
     let native_root = game_root_path(&manager);
     tracing::info!(
