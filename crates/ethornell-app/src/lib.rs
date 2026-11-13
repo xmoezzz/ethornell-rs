@@ -1,7 +1,9 @@
 use ethornell_archive::{MagicKind, ResourceManager, detect_magic, scan_game_root};
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
-use ethornell_image::{DecodedImage, decode_image, parse_cbg_metadata};
+use ethornell_image::{
+    DecodedImage, decode_image, parse_cbg_metadata, raw_bgi_native_bitmap_format,
+};
 use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
 use ethornell_script::calls::known_call_arg_count;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1000,6 +1002,9 @@ struct RuntimeTraceApi {
     /// registrations are permitted and 90:DF removes the first matching node.
     graph_knob_watches: VecDeque<i32>,
     graph_knob_input_mode: i32,
+    /// Set once a script calls 90:DD. A game that never calls it keeps the
+    /// historical behavior where knob hit-testing ignores the input mode.
+    graph_knob_input_mode_set: bool,
     /// Target CDspObjGroup registry: 8 slots, handles 0xF1000000 | slot.
     graph_groups: BTreeMap<i32, GraphGroupState>,
     graph_native_owners: BTreeMap<i32, i32>,
@@ -1471,6 +1476,7 @@ impl RuntimeTraceApi {
             graph_knob_states: BTreeMap::new(),
             graph_knob_watches: VecDeque::new(),
             graph_knob_input_mode: 0,
+            graph_knob_input_mode_set: false,
             graph_groups: BTreeMap::new(),
             graph_native_owners: BTreeMap::new(),
             surface_controls: SurfaceControlRegistry::default(),
@@ -2694,10 +2700,11 @@ impl RuntimeTraceApi {
                     return false;
                 };
                 (native_format, None, None)
+            } else if let Some(native_format) = raw_bgi_native_bitmap_format(&bytes) {
+                (native_format, None, None)
             } else {
-                // Portable PNG/JPEG/raw-image compatibility resources have no
-                // target CBG subtype to recover. Keep the historical RGBA
-                // format-2 interpretation for those non-CBG paths.
+                // Portable PNG/JPEG compatibility resources have no target
+                // bitmap format metadata, so keep the historical RGBA path.
                 (2, None, None)
             };
 
@@ -4531,6 +4538,11 @@ impl RuntimeTraceApi {
     /// rectangle. The portable manager keeps the same sort key through the
     /// target Sprite, so choose the largest active key among accepted rects.
     fn graph_knob_at_point(&self, point: (f32, f32)) -> Option<i32> {
+        // 90:DD with 0 turns knob input off; until a script calls it, the
+        // native path has no mode to consult and keeps the older behavior.
+        if self.graph_knob_input_mode_set && self.graph_knob_input_mode == 0 {
+            return None;
+        }
         self.graph_knob_states
             .iter()
             .filter_map(|(&handle, state)| {
@@ -15175,6 +15187,63 @@ mod input_tests {
         let mut unwatch = vec![Value::Int(first)];
         call_graph(&mut api, 0x90, 0xdf, &mut unwatch).unwrap();
         assert!(!api.graph_knob_watches.contains(&first));
+    }
+
+    #[test]
+    fn explicit_knob_input_mode_zero_releases_pointer_capture() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 604;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-mode-target".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 2176,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut enable = vec![Value::Int(handle), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0xd4, &mut enable).unwrap();
+
+        // Games that never call 90:DD keep their existing knob behavior.
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
+
+        let mut disable_mode = vec![Value::Int(0)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut disable_mode).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), None);
+
+        let mut enable_mode = vec![Value::Int(1)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut enable_mode).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
     }
 
     #[test]
@@ -27512,6 +27581,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0xdd) => {
                 let value = pop_int_value(stack).unwrap_or_default();
+                self.graph_knob_input_mode_set = true;
                 let previous = std::mem::replace(&mut self.graph_knob_input_mode, value);
                 tracing::info!(value, previous, "GraphSwapKnobInputMode");
                 return Ok(ethornell_vm::Value::Int(previous));
