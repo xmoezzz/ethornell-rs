@@ -18,7 +18,6 @@ mod debug_trace;
 mod display_tree;
 mod effects;
 mod file_policy;
-mod game_font;
 mod frame_presenter;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
@@ -30,6 +29,7 @@ mod graph_bitmap_nodes;
 mod graph_color;
 mod graph_config;
 mod font_transform;
+mod game_font;
 mod graph_defaults;
 mod graph_effect;
 #[cfg(not(any(target_os = "vita", target_os = "horizon")))]
