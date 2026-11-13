@@ -115,7 +115,7 @@ impl RuntimeTraceApi {
         item.linear_sampling = false;
     }
 }
-fn rasterize_source(
+pub(super) fn rasterize_source(
     source: &DecodedImage,
     item: &RuntimeGraphDrawItem,
 ) -> Option<(DecodedImage, f32, f32)> {

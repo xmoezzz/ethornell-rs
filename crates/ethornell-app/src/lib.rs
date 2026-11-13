@@ -67,6 +67,7 @@ mod native_selection;
 mod native_sound;
 mod native_sprite_filters;
 mod native_sprite_mask;
+mod native_sprite_link;
 mod native_sprite_perspective;
 mod native_system;
 mod native_user;
@@ -1013,6 +1014,7 @@ struct RuntimeTraceApi {
     /// Sprite+0x154 raised by a 91:55 link (sub_4290F0) rather than by a
     /// 90:55 grayscale bitmap.
     graph91_sprite_link_masks: BTreeSet<i32>,
+    linked_sprite_draws: BTreeMap<i32, native_sprite_link::LinkedSpriteDraw>,
     /// Target System91:60-69 CDspObjEffector registry: 8 tagged slots.
     graph91_effectors: BTreeMap<i32, native_graph_sys91::Graph91EffectorState>,
     /// Target System91:70-7F CDspObjLandscape registry: 4 tagged slots.
@@ -1449,6 +1451,7 @@ impl RuntimeTraceApi {
                 native_graph_sys91::Graph91MultiLayerBackgroundState::default(),
             graph91_sprite_relations: BTreeMap::new(),
             graph91_sprite_link_masks: BTreeSet::new(),
+            linked_sprite_draws: BTreeMap::new(),
             graph91_effectors: BTreeMap::new(),
             graph91_landscapes: BTreeMap::new(),
             queued_system_events: VecDeque::new(),
@@ -1909,6 +1912,7 @@ impl RuntimeTraceApi {
         // sub_442EE0 (CreateWorkBitmap) copies the whole current back buffer
         // into the new bitmap; sub_442F80 (CreatePrioritizedWorkBitmap)
         // renders the display tree up to the given priority into it.
+        self.refresh_linked_sprite_masks();
         self.refresh_native_sprite_filters();
         self.refresh_native_filters();
         let captured = snapshot::compose_runtime_frame_through_priority(self, true, priority);
@@ -3913,9 +3917,7 @@ impl RuntimeTraceApi {
         removed |= self.graph91_object_transforms.remove(&object).is_some();
         removed |= self.graph91_effectors.remove(&object).is_some();
         removed |= self.graph91_landscapes.remove(&object).is_some();
-        self.graph91_sprite_relations
-            .retain(|sprite, linked| *sprite != object && *linked != object);
-        self.graph91_sprite_link_masks.remove(&object);
+        self.release_sprite_relations(object);
         removed |= self.graph_input_objects.remove(&object).is_some();
         removed |= self.graph_object_properties.remove(&object).is_some();
         removed |= self.graph_mode5_render_states.remove(&object).is_some();
@@ -6153,6 +6155,8 @@ impl RuntimeTraceApi {
             return false;
         }
         self.graph_layers.remove(&target);
+        self.refresh_linked_sprite_masks();
+        self.refresh_native_sprite_filters();
         self.refresh_native_filters();
         let source = snapshot::compose_runtime_frame(self, false);
         let image = match displacement {
@@ -7166,6 +7170,8 @@ impl RuntimeTraceApi {
 
     fn render_graph_object_to_bitmap(&mut self, object_id: i32, bitmap_id: i32) -> bool {
         let target_size = self.bitmap_dimensions.get(&bitmap_id).copied();
+        self.refresh_linked_sprite_masks();
+        self.refresh_native_sprite_filters();
         let Some(image) = snapshot::compose_graph_object(self, object_id, target_size) else {
             return false;
         };
@@ -8153,6 +8159,13 @@ impl RuntimeTraceApi {
     }
 
     fn graph_draw_items(&self) -> Vec<RuntimeGraphDrawItem> {
+        self.graph_draw_items_with_link_masks(false)
+    }
+
+    fn graph_draw_items_with_link_masks(&self, include_masks: bool) -> Vec<RuntimeGraphDrawItem> {
+        let mask_owners = if include_masks {
+            self.graph91_sprite_relations.values().copied().collect::<BTreeSet<_>>()
+        } else { BTreeSet::new() };
         let mut items = Vec::new();
         // Compatibility-only title items are added only when the target graph
         // scripts have loaded resources but have not yet materialized matching
@@ -8163,7 +8176,8 @@ impl RuntimeTraceApi {
         let mut inactive_backgrounds = BTreeSet::new();
         let mut backf_secondaries = Vec::new();
         for (layer_id, layer) in &self.graph_layers {
-            if !self.should_draw_graph_layer(*layer_id, layer) {
+            let is_link_mask = mask_owners.contains(&layer.owner_object.unwrap_or(*layer_id));
+            if !is_link_mask && !self.should_draw_graph_layer(*layer_id, layer) {
                 continue;
             }
             let owner_background = layer
@@ -8338,21 +8352,31 @@ impl RuntimeTraceApi {
                 .map(|surface| self.surface_display_opacity(surface))
                 .unwrap_or(1.0)
                 * opacity;
-            if opacity <= 0.001 {
+            if opacity <= 0.001 && !is_link_mask {
                 continue;
             }
-            if layer.target_surface.is_some_and(|surface| {
+            if !is_link_mask && layer.target_surface.is_some_and(|surface| {
                 self.graph_surfaces
                     .get(&surface)
                     .is_some_and(|record| !self.surface_display_chain_visible(surface, record))
             }) {
                 continue;
             }
+            // A bitmap mutation may move an archive-backed slot to a runtime
+            // image without reconfiguring its sprites (e.g. Graph90:13).
+            // Resolve raw primary bindings live; retain generated mode rasters.
+            let raw_sprite = self.display_tree.kind(layer.owner_object.unwrap_or(*layer_id))
+                == Some(NativeDisplayKind::Sprite)
+                && (!layer.key.starts_with("runtime:") || layer.key.starts_with("runtime:bitmap:"));
+            let primary = node_properties.or(owner_properties).and_then(|p| p.format_resource);
+            let primary_key = primary.and_then(|bitmap| self.resolve_resource_key(bitmap));
+            if raw_sprite && primary.is_some() && primary_key.is_none() { continue; }
             let draw_key = self
                 .aux_masked_sprites
                 .get(layer_id)
                 .map(|(key, _)| key.as_str())
                 .or_else(|| self.message_control_layer_draw_key(*layer_id, layer))
+                .or_else(|| raw_sprite.then_some(primary_key).flatten())
                 .unwrap_or(layer.key.as_str());
             let Some(image) = self.graph_images.get(draw_key) else {
                 continue;
@@ -8527,8 +8551,11 @@ impl RuntimeTraceApi {
         // Native CObjectManager inserts equal-depth objects after existing
         // entries. Preserve that chain order; the old reversed order is only
         // available through ETHORNELL_LEGACY_REVERSE_EQUAL_DEPTH.
+        items.retain_mut(|item| include_masks || self.apply_linked_sprite_draw(item));
         for item in &mut items {
-            self.apply_filtered_sprite_draw(item);
+            if !include_masks {
+                self.apply_filtered_sprite_draw(item);
+            }
             if let Some(object) = item.owner_object {
                 let key = if item.key.starts_with("runtime:landscape:") {
                     item.key
@@ -9789,6 +9816,7 @@ impl RuntimeEngine {
         }
         self.api.sync_display_tree_from_runtime();
         self.api.refresh_aux_masked_sprites();
+        self.api.refresh_linked_sprite_masks();
         self.api.refresh_native_sprite_filters();
         self.api.refresh_native_filters();
         self.api.sweep_unreferenced_archive_images();
@@ -26530,8 +26558,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             rgba,
                         },
                     );
-                    self.graph_resources
-                        .insert(bitmap_id, RuntimeGraphResource::whole(key));
+                    // Clear/fill mutates the existing bitmap, unlike 90:11.
+                    // Keep its generation so live sprite bindings remain valid.
+                    if let Some(binding) = self.graph_resources.get_mut(&bitmap_id) {
+                        binding.key = key;
+                        binding.source_rect = None;
+                    } else {
+                        self.graph_resources.insert(bitmap_id, RuntimeGraphResource::whole(key));
+                    }
                     if let Some(surface) = self.graph_surfaces.get_mut(&bitmap_id) {
                         surface.resource_id = Some(bitmap_id);
                     }
