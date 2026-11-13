@@ -25,9 +25,30 @@ pub enum NativeAbiProfile {
     #[default]
     Tayutama,
     Amachoco,
+    Anipani,
+    HoukagoFd,
+    Modern,
 }
 
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
+    if profile == NativeAbiProfile::Anipani && (group, id) == (0x91, 0x09) {
+        return Some(NativeCallAbi { argc: 1, stack_outputs: 1, installs_procedure: false, raw_descriptor_bit8: true });
+    }
+    if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
+        let (argc, stack_outputs) = match (group, id) {
+            // FD native 49F1E0 / 4956F0 and the matching later tables.
+            (0x81, 0x00) | (0x81, 0x02) | (0x91, 0x09) => (1, 1),
+            (0x81, 0x01) | (0x81, 0x03) => (0, 1),
+            (0x91, 0x05) => (4, 1),
+            (0x91, 0x0a) => (2, 1),
+            (0x92, 0x0e) => (3, 0),
+            (0x92, 0x0f) if profile == NativeAbiProfile::Modern => (2, 0),
+            (0x92, 0x95) => (1, 1),
+            (0x92, 0x99) => (7, 1),
+            _ => return lookup(group, id),
+        };
+        return Some(NativeCallAbi { argc, stack_outputs, installs_procedure: false, raw_descriptor_bit8: stack_outputs != 0 });
+    }
     if profile==NativeAbiProfile::Amachoco {
         let (argc,stack_outputs)=match (group,id) {
             (0x81,0x00)=>(1,1),

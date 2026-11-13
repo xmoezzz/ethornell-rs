@@ -28,6 +28,7 @@ mod graph;
 mod graph_bitmap_nodes;
 mod graph_color;
 mod graph_config;
+mod font_transform;
 mod graph_defaults;
 mod graph_effect;
 #[cfg(not(any(target_os = "vita", target_os = "horizon")))]
@@ -229,6 +230,8 @@ fn configured_game_id(manager: &ResourceManager) -> (String, &'static str) {
 struct NativeRuntimeProfile {
     abi: ethornell_vm::NativeAbiProfile,
     se_channels: usize,
+    modern_gradient_blur: bool,
+    modern_pointer_tags: bool,
     main_code_bytes: u32,
     main_data_bytes: u32,
 }
@@ -238,6 +241,8 @@ impl Default for NativeRuntimeProfile {
         Self {
             abi: ethornell_vm::NativeAbiProfile::Tayutama,
             se_channels: 64,
+            modern_gradient_blur: false,
+            modern_pointer_tags: false,
             main_code_bytes: 0x80000,
             main_data_bytes: 0x40000,
         }
@@ -245,7 +250,7 @@ impl Default for NativeRuntimeProfile {
 }
 
 fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
-    // Session version detection uses two exact code-resource fingerprints,
+    // Session version detection uses confirmed code-resource pairs,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
     // restricted regardless of this profile.
@@ -262,6 +267,10 @@ fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Nati
         (10176, CONFIRMED_BOOTSTRAP_FNV) => {
             Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV, amachoco))
         }
+        // Animal Panic 48A5E0 -> 498990 -> 464000: the resource-mode
+        // selector matches, without importing unrelated later text signatures.
+        (7664, 0x8ba4d6240ac73523) => Some((26064, 0xec4630efb73656f1,
+            NativeRuntimeProfile { abi: ethornell_vm::NativeAbiProfile::Anipani, ..NativeRuntimeProfile::default() })),
         // Japanese retail release, system.arc dated 2019-12-10.
         (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a, amachoco)),
         // Houkago Cinderella FD's validator sub_4A6C30 accepts SE 0..128.
@@ -271,6 +280,48 @@ fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Nati
             0x603c84fe0ba8bc49,
             NativeRuntimeProfile {
                 se_channels: 128,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // Houkago Cinderella 2 FD: sub_4ADB30 validates SE indices <128;
+        // startup sub_4A0DD0 allocates 8 MiB code / 4 MiB data.
+        (10144, 0x93e09e85cc7cc4b2) => Some((
+            14864,
+            0x2ae5953033ee96e5,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::HoukagoFd,
+                modern_gradient_blur: true,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // lovepical: original pointer resolver uses code/data tags 1/2 <<28;
+        // native startup still allocates 8 MiB code / 4 MiB data, 128 SE slots.
+        (14320, 0xce17f41f47bd9ebd) => Some((
+            13200, 0xe03d3384de352602,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::Modern,
+                modern_gradient_blur: true,
+                modern_pointer_tags: true,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // dokai: original pointer resolver uses code/data tags 1/2 <<28;
+        // native startup still allocates 8 MiB code / 4 MiB data, 128 SE slots.
+        (14320, 0xc2ea2dbd2a040102) => Some((
+            13200, 0x23b31f6761fd962c,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::Modern,
+                modern_gradient_blur: true,
+                modern_pointer_tags: true,
                 main_code_bytes: 0x800000,
                 main_data_bytes: 0x400000,
                 ..NativeRuntimeProfile::default()
@@ -1225,6 +1276,8 @@ struct RuntimeTraceApi {
     auto_user_click_hovered_frames: u32,
     frame_yield_requested: bool,
     native_dialog_presentation: bool,
+    modern_gradient_blur: bool,
+    native_additive_coverage: bool,
     pending_transition_destination: Option<i32>,
     pending_window_title: Option<String>,
     pending_window_position: Option<(i32, i32)>,
@@ -1625,6 +1678,8 @@ impl RuntimeTraceApi {
             auto_user_click_hovered_frames: 0,
             frame_yield_requested: false,
             native_dialog_presentation: false,
+            modern_gradient_blur: false,
+            native_additive_coverage: false,
             pending_transition_destination: None,
             pending_window_title: None,
             pending_window_position: None,
@@ -2526,7 +2581,7 @@ impl RuntimeTraceApi {
                                 .map(|pair| (pair[0], pair[1]))
                         })
                         .unwrap_or((0, 0));
-                    bitmap_blend::blit_mode(
+                    bitmap_blend::blit_mode_with_options(
                         base,
                         *base_format,
                         &image,
@@ -2535,6 +2590,7 @@ impl RuntimeTraceApi {
                         y,
                         element.mode,
                         element.parameter,
+                        self.native_additive_coverage,
                     );
                 }
             }
@@ -7531,7 +7587,7 @@ impl RuntimeTraceApi {
         // kernel does not implement leaves the destination unchanged.
         // Bitmaps whose format is unknown keep the portable compositor.
         let native = match (source_format, destination_format) {
-            (Some(sf), Some(df)) => Some(bitmap_blend::blit_mode(
+            (Some(sf), Some(df)) => Some(bitmap_blend::blit_mode_with_options(
                 &mut destination_image,
                 df,
                 &source_image,
@@ -7540,6 +7596,7 @@ impl RuntimeTraceApi {
                 y,
                 mode,
                 alpha_parameter,
+                self.native_additive_coverage,
             )),
             _ => None,
         };
@@ -9598,6 +9655,7 @@ impl RuntimeEngine {
             4096,
         );
         vm.set_native_abi_profile(profile.abi);
+        vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
@@ -9605,6 +9663,7 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.modern_gradient_blur = profile.modern_gradient_blur;
                 api.native_dialog_presentation = native_dialog_presentation;
                 api
             },
@@ -10339,6 +10398,19 @@ mod input_tests {
             raw: Vec::new().into(),
             warning: None,
         }
+    }
+
+    #[test]
+    fn unknown_native_host_calls_fail_without_acknowledgement() {
+        use ethornell_vm::{NativeCallFrame, NativeOpcode, VmError};
+        let manager = ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0x80,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::SysApi::call_sys(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0x80,id:u16::MAX })));
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0x91,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::GraphApi::call_graph(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0x91,id:u16::MAX })));
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0xa0,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::SoundApi::call_sound(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0xa0,id:u16::MAX })));
     }
 
     #[test]
@@ -12694,6 +12766,23 @@ mod input_tests {
 
         let captured = &api.graph_images["runtime:priority-bitmap:128"];
         assert_eq!(&captured.rgba[..4], &[200, 100, 50, 255]);
+
+        // Newer Graph91:05 draws into an existing destination, keeping its
+        // dimensions and resource identity, rather than creating screen size.
+        api.recreate_native_bitmap(129, 2, 1, 1);
+        let mut capture = [129, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut capture).unwrap(), Value::Int(0));
+        let captured = api.graph_bitmap_image(129).unwrap();
+        assert_eq!((captured.width, captured.height), (2, 1));
+        assert_eq!(&captured.rgba[..4], &[200, 100, 50, 255]);
+        let mut outside = [129, -1, 0, 71].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x91, 0x05, &mut outside).unwrap();
+        assert_eq!(&api.graph_bitmap_image(129).unwrap().rgba[..4], &[0, 0, 0, 255]);
+        let mut missing = [130, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut missing).unwrap(), Value::Int(2));
+        api.recreate_native_bitmap(130, 1, 1, 2);
+        let mut incompatible = [130, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut incompatible).unwrap(), Value::Int(1));
     }
 
     #[test]
@@ -22353,6 +22442,33 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         self.disk_file_exists(path) || self.directory_exists(path)
     }
 
+    fn user_ui_language(&mut self) -> i32 {
+        let locale = std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES"))
+            .or_else(|_| std::env::var("LANG")).unwrap_or_default().to_ascii_lowercase();
+        if locale.starts_with("ja") { 0x0411 }
+        else if locale.starts_with("zh_tw") || locale.starts_with("zh_hk") { 0x0404 }
+        else if locale.starts_with("zh") { 0x0804 }
+        else if locale.starts_with("ko") { 0x0412 }
+        else { 0x0409 }
+    }
+
+    fn register_installation(&mut self, company: &str, product: &str, folder: &str) -> ethornell_vm::VmResult<()> {
+        // BP 0x73 / FD sub_486710: a persistent company/product folder record.
+        // Keep this in the host-owned user capability instead of HKLM.
+        const PATH: &str = "bgi-user/installations.json";
+        let mut records: BTreeMap<String, String> = match self.read_user_file_bytes(PATH) {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| ethornell_vm::VmError::Runtime(format!("installation metadata: {error}")))?,
+            None => BTreeMap::new(),
+        };
+        let key = serde_json::to_string(&(company, product)).expect("strings serialize");
+        records.insert(key, format!("\"{folder}\""));
+        let bytes = serde_json::to_vec(&records).expect("string records serialize");
+        if !self.write_file_bytes(PATH, &bytes) {
+            return Err(ethornell_vm::VmError::Runtime("cannot persist installation metadata".into()));
+        }
+        Ok(())
+    }
+
     fn message_box(&mut self, caption: &str, text: &str) {
         // An empty caption is sub_46BC80's default (sub_46C1E0 with no
         // caption), as for script errors.
@@ -22361,6 +22477,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         } else {
             caption.to_string()
         };
+        if !self.native_dialog_presentation {
+            tracing::warn!(caption, message = text, "native message (offscreen; dialog suppressed)");
+            return;
+        }
         host_dialog::show_message(
             host_dialog::MessageDialogKind::Information,
             &caption,
@@ -24529,7 +24649,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             stack_top = ?stack_top_summary(stack, 8),
             "runtime syscall stub"
         );
-        Ok(ethornell_vm::Value::None)
+        Err(ethornell_vm::VmError::UnknownDispatch { group, id })
     }
 }
 
@@ -24895,6 +25015,25 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         }
         let (x, y) = self.graph_native_composite_position(object)?;
         Some([x, y])
+    }
+
+    fn register_named_font_transform(&mut self, name: &str, values: [i32; 5]) -> ethornell_vm::VmResult<()> {
+        self.register_native_named_font_transform(name, values)
+    }
+    fn set_named_font_tracking(&mut self, name: &str, tracking: i32) -> ethornell_vm::VmResult<()> {
+        if !(-65536..=65536).contains(&tracking) {
+            return Err(ethornell_vm::VmError::Runtime(format!("無効な値 [ {} ] が指定されました", tracking as f32 / 65536.0)));
+        }
+        let transform = self.graph91_font_transforms.get_mut(&name.to_ascii_lowercase())
+            .ok_or_else(|| ethornell_vm::VmError::Runtime(format!("未登録のフォント名 [ {name} ] が指定されました")))?;
+        transform.tracking = tracking;
+        Ok(())
+    }
+
+    fn window_last_text_extent(&self, window: i32) -> Option<i32> {
+        if self.display_tree.kind(window) != Some(crate::display_tree::NativeDisplayKind::Window) { return None; }
+        self.graph_surfaces.get(&window)?;
+        Some(self.surface_text_states.get(&window).map_or(0, |state| state.last_text_extent))
     }
 
     fn native_font_registered(&self, font: i32) -> bool {
@@ -28182,6 +28321,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             kinsoku,
                             color,
                             shadow,
+                            font,
                         )
                         .unwrap_or((1, (x, y))),
                     None => (1, (x, y)),
@@ -28654,6 +28794,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     stack_top = ?stack_top_summary(stack, 8),
                     "runtime graphcall stub"
                 );
+                return Err(ethornell_vm::VmError::UnknownDispatch { group, id });
             }
         }
         Ok(ethornell_vm::Value::None)
@@ -29266,7 +29407,7 @@ impl ethornell_vm::SoundApi for RuntimeTraceApi {
             stack_top = ?stack_top_summary(stack, 8),
             "runtime sndcall stub"
         );
-        Ok(ethornell_vm::Value::None)
+        Err(ethornell_vm::VmError::UnknownDispatch { group, id })
     }
 }
 

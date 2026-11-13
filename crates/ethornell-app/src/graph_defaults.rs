@@ -5,6 +5,7 @@ pub(crate) struct SurfaceTextState {
     pub(crate) text_layout_mode: i32,
     pub(crate) cursor_x: i32,
     pub(crate) cursor_y: i32,
+    pub(crate) last_text_extent: i32,
     pub(crate) font: i32,
     pub(crate) font_size: i32,
     pub(crate) scale_percent: i32,

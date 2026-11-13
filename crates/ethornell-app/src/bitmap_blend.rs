@@ -449,6 +449,32 @@ pub(crate) fn blit_add(
     }
 }
 
+/// FD 408D10 option 0x01220000 affects only ARGB -> ARGB addition
+/// (40DE80 -> 40E420). Pairs are skipped only when both alphas are zero;
+/// otherwise every lane in both pixels is accumulated without alpha weighting.
+pub(crate) fn blit_mode_with_options(
+    destination: &mut DecodedImage, df: i32, source: &DecodedImage, sf: i32,
+    x: i32, y: i32, mode: i32, parameter: i32, additive_coverage: bool,
+) -> bool {
+    if additive_coverage && df == 2 && sf == 2 && matches!(mode, 2 | 0x21) {
+        let p = if mode == 2 { parameter } else { 256 - parameter }.clamp(0,256);
+        if p != 0 {
+            for_each_pair(destination, source, x, y,
+                |s,d| {
+                    if s[3] != 0 || s[7] != 0 {
+                        for i in 0..8 { d[i] = clamp_u8(i32::from(d[i]) + (i32::from(s[i])*p >> 8)); }
+                    }
+                },
+                |s,d| {
+                    if s[3] != 0 {
+                        for i in 0..4 { d[i] = clamp_u8(i32::from(d[i]) + (i32::from(s[i])*p >> 8)); }
+                    }
+                });
+        }
+        true
+    } else { blit_mode(destination, df, source, sf, x, y, mode, parameter) }
+}
+
 /// Mode 3 (subtractive): only an ARGB source into an RGB destination is
 /// implemented by the target; every other pair leaves the destination alone.
 pub(crate) fn blit_subtract(
@@ -1042,6 +1068,21 @@ mod tests {
             height: 1,
             rgba: pixels.concat(),
         }
+    }
+
+    #[test]
+    fn modern_raster_option_addition_preserves_pair_and_tail_rules() {
+        let source = image(&[[100,60,20,0],[80,40,20,64],[200,100,50,0]]);
+        let mut dst = image(&[[10,10,10,10];3]);
+        assert!(blit_mode_with_options(&mut dst,2,&source,2,0,0,2,128,true));
+        assert_eq!(dst.rgba, [60,40,20,10,50,30,20,42,10,10,10,10]);
+        // The option is not a general alpha bypass: RGB destinations retain
+        // their distinct native kernel, including its source-alpha weighting.
+        let mut ordinary = image(&[[10,10,10,10];3]);
+        let mut option = ordinary.clone();
+        blit_mode(&mut ordinary,1,&source,2,0,0,2,128);
+        blit_mode_with_options(&mut option,1,&source,2,0,0,2,128,true);
+        assert_eq!(ordinary,option);
     }
 
     #[test]
