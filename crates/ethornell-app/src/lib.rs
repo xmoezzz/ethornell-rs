@@ -46,6 +46,7 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
+mod movie_container;
 mod native_background;
 mod native_background_effect;
 mod native_backml;
