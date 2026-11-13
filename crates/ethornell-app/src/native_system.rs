@@ -184,7 +184,10 @@ impl RuntimeTraceApi {
         max_count: usize,
         directories: bool,
     ) -> Vec<String> {
-        if let Some(policy) = file_policy::active() { return policy.enumerate_user(pattern, recursive, max_count, directories).unwrap_or_default(); }
+        if let Some(policy) = file_policy::active() {
+            let pattern = if directories { pattern.to_string() } else { user_files::native_enumeration_pattern(pattern) };
+            return policy.enumerate_user(&pattern, recursive, max_count, directories).unwrap_or_default();
+        }
         let normalized = pattern.replace('\\', std::path::MAIN_SEPARATOR_STR);
         let pattern_path = Path::new(&normalized);
         let wildcard = pattern_path

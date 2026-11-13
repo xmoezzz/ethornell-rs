@@ -1157,6 +1157,43 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
+    fn archive_discovery_and_directory_use_resource_root_and_index_order() {
+        use ethornell_vm::SysApi;
+        let (base, p) = roots("archive-enumeration");
+        std::fs::create_dir(p.resource.join("Archive")).unwrap();
+        std::fs::create_dir(p.user.join("Archive")).unwrap();
+        let names = ["AnimationSet000", "Animation000"];
+        let mut arc = b"BURIKO ARC20".to_vec();
+        arc.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for name in names {
+            let mut record = [0; 128];
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            arc.extend_from_slice(&record);
+        }
+        std::fs::write(p.resource.join("Archive/data06000.arc"), arc).unwrap();
+        std::fs::write(p.user.join("Archive/data06999.arc"), b"user decoy").unwrap();
+        std::fs::write(p.user.join("slot.sav"), b"save").unwrap();
+        let manager = p.open_manager().unwrap();
+        let mut api = super::super::RuntimeTraceApi::new_with_native_root(manager, p.resource.clone());
+        scope(&p, || {
+            assert_eq!(api.enumerate_user_files("Archive\\data06???.arc", false, 0), ["data06000.arc"]);
+            assert_eq!(api.enumerate_native_paths("Archive\\data06???.arc", false, 0, false), ["data06000.arc"]);
+            assert_eq!(api.enumerate_user_files("bgi-user/Archive/*.arc", false, 0), ["data06999.arc"]);
+            assert_eq!(api.enumerate_user_files("*.sav", false, 0), ["slot.sav"]);
+            for archive in ["data06000.arc", "Archive\\DATA06000.arc", "bgi-resource/Archive/data06000.arc"] {
+                assert_eq!(api.archive_entry_names(archive).unwrap(), names);
+            }
+            for denied in ["absent.arc", "../data06000.arc", "/outside/data06000.arc", "bgi-user/Archive/data06000.arc"] {
+                assert!(api.archive_entry_names(denied).is_none(), "{denied}");
+            }
+            for denied in ["../*.arc", "/outside/*.arc", "C:\\outside\\*.arc"] {
+                assert!(api.enumerate_user_files(denied, false, 0).is_empty(), "{denied}");
+            }
+        });
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn overlay_case_virtual_roots_and_native_file_calls_are_consistent() {
         use ethornell_vm::{NativeCallFrame, NativeOpcode, SysApi, Value};
         let (base, p) = roots("full-chain");
