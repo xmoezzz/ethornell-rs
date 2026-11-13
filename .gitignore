@@ -34,3 +34,8 @@ docs/
 
 # Packaged platform builds (platform/wasm/build.sh)
 /build/
+
+# Android release signing keys are kept outside the repository.
+*.jks
+*.keystore
+*.p12

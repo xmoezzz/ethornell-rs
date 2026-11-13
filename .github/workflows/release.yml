@@ -188,6 +188,8 @@ jobs:
   android:
     name: Android (APK)
     runs-on: ubuntu-latest
+    env:
+      SIGNED_RELEASE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -198,16 +200,41 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Prepare Android build tools
+        run: sdkmanager 'build-tools;36.0.0'
       - name: Build APK
-        # A debug-signed APK: installable as is. Each CI machine has its own
-        # debug key, so updating needs an uninstall first (saves are lost).
+        env:
+          VARIANT: ${{ env.SIGNED_RELEASE == 'true' && 'release' || 'debug' }}
         run: |
           export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           platform/android/build.sh
       - name: Package
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp platform/android/app/build/outputs/apk/debug/app-debug.apk dist/ethornell-android.apk
+          if [[ "$SIGNED_RELEASE" == 'true' ]]; then
+            cp platform/android/app/build/outputs/apk/release/app-release-unsigned.apk dist/ethornell-android.apk
+          else
+            cp platform/android/app/build/outputs/apk/debug/app-debug.apk dist/ethornell-android.apk
+          fi
+      - name: Sign release APK
+        if: env.SIGNED_RELEASE == 'true'
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${ANDROID_KEY_BASE64:?missing release keystore secret}"
+          export ANDROID_KEYSTORE="$RUNNER_TEMP/ethornell-release.p12"
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$ANDROID_KEYSTORE"
+          bash platform/android/sign.sh dist/ethornell-android.apk dist/ethornell-android-signed.apk
+          mv dist/ethornell-android-signed.apk dist/ethornell-android.apk
+      - name: Verify APK signature
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose dist/ethornell-android.apk
       - uses: actions/upload-artifact@v4
         with:
           name: ethornell-android
