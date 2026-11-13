@@ -5,6 +5,13 @@
 //! their alpha with the mask object's effective opacity, before RGB filters.
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkedMaskDraw {
+    Independent,
+    Masked,
+    Suppressed,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LinkedSpriteDraw {
     key: String,
@@ -41,13 +48,32 @@ impl RuntimeTraceApi {
         self.discard_linked_sprite_draw(object);
     }
 
-    fn uses_linked_sprite_mask(&self, sprite: i32) -> bool {
-        self.graph91_sprite_link_masks.contains(&sprite)
-            && self.graph91_sprite_relations.contains_key(&sprite)
-            // Original mode 3 uses its own threshold mask, even while linked.
-            && self.graph_object_properties.get(&sprite).is_some_and(|p| {
-                p.named_properties.get("target-object-mode").copied().unwrap_or(0) != 3
-            })
+    fn linked_sprite_mask_draw(&self, sprite: i32) -> LinkedMaskDraw {
+        if !self.graph91_sprite_link_masks.contains(&sprite)
+            || !self.graph91_sprite_relations.contains_key(&sprite)
+        {
+            return LinkedMaskDraw::Independent;
+        }
+        // 42BD70: only 0/1/5/6 consume the linked pointer. Mode 2
+        // degenerates to 0 for an identity rotation/stretch; its general
+        // path only accepts the auxiliary bitmap cleared by Graph91:55,
+        // so it draws nothing with an active link. Modes 3 and 4 keep
+        // their independent threshold/vector drawing, even while linked.
+        match self.graph90_sprite_mode(sprite) {
+            Some(0 | 1 | 5 | 6) => LinkedMaskDraw::Masked,
+            Some(2) => {
+                if self.graph_layers.get(&sprite).is_some_and(|layer| {
+                    layer.rotation_degrees == 0.0
+                        && layer.scale_x == 1.0
+                        && layer.scale_y == 1.0
+                }) {
+                    LinkedMaskDraw::Masked
+                } else {
+                    LinkedMaskDraw::Suppressed
+                }
+            }
+            _ => LinkedMaskDraw::Independent,
+        }
     }
 
     pub(super) fn refresh_linked_sprite_masks(&mut self) {
@@ -64,7 +90,7 @@ impl RuntimeTraceApi {
         let relations = self.graph91_sprite_relations.clone();
         let mut previous = std::mem::take(&mut self.linked_sprite_draws);
         for (picture_id, mask_id) in relations {
-            if !self.uses_linked_sprite_mask(picture_id) {
+            if self.linked_sprite_mask_draw(picture_id) != LinkedMaskDraw::Masked {
                 continue;
             }
             let (Some(picture), Some(mask)) = (items.get(&picture_id), items.get(&mask_id)) else {
@@ -236,8 +262,10 @@ impl RuntimeTraceApi {
         {
             return false;
         }
-        if !self.uses_linked_sprite_mask(owner) {
-            return true;
+        match self.linked_sprite_mask_draw(owner) {
+            LinkedMaskDraw::Independent => return true,
+            LinkedMaskDraw::Suppressed => return false,
+            LinkedMaskDraw::Masked => {}
         }
         let Some(draw) = self.linked_sprite_draws.get(&owner) else {
             return false;
