@@ -2673,6 +2673,11 @@ impl RuntimeTraceApi {
 
     /// sub_428320(-1): Sprite+0x154 = 0, +0x158 = -1; +0x160 stays.
     pub(super) fn graph91_clear_sprite_mask(&mut self, sprite: i32) {
+        self.discard_linked_sprite_draw(sprite);
+        if let Some((key, _)) = self.aux_masked_sprites.remove(&sprite) {
+            self.graph_images.remove(&key);
+            self.graph_image_revisions.remove(&key);
+        }
         if let Some(properties) = self.graph_object_properties.get_mut(&sprite) {
             properties.aux_resource = None;
         }

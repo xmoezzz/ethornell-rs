@@ -21,7 +21,7 @@ pub(crate) fn take_raster_error() -> Option<String> {
     RASTER_ERROR.with(|error| error.borrow_mut().take())
 }
 
-fn record_raster_error(message: impl Into<String>) {
+pub(super) fn record_raster_error(message: impl Into<String>) {
     RASTER_ERROR.with(|error| {
         let mut error = error.borrow_mut();
         if error.is_none() {
@@ -541,6 +541,21 @@ fn capture_draw_item(
     origin_x: f32,
     origin_y: f32,
 ) -> Option<RuntimeGraphDrawItem> {
+    if layer.owner_object.unwrap_or(layer_id) == layer_id
+        && api.display_tree.kind(layer_id) == Some(crate::display_tree::NativeDisplayKind::Sprite)
+    {
+        // Sprite captures use the same masked/filtered output as presentation.
+        // Work-bitmap copies never capture the hidden mask as a second image.
+        let mut item = api.graph_output_draw_items().into_iter()
+            .find(|item| item.owner_object == Some(layer_id))?;
+        item.x -= origin_x;
+        item.y -= origin_y;
+        if let Some(quad) = item.destination_quad.as_mut() {
+            for point in quad { point[0] -= origin_x; point[1] -= origin_y; }
+        }
+        if let Some(clip) = item.clip.as_mut() { clip.x -= origin_x; clip.y -= origin_y; }
+        return Some(item);
+    }
     if !layer.enabled || !api.object_enabled_for_layer(layer.owner_object) {
         return None;
     }
