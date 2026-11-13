@@ -4532,15 +4532,17 @@ impl RuntimeTraceApi {
         None
     }
 
+    fn graph_knob_input_disabled(&self) -> bool {
+        self.graph_knob_input_mode_set && self.graph_knob_input_mode == 0
+    }
+
     /// Find the topmost live CDspObjKnob under the pointer. Target
     /// sub_463780 walks the knob manager's native-sort-ordered list and then
     /// asks the pointer-scope system to validate the controlled object's
     /// rectangle. The portable manager keeps the same sort key through the
     /// target Sprite, so choose the largest active key among accepted rects.
     fn graph_knob_at_point(&self, point: (f32, f32)) -> Option<i32> {
-        // 90:DD with 0 turns knob input off; until a script calls it, the
-        // native path has no mode to consult and keeps the older behavior.
-        if self.graph_knob_input_mode_set && self.graph_knob_input_mode == 0 {
+        if self.graph_knob_input_disabled() {
             return None;
         }
         self.graph_knob_states
@@ -15351,6 +15353,73 @@ mod input_tests {
     }
 
     #[test]
+    fn disabled_knob_pointer_node_does_not_block_icon_scope() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.input_configuration_enabled = 1;
+        let target = 606;
+        let knob = 607;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "disabled-knob-target".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 2176,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.graph_object_layers
+            .insert(target, [target].into_iter().collect());
+        api.graph_knob_states
+            .insert(knob, super::graph_knob::GraphKnobState::new(target, 0.0, 0.0));
+        api.graph_object_draw_enabled.insert(knob, true);
+        api.pointer_object_nodes.push((0x0008_0000, knob));
+        let scope = 0x0007_ffff;
+        api.registered_pointer_input_scopes.register(scope);
+        let point = (110.0, 210.0);
+
+        // Unconfigured games keep existing knob pointer-scope behavior.
+        assert!(!super::native_pointer_scope_eligible_at(
+            &api,
+            scope,
+            Some(point)
+        ));
+
+        let mut disable_mode = vec![Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xdd, &mut disable_mode).unwrap();
+        assert!(super::native_pointer_scope_eligible_at(
+            &api,
+            scope,
+            Some(point)
+        ));
+
+        let mut enable_mode = vec![Value::Int(1)];
+        call_graph(&mut api, 0x90, 0xdd, &mut enable_mode).unwrap();
+        assert!(!super::native_pointer_scope_eligible_at(
+            &api,
+            scope,
+            Some(point)
+        ));
+    }
+
+    #[test]
     fn knob_mouse_capture_drag_changed_and_active_handle_follow_target_manager() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -20705,7 +20774,10 @@ fn native_pointer_scope_eligible_at(
         .pointer_object_nodes
         .iter()
         .filter_map(|&(scope, object)| {
-            (on_screen && api.graph_object_is_drawable(object)).then(|| {
+            // A disabled 90:DD Knob must not shadow a live icon-input item.
+            let knob_disabled =
+                api.graph_knob_input_disabled() && api.graph_knob_states.contains_key(&object);
+            (on_screen && !knob_disabled && api.graph_object_is_drawable(object)).then(|| {
                 (
                     scope,
                     api.graph_object_pointer_hit_at(object, point)
