@@ -125,7 +125,7 @@ pub(crate) fn lend_local_window(owner: &mut Vm, child: &mut Vm) {
 }
 
 impl Vm {
-    /// The data-region limit a call checks (sub_445010: +0x40 + +0x44).
+    /// The data-region limit a call checks (sub_444C40: +0x40 + +0x44).
     pub(crate) fn data_region_limit(&self) -> u32 {
         if self.child_thread_tag.is_some() {
             self.thread.frame_region_base().saturating_add(self.thread.data_region_size())

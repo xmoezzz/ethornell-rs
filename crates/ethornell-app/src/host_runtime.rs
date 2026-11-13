@@ -542,6 +542,7 @@ impl HostRuntime {
         self.runtime.api.input_down_descriptors.clear();
         self.runtime.api.input_down_reported.clear();
         self.runtime.api.mouse_pressed = false;
+        self.runtime.api.graph_icon_press_consumed = false;
         self.runtime.api.last_button_press = None;
         self.runtime.api.suppress_message_mouse_release = false;
         for input in self.runtime.api.graph_input_objects.values_mut() {
@@ -1148,7 +1149,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an authorized read-only sample via ETHORNELL_RESTRICTED_REPRO_GAME; private temporary user root"]
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     fn authorized_sample_restricted_vm_baseline() {
         if std::env::var_os("ETHORNELL_RESTRICTED_TRACE").is_some() {
             ethornell_core::init_tracing();

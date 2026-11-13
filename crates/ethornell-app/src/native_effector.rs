@@ -35,7 +35,9 @@ impl RuntimeTraceApi {
             0x67 => [a[1], -1],
             _ => [-1, -1],
         };
-        if id == 0x66 && a[1] as u32 > 1 {
+        // FD sub_426220 accepts six modes; older 420xxx code accepts two.
+        let gradient_max = if self.modern_gradient_blur { 5 } else { 1 };
+        if id == 0x66 && a[1] as u32 > gradient_max {
             return Err(err(format!("指定されたグラデーションタイプ [ {} ] は無効です", a[1])));
         }
         if id == 0x68 && (a[4] == 0 || a[5] == 0) {
@@ -247,6 +249,7 @@ impl RuntimeTraceApi {
                 alpha,
                 filter.unwrap_or(p[1]) != 0,
             )?,
+            1 if self.modern_gradient_blur => modern_gradient_blur(source, alpha, p[0]),
             1 => crate::native_background_effect::native_horizontal_blur(source, alpha, p[0] != 0),
             2 => self.effects.warp_vector_map(
                 state.vector_maps[0],
@@ -294,6 +297,47 @@ impl RuntimeTraceApi {
         Some(result)
     }
 }
+/// FD 4149A0 selects horizontal (0/1), vertical (2/3), or horizontal then
+/// vertical (4/5); odd modes clamp edges, even modes pad with zero. FD SSE2
+/// kernels halve each byte before accumulating and use unsigned mulhi with
+/// floor((131072 + 2*count)/count), rather than the legacy blur's rounding.
+fn modern_gradient_blur(source: &DecodedImage, alpha: i32, mode: i32) -> DecodedImage {
+    if alpha == 0 || source.width == 0 || source.height == 0 { return source.clone(); }
+    let clamp = mode & 1 != 0;
+    match mode / 2 {
+        0 => modern_blur_pass(source, alpha, false, clamp),
+        1 => modern_blur_pass(source, alpha, true, clamp),
+        2 => modern_blur_pass(&modern_blur_pass(source, alpha, false, clamp), alpha, true, clamp),
+        _ => unreachable!("gradient mode validated before configuring the effector"),
+    }
+}
+
+fn modern_blur_pass(source: &DecodedImage, alpha: i32, vertical: bool, clamp: bool) -> DecodedImage {
+    let radius = (alpha as u32).min(255) as i32;
+    let count = 2 * radius + 1;
+    let reciprocal = ((0x20000 + 2 * count) / count) as u32;
+    let (length, lines) = if vertical { (source.height, source.width) } else { (source.width, source.height) };
+    let mut output = source.clone();
+    for line in 0..lines as usize {
+        let index = |position: usize| if vertical { (position * source.width as usize + line) * 4 } else { (line * source.width as usize + position) * 4 };
+        let sample = |position: i32, channel: usize| -> u32 {
+            let position = if clamp { position.clamp(0, length as i32 - 1) }
+                else if position < 0 || position >= length as i32 { return 0; }
+                else { position };
+            u32::from(source.rgba[index(position as usize) + channel] >> 1)
+        };
+        let mut sums = [0u32; 4];
+        for position in -radius..=radius { for c in 0..4 { sums[c] += sample(position, c); } }
+        for position in 0..length as i32 {
+            for c in 0..4 {
+                output.rgba[index(position as usize) + c] = ((sums[c] * reciprocal) >> 16).min(255) as u8;
+                sums[c] = sums[c] - sample(position - radius, c) + sample(position + radius + 1, c);
+            }
+        }
+    }
+    output
+}
+
 /// 4169D0 prepares start/dx/dy as independently truncated signed 16.16.
 /// 418500 samples nearest; 417ED0 uses four fractional bits and black borders.
 fn effector_affine(source: &DecodedImage, t: [i32; 5], bilinear: bool) -> DecodedImage {
@@ -380,6 +424,23 @@ pub(super) fn native_inverse_affine(
 mod tests {
     use super::*;
     use ethornell_vm::{NativeCallFrame, NativeOpcode, Value};
+    #[test]
+    fn modern_gradient_modes_follow_axis_edge_and_sse_rounding() {
+        let mut source = DecodedImage { width: 3, height: 3, rgba: vec![0; 36] };
+        source.rgba[..4].fill(255);
+        let channel = |image: &DecodedImage| image.rgba.chunks_exact(4).map(|p| p[0]).collect::<Vec<_>>();
+        for (mode, expected) in [
+            (0, vec![84,84,0,0,0,0,0,0,0]),
+            (1, vec![169,84,0,0,0,0,0,0,0]),
+            (2, vec![84,0,0,84,0,0,0,0,0]),
+            (3, vec![169,0,0,84,0,0,0,0,0]),
+            (4, vec![28,28,0,28,28,0,0,0,0]),
+            (5, vec![112,56,0,56,28,0,0,0,0]),
+        ] { assert_eq!(channel(&modern_gradient_blur(&source, 1, mode)), expected, "mode {mode}"); }
+        assert_eq!(modern_gradient_blur(&source, 0, 5), source);
+        assert_eq!(modern_gradient_blur(&source, 256, 5), modern_gradient_blur(&source, 255, 5));
+    }
+
     #[test]
     fn all_effector_modes_draw_and_transform_coefficients_wait_for_setter() {
         let manager = ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();

@@ -197,16 +197,20 @@ pub fn opcode_name(code: u8) -> Option<&'static str> {
     vm_opcode::lookup_bp_opcode(code).map(|spec| spec.symbol)
 }
 
-/// Non-null entries in the shipped interpreter table at `0x506300`. The
-/// senmomo build (BGI 1.622) adds the 16.16 fixed-point and vector opcodes
-/// 0x56..=0x5F (without 0x5C).
+/// Recovered entries across the legacy table at `0x506300`, senmomo's fixed
+/// arithmetic additions, and Houkago Cinderella 2 FD's compact instructions
+/// at `0x559710`, plus Lovepical (`0x553660`) / Dokai (`0x1401C4980`).
+/// This is not a completeness claim for every engine version.
 pub const NATIVE_REGISTERED_OPCODES: &[u8] = &[
-    0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x11, 0x14, 0x15, 0x16,
-    0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x30, 0x31, 0x32,
-    0x33, 0x34, 0x35, 0x38, 0x39, 0x3a, 0x40, 0x42, 0x43, 0x44, 0x48, 0x49, 0x50, 0x51, 0x52, 0x53,
-    0x54, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
-    0x6f, 0x70, 0x71, 0x74, 0x75, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81,
-    0x90, 0x91, 0x92, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xff,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3e, 0x3f, 0x40, 0x42,
+    0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x73, 0x74, 0x75, 0x77, 0x78, 0x79, 0x7a, 0x7b,
+    0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x90, 0x91, 0x92, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xe3, 0xe4,
+    0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef, 0xff,
 ];
 
 /// Return a diagnostic candidate label for a native selector.
@@ -890,19 +894,106 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
         let mut opcode_name_override = None;
 
         match opcode_byte {
+            0x03 => {
+                if let Some(mode) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::U8(mode));
+                    if mode < 0x80 {
+                        for _ in 0..=mode {
+                            if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::I32(value)); }
+                            else { break; }
+                        }
+                    } else {
+                        let value = match mode {
+                            0x80 => read_u8_operand(&mut cursor, &mut raw_len, &mut warning).map(|v| v as i8 as i32),
+                            0x81 => read_u16_operand(&mut cursor, &mut raw_len, &mut warning).map(|v| v as i16 as i32),
+                            0x82 => read_u32_operand(&mut cursor, &mut raw_len, &mut warning).map(|v| v as i32),
+                            0x83 => {
+                                let low = read_u32_operand(&mut cursor, &mut raw_len, &mut warning);
+                                let high = read_u32_operand(&mut cursor, &mut raw_len, &mut warning);
+                                low.zip(high).map(|(low, _)| low as i32)
+                            },
+                            _ => None, // Reserved encodings return without pushing in 4D4010.
+                        };
+                        if let Some(value) = value { operands.push(BpOperand::I32(value)); }
+                    }
+                }
+            }
+            0x0d => read_packed_immediate(&mut cursor, &mut raw_len, &mut warning, &mut operands),
+            0x0e | 0xe4..=0xe7 => {
+                if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U16(value)); }
+                read_packed_immediate(&mut cursor, &mut raw_len, &mut warning, &mut operands);
+            }
+            0x13 | 0xee => {
+                if let Some(relative) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::Offset((offset as i64 + i64::from(relative as i16)) as u32));
+                }
+            }
+            0x36 | 0x3f => {
+                if let Some(mode) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U8(mode)); }
+                if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::I32(value)); }
+            }
+            0x3e => {
+                if let Some(mode) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U8(mode)); }
+            }
+            0xe3 => {
+                if let Some(count) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::U8(count));
+                    for _ in 0..=count {
+                        if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U16(value)); }
+                        else { break; }
+                    }
+                }
+            }
+            0xed => {
+                if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U16(value)); }
+                if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::I32(value)); }
+            }
             0x00 | 0x08 | 0x09 | 0x0a => {
                 if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(value));
                 }
             }
-            0x01 => {
+            0x01 | 0x0f | 0x19..=0x1e => {
                 if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U16(value));
                 }
+                if matches!(opcode_byte, 0x1a | 0x1b) {
+                    if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) {
+                        operands.push(BpOperand::I32(value));
+                    }
+                } else if opcode_byte == 0x1c {
+                    if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                        operands.push(BpOperand::U8(value));
+                    }
+                }
             }
-            0x02 => {
+            0x02 | 0x18 | 0xef => {
                 if let Some(value) = read_u32_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U32(value));
+                }
+            }
+            0x12 | 0x1f | 0x2c..=0x2f | 0xec => {
+                if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::I32(value));
+                }
+            }
+            0x3c => {
+                if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::U8(value));
+                }
+            }
+            0x15 | 0x3b | 0x37 => {
+                if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                    operands.push(BpOperand::U8(value));
+                    if matches!(opcode_byte, 0x3b | 0x37) || value & 8 != 0 {
+                        if let Some(relative) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
+                            let target = (offset as i64 + i64::from(relative as i16)) as u32;
+                            operands.push(BpOperand::Offset(target));
+                        }
+                    }
+                    if opcode_byte == 0x37 {
+                        if let Some(value) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::I32(value)); }
+                    }
                 }
             }
             0x04..=0x06 => {
@@ -944,7 +1035,7 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                     operands.push(BpOperand::U8(count));
                 }
             }
-            0x15 | 0x80 | 0x81 | 0x90 | 0x91 | 0x92 | 0xa0 | 0xb0 | 0xc0 | 0xd0 | 0xe0 => {
+            0x80 | 0x81 | 0x90 | 0x91 | 0x92 | 0xa0 | 0xb0 | 0xc0 | 0xd0 | 0xe0 => {
                 if let Some(value) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(value));
                     if !matches!(opcode_byte, 0xd0 | 0xe0) {
@@ -1106,6 +1197,54 @@ fn read_u16_operand(
     }
 }
 
+/// Houkago FD 44E6F0: signed LEB128, bounded to an i32 rather than allowing
+/// corrupt streams to shift/scan without a limit.
+fn read_sleb32_operand(
+    cursor: &mut Cursor<&[u8]>,
+    raw_len: &mut usize,
+    warning: &mut Option<String>,
+) -> Option<i32> {
+    let mut result = 0u32;
+    for index in 0..5 {
+        let byte = read_u8_operand(cursor, raw_len, warning)?;
+        if index == 4 && (byte & 0x80 != 0 || !matches!(byte & 0x70, 0 | 0x70)) {
+            *warning = Some("invalid signed LEB128 i32".into());
+            return None;
+        }
+        result |= u32::from(byte & 0x7f).wrapping_shl(index * 7);
+        if byte & 0x80 == 0 {
+            let bits = (index + 1) * 7;
+            if bits < 32 && byte & 0x40 != 0 {
+                result |= u32::MAX << bits;
+            }
+            return Some(result as i32);
+        }
+    }
+    None
+}
+
+/// 498060 with two reserved low bits: signed LEB payload plus a width.
+/// The combined encoding has 34 useful bits, so decode in i64 before
+/// extracting width and validating the signed i32 payload.
+fn read_packed_immediate(cursor: &mut Cursor<&[u8]>, raw_len: &mut usize, warning: &mut Option<String>, operands: &mut Vec<BpOperand>) {
+    let mut packed = 0i64;
+    for index in 0..5 {
+        let Some(byte) = read_u8_operand(cursor, raw_len, warning) else { return; };
+        packed |= i64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            if byte & 0x40 != 0 { packed |= -1i64 << ((index + 1) * 7); }
+            let payload = packed >> 2;
+            // The native compiler also emits unsigned representations of
+            // negative 32-bit cells (e.g. 80 80 80 80 08 for MIN).
+            if (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&payload) {
+                operands.extend([BpOperand::U8((packed & 3) as u8), BpOperand::I32(payload as u32 as i32)]);
+            } else { *warning = Some("packed BP immediate overflow".into()); }
+            return;
+        }
+    }
+    *warning = Some("unterminated packed BP immediate".into());
+}
+
 fn read_u32_operand(
     cursor: &mut Cursor<&[u8]>,
     raw_len: &mut usize,
@@ -1189,8 +1328,35 @@ mod tests {
     }
 
     #[test]
+    fn compact_bp_immediates_preserve_instruction_boundaries() {
+        let instructions = disassemble_bp(&[0x12, 0xf0, 0x21, 0x80, 0xfd, 0x15, 8, 0xa7, 0x16, 0x0f, 0xec, 0x90, 0x17]);
+        assert_eq!(instructions.iter().map(|i| i.offset).collect::<Vec<_>>(), [0, 3, 5, 9, 12]);
+        assert_eq!(&*instructions[0].operands, &[BpOperand::I32(0x10f0)]);
+        assert_eq!(&*instructions[2].operands, &[BpOperand::U8(8), BpOperand::Offset(0x16ac)]);
+        assert_eq!(&*instructions[3].operands, &[BpOperand::U16(0x90ec)]);
+        for (encoded, expected) in [
+            (vec![0x7f], -1), (vec![0x90, 0x5e], -0x10f0),
+            (vec![0xff, 0xff, 0xff, 0xff, 0x07], i32::MAX),
+            (vec![0x80, 0x80, 0x80, 0x80, 0x78], i32::MIN),
+            (vec![0x80, 0x80, 0x80, 0x80, 0x08], i32::MIN),
+            (vec![0xff, 0xff, 0xff, 0xff, 0x0f], -1),
+        ] {
+            let mut bytes = vec![0x12]; bytes.extend(encoded); bytes.push(0x17);
+            let instructions = disassemble_bp(&bytes);
+            assert_eq!(&*instructions[0].operands, &[BpOperand::I32(expected)]);
+            assert_eq!(instructions[1].opcode.code(), 0x17);
+        }
+        for encoded in [vec![0x80], vec![0xff, 0xff, 0xff, 0xff, 0x1f], vec![0x80; 5]] {
+            let mut bytes = vec![0x12]; bytes.extend(encoded);
+            let instructions = disassemble_bp(&bytes);
+            assert!(instructions[0].operands.is_empty());
+            assert!(instructions[0].warning.is_some());
+        }
+    }
+
+    #[test]
     fn compact_instructions_preserve_disassembler_json() {
-        let instructions = disassemble_bp(&[0xff, 0xf0, 0x03, 0x17]);
+        let instructions = disassemble_bp(&[0xff, 0xf0, 0x07, 0x17]);
         let json = serde_json::to_value(&instructions).unwrap();
         assert_eq!(
             json[0],
@@ -1206,7 +1372,7 @@ mod tests {
             })
         );
         assert_eq!(json[1]["opcode_name"], "unknown");
-        assert_eq!(json[1]["opcode_hex"], "0x03");
+        assert_eq!(json[1]["opcode_hex"], "0x07");
         assert_eq!(json[2]["raw"], serde_json::json!([23]));
     }
 
@@ -1222,7 +1388,7 @@ mod tests {
 
     #[test]
     fn names_every_opcode_registered_by_the_native_interpreter() {
-        assert_eq!(NATIVE_REGISTERED_OPCODES.len(), 98);
+        assert_eq!(NATIVE_REGISTERED_OPCODES.len(), 136);
         assert!(
             NATIVE_REGISTERED_OPCODES
                 .iter()
@@ -1264,8 +1430,8 @@ mod tests {
         assert_eq!(jump.stack_effect, "1 -> 0");
         assert_eq!(jump.immediate, "none");
         let conditional = vm_opcode::lookup_bp_opcode(0x15).unwrap();
-        assert_eq!(conditional.stack_effect, "2 -> 0");
-        assert_eq!(conditional.immediate, "u8 predicate selector (0..5)");
+        assert_eq!(conditional.stack_effect, "2 -> 0; inline target: 1 -> 0");
+        assert!(conditional.immediate.contains("i16 relative"));
     }
 
     #[test]

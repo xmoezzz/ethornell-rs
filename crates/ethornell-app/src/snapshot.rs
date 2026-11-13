@@ -21,7 +21,7 @@ pub(crate) fn take_raster_error() -> Option<String> {
     RASTER_ERROR.with(|error| error.borrow_mut().take())
 }
 
-fn record_raster_error(message: impl Into<String>) {
+pub(super) fn record_raster_error(message: impl Into<String>) {
     RASTER_ERROR.with(|error| {
         let mut error = error.borrow_mut();
         if error.is_none() {
@@ -289,7 +289,20 @@ pub(crate) fn compose_runtime_frame_through_priority(
     include_text: bool,
     maximum_priority: Option<i32>,
 ) -> DecodedImage {
-    let (width, height) = runtime_frame_size(api);
+    compose_runtime_region(api, include_text, maximum_priority, [0, 0], runtime_frame_size(api))
+}
+
+/// The same retained scene traversal, in a caller-supplied bitmap viewport.
+/// Graph91:05 captures at (-x,-y); objects beyond the screen edge can still
+/// contribute to the offscreen destination.
+pub(crate) fn compose_runtime_region(
+    api: &RuntimeTraceApi,
+    include_text: bool,
+    maximum_priority: Option<i32>,
+    origin: [i32; 2],
+    size: (u32, u32),
+) -> DecodedImage {
+    let (width, height) = size;
     let Some(mut out) = new_raster(width, height) else {
         return DecodedImage {
             width: 0,
@@ -325,6 +338,7 @@ pub(crate) fn compose_runtime_frame_through_priority(
         let Some(src) = api.graph_images.get(&item.key) else {
             continue;
         };
+        let item = translated_item(item, origin);
         composite_runtime_item(&mut out, src, &item);
     }
 
@@ -344,15 +358,19 @@ pub(crate) fn compose_runtime_frame_through_priority(
                     positioned.y += surface_y;
                     positioned.color[3] *= api.surface_display_opacity(surface);
                 }
+                positioned.x -= origin[0] as f32;
+                positioned.y -= origin[1] as f32;
                 let clip = node
                     .target_surface
-                    .and_then(|surface| api.surface_chain_clip(surface));
-                draw_text_node(
+                    .and_then(|surface| api.surface_chain_clip(surface))
+                    .map(|mut clip| { clip.x -= origin[0] as f32; clip.y -= origin[1] as f32; clip });
+                draw_transformed_text_node(
                     &mut out,
                     &positioned,
                     api.formatted_text_layout(&positioned),
                     api.text_node_shadow(&positioned),
                     clip,
+                    api.named_font_transform(node.target_surface),
                 );
             }
         }
@@ -364,6 +382,7 @@ pub(crate) fn compose_runtime_frame_through_priority(
         && let Some(item) = api.directshow_movie_draw_item()
         && let Some(src) = api.graph_images.get(&item.key)
     {
+        let item = translated_item(item, origin);
         composite_runtime_item(&mut out, src, &item);
     }
 
@@ -522,16 +541,27 @@ pub(crate) fn compose_graph_object(
                 width: clip.width,
                 height: clip.height,
             });
-        draw_text_node(
+        draw_transformed_text_node(
             &mut out,
             &positioned,
             api.formatted_text_layout(&positioned),
             api.text_node_shadow(&positioned),
             clip,
+            api.named_font_transform(node.target_surface),
         );
     }
 
     Some(out)
+}
+
+fn translated_item(mut item: RuntimeGraphDrawItem, origin: [i32; 2]) -> RuntimeGraphDrawItem {
+    item.x -= origin[0] as f32;
+    item.y -= origin[1] as f32;
+    if let Some(quad) = item.destination_quad.as_mut() {
+        for point in quad { point[0] -= origin[0] as f32; point[1] -= origin[1] as f32; }
+    }
+    if let Some(clip) = item.clip.as_mut() { clip.x -= origin[0] as f32; clip.y -= origin[1] as f32; }
+    item
 }
 
 fn capture_draw_item(
@@ -541,6 +571,21 @@ fn capture_draw_item(
     origin_x: f32,
     origin_y: f32,
 ) -> Option<RuntimeGraphDrawItem> {
+    if layer.owner_object.unwrap_or(layer_id) == layer_id
+        && api.display_tree.kind(layer_id) == Some(crate::display_tree::NativeDisplayKind::Sprite)
+    {
+        // Sprite captures use the same masked/filtered output as presentation.
+        // Work-bitmap copies never capture the hidden mask as a second image.
+        let mut item = api.graph_output_draw_items().into_iter()
+            .find(|item| item.owner_object == Some(layer_id))?;
+        item.x -= origin_x;
+        item.y -= origin_y;
+        if let Some(quad) = item.destination_quad.as_mut() {
+            for point in quad { point[0] -= origin_x; point[1] -= origin_y; }
+        }
+        if let Some(clip) = item.clip.as_mut() { clip.x -= origin_x; clip.y -= origin_y; }
+        return Some(item);
+    }
     if !layer.enabled || !api.object_enabled_for_layer(layer.owner_object) {
         return None;
     }
@@ -645,6 +690,17 @@ pub(crate) fn draw_text_node(
     shadow: TextNodeShadow,
     clip: Option<crate::graph::RuntimeClipRect>,
 ) {
+    draw_transformed_text_node(dst, node, layout, shadow, clip, None);
+}
+
+fn draw_transformed_text_node(
+    dst: &mut DecodedImage,
+    node: &crate::text::RuntimeTextNode,
+    layout: crate::text::RuntimeFormattedTextLayout,
+    shadow: TextNodeShadow,
+    clip: Option<crate::graph::RuntimeClipRect>,
+    transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
+) {
     if !valid_raster(dst)
         || !valid_text_position(node.x, node.y)
         || !valid_text_raster(node.size, node.text.chars().count())
@@ -680,7 +736,8 @@ pub(crate) fn draw_text_node(
         let bold = style.is_some_and(|style| style.style.bold);
         let italic = style.is_some_and(|style| style.style.italic);
         let glyph_id = font.glyph_id(ch);
-        let advance = scaled.h_advance(glyph_id).max(node.size * 0.5);
+        let advance = scaled.h_advance(glyph_id).max(node.size * 0.5)
+            + transform.map_or(0.0, |t| t.advance_adjustment(node.size));
         if x + advance > max_x {
             x = node.x;
             y += line_height;
@@ -692,7 +749,7 @@ pub(crate) fn draw_text_node(
                 x,
                 y: y - scaled.ascent(),
             };
-            rasterize_placed_glyph_records(
+            rasterize_transformed_glyph_records(
                 dst,
                 1,
                 &[placed],
@@ -700,6 +757,7 @@ pub(crate) fn draw_text_node(
                 color,
                 &|_| None,
                 Some(effect),
+                transform,
             );
             x += advance;
             char_index += 1;
@@ -713,7 +771,7 @@ pub(crate) fn draw_text_node(
                 (effect.rgb & 0xff) as f32 / 255.0,
                 color[3] * effect.concentration as f32 / 256.0,
             ];
-            draw_glyph(
+            draw_transformed_glyph(
                 dst,
                 &font,
                 glyph.clone(),
@@ -723,11 +781,12 @@ pub(crate) fn draw_text_node(
                 bold,
                 italic,
                 clip,
+                transform,
             );
         } else if let Some((shadow_x, shadow_y, shadow_alpha)) =
             resolve_text_shadow(default_shadow, node.size)
         {
-            draw_glyph(
+            draw_transformed_glyph(
                 dst,
                 &font,
                 glyph.clone(),
@@ -737,9 +796,10 @@ pub(crate) fn draw_text_node(
                 bold,
                 italic,
                 clip,
+                transform,
             );
         }
-        draw_glyph(dst, &font, glyph, color, 0, 0, bold, italic, clip);
+        draw_transformed_glyph(dst, &font, glyph, color, 0, 0, bold, italic, clip, transform);
         x += advance;
         char_index += 1;
     }
@@ -1226,15 +1286,17 @@ fn glyph_cell(
     y: f32,
     size: f32,
     rgb: [u8; 3],
+    transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
 ) -> Option<(DecodedImage, i32, i32)> {
     if !valid_text_position(x, y) {
         return None;
     }
-    let scale = PxScale::from(size);
-    let baseline = y + font.as_scaled(scale).ascent();
+    let ratios = transform.map_or([1.0; 2], |t| t.scales());
+    let scale = PxScale { x: size * ratios[0], y: size * ratios[1] };
+    let baseline = (y + font.as_scaled(PxScale::from(size)).ascent()) * ratios[1];
     let outlined = font.outline_glyph(
         font.glyph_id(ch)
-            .with_scale_and_position(scale, point(x, baseline)),
+            .with_scale_and_position(scale, point(x * ratios[0], baseline)),
     )?;
     let bounds = outlined.px_bounds();
     if !valid_glyph_bounds(bounds) {
@@ -1253,7 +1315,12 @@ fn glyph_cell(
             }
         }
     });
-    Some((cell, left, top))
+    if let Some(transform) = transform {
+        let cell = crate::font_transform::reduce_glyph_coverage(&cell, ratios);
+        let left = (left as f32 / ratios[0] + size * transform.offset_x as f32 / 65536.0).floor() as i32;
+        let top = (top as f32 / ratios[1] + size * transform.offset_y as f32 / 65536.0).floor() as i32;
+        Some((cell, left, top))
+    } else { Some((cell, left, top)) }
 }
 
 /// sub_435290's per-character records, blitted onto `dst` (format
@@ -1272,6 +1339,19 @@ pub(crate) fn rasterize_placed_glyph_records(
     color_of: &dyn Fn(usize) -> Option<[f32; 4]>,
     shadow: Option<TextShadow>,
 ) {
+    rasterize_transformed_glyph_records(dst, dst_format, glyphs, size, color, color_of, shadow, None);
+}
+
+pub(crate) fn rasterize_transformed_glyph_records(
+    dst: &mut DecodedImage,
+    dst_format: i32,
+    glyphs: &[crate::text_layout::PlacedGlyph],
+    size: f32,
+    color: [f32; 4],
+    color_of: &dyn Fn(usize) -> Option<[f32; 4]>,
+    shadow: Option<TextShadow>,
+    transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
+) {
     if !valid_raster(dst) || !valid_text_raster(size, glyphs.len()) {
         return;
     }
@@ -1286,7 +1366,7 @@ pub(crate) fn rasterize_placed_glyph_records(
     for glyph in glyphs {
         let color = color_of(glyph.index).unwrap_or(color);
         let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
-        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb)
+        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb, transform)
         else {
             continue;
         };
@@ -1445,6 +1525,61 @@ fn draw_glyph(
             blend_pixel_native(&mut dst.rgba[i..i + 4], &src, 1.0, 0);
         }
     });
+}
+
+fn draw_transformed_glyph(
+    dst: &mut DecodedImage,
+    font: &FontArc,
+    glyph: ab_glyph::Glyph,
+    color: [f32; 4],
+    dx: i32,
+    dy: i32,
+    bold: bool,
+    italic: bool,
+    clip: Option<crate::graph::RuntimeClipRect>,
+    transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
+) {
+    let Some(transform) = transform else {
+        return draw_glyph(dst, font, glyph, color, dx, dy, bold, italic, clip);
+    };
+    if !valid_text_position(glyph.position.x, glyph.position.y) { return; }
+    let ratios = transform.scales();
+    let size = glyph.scale.y;
+    let high = ab_glyph::Glyph {
+        scale: PxScale { x: glyph.scale.x * ratios[0], y: size * ratios[1] },
+        position: point(glyph.position.x * ratios[0], glyph.position.y * ratios[1]),
+        ..glyph
+    };
+    let Some(outline) = font.outline_glyph(high) else { return; };
+    let bounds = outline.px_bounds();
+    if !valid_glyph_bounds(bounds) { return; }
+    let Some(mut cell) = new_raster(bounds.width() as u32, bounds.height() as u32) else { return; };
+    outline.draw(|x, y, coverage| {
+        let at = ((y * cell.width + x) * 4) as usize;
+        cell.rgba[at..at+4].copy_from_slice(&[255, 255, 255, (coverage * 255.0).round() as u8]);
+    });
+    let cell = crate::font_transform::reduce_glyph_coverage(&cell, ratios);
+    let left = (bounds.min.x / ratios[0] + size * transform.offset_x as f32 / 65536.0).floor() as i32;
+    let top = (bounds.min.y / ratios[1] + size * transform.offset_y as f32 / 65536.0).floor() as i32;
+    for gy in 0..cell.height {
+        for gx in 0..cell.width {
+            let coverage = cell.rgba[((gy * cell.width + gx) * 4 + 3) as usize] as f32 / 255.0;
+            let italic_dx = if italic { ((cell.height - gy) as f32 * 0.20).round() as i32 } else { 0 };
+            let y = top.saturating_add(gy as i32).saturating_add(dy);
+            for bold_dx in 0..=i32::from(bold) {
+                let x = left.saturating_add(gx as i32).saturating_add(dx).saturating_add(italic_dx).saturating_add(bold_dx);
+                if x < 0 || y < 0 || x >= dst.width as i32 || y >= dst.height as i32 || !point_in_clip(x,y,clip) { continue; }
+                let src = [
+                    (color[0].clamp(0.0,1.0)*255.0).round() as u8,
+                    (color[1].clamp(0.0,1.0)*255.0).round() as u8,
+                    (color[2].clamp(0.0,1.0)*255.0).round() as u8,
+                    (coverage*color[3]).clamp(0.0,1.0).mul_add(255.0,0.0).round() as u8,
+                ];
+                let at = ((y as u32*dst.width+x as u32)*4) as usize;
+                blend_pixel_native(&mut dst.rgba[at..at+4],&src,1.0,0);
+            }
+        }
+    }
 }
 
 fn runtime_text_style_at(

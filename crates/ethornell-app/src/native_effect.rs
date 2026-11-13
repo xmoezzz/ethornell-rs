@@ -740,6 +740,7 @@ impl RuntimeTraceApi {
             screen.height as u32,
             &screen.frame_tables[0],
             &state.particle_banks,
+            self.native_additive_coverage,
         );
         while screen.layers.len() > images.len() {
             let layer = screen.layers.pop().unwrap();

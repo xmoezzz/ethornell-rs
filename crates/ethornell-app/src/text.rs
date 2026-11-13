@@ -373,6 +373,7 @@ impl RuntimeTraceApi {
         kinsoku: bool,
         color: [f32; 4],
         shadow: Option<crate::snapshot::TextShadow>,
+        font: i32,
     ) -> Option<(i32, (i32, i32))> {
         let link_color = (self.system92_text_render_override != -1)
             .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
@@ -392,8 +393,10 @@ impl RuntimeTraceApi {
             kinsoku,
             indent_brackets: self.graph_defaults.text_layout.mode_flag != 0,
         };
+        let transform = self.named_font_transform_for_id(font);
+        let advance = transform.map_or(0.0, |t| t.advance_adjustment(size));
         let layout = crate::text_layout::layout_text(&parsed.text, &params, &|ch| {
-            crate::snapshot::glyph_advance(ch, size, horizontal_scale)
+            (crate::snapshot::glyph_advance(ch, size, horizontal_scale) + advance).max(0.0)
         });
         let spans = parsed.style_spans.clone();
         let color_of = move |index: usize| {
@@ -411,7 +414,7 @@ impl RuntimeTraceApi {
                 })
         };
         let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
-        crate::snapshot::rasterize_placed_glyph_records(
+        crate::snapshot::rasterize_transformed_glyph_records(
             &mut image,
             format,
             &layout.glyphs,
@@ -419,6 +422,7 @@ impl RuntimeTraceApi {
             color,
             &color_of,
             shadow,
+            transform,
         );
         // `<l>` fragments feed Graph92:9E with the position the layout gave
         // the first glyph of each link.
@@ -501,6 +505,7 @@ impl RuntimeTraceApi {
                     at(2) != 0,
                     color,
                     None,
+                    font,
                 )
                 .map_or(x, |(_, (end_x, _))| end_x),
             None => x,
@@ -1220,6 +1225,9 @@ impl RuntimeTraceApi {
         let cursor = self.surface_text_states.entry(window).or_default();
         cursor.cursor_x = cursor_x;
         cursor.cursor_y = cursor_y;
+        if !parsed.text.is_empty() {
+            cursor.last_text_extent = cursor_x.wrapping_sub(state.x as i32);
+        }
         self.message_pages.insert(
             window,
             MessagePage {

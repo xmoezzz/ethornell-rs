@@ -41,6 +41,63 @@ pub(crate) fn game_root_path(manager: &ResourceManager) -> PathBuf {
         .unwrap_or_else(|_| root.to_path_buf())
 }
 
+/// Native archive discovery is a read of the install tree, while ordinary
+/// save-file enumeration retains the private-user root. Explicit capability
+/// roots are authoritative; FilePolicy still validates every path component.
+pub(crate) fn native_enumeration_pattern(pattern: &str) -> String {
+    let normalized = pattern.replace('\\', "/");
+    if !normalized.starts_with("bgi-")
+        && Path::new(&normalized)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("arc"))
+    {
+        format!("bgi-resource/{normalized}")
+    } else {
+        normalized
+    }
+}
+
+/// Sys81:39 consumes an already indexed archive directory, not loose files
+/// or an arbitrary path to reopen. Preserve original member spelling/order.
+pub(crate) fn archive_directory_names(
+    manager: &ResourceManager,
+    native_root: &Path,
+    archive: &str,
+) -> Option<Vec<String>> {
+    let normalized = archive.replace('\\', "/");
+    let path = if let Some(relative) = normalized.strip_prefix("bgi-resource/") {
+        PathBuf::from(relative)
+    } else {
+        normalize_runtime_native_path(native_root, archive)
+    };
+    let relative = if path.is_absolute() {
+        path.strip_prefix(native_root).ok()?
+    } else {
+        path.as_path()
+    };
+    let parts = relative.components().filter_map(|part| match part {
+        std::path::Component::CurDir => None,
+        other => Some(other),
+    }).collect::<Vec<_>>();
+    if parts.is_empty() || parts.iter().any(|part| {
+        !matches!(part, std::path::Component::Normal(name) if !name.to_string_lossy().contains([':', '\0']))
+    }) {
+        return None;
+    }
+    let name = parts.iter().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+    let index = manager.archives().archives.iter().find(|index| {
+        if parts.len() == 1 {
+            index.path.file_name().is_some_and(|leaf| leaf.to_string_lossy().eq_ignore_ascii_case(&name))
+        } else {
+            index.path.strip_prefix(&manager.archives().root).is_ok_and(|relative| {
+                relative.to_string_lossy().replace('\\', "/").eq_ignore_ascii_case(&name)
+            })
+        }
+    })?;
+    Some(index.entries.iter().map(|entry| entry.name.clone()).collect())
+}
+
 pub(crate) fn script_game_root(native_root: &Path) -> String {
     if cfg!(target_os = "windows") {
         native_root.to_string_lossy().into_owned()

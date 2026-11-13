@@ -27,6 +27,7 @@ impl Vm {
     pub(crate) fn set_newest_async_thread_regions(&mut self, code: u32, data: u32, slots: u32) {
         if let Some(task) = self.async_tasks.last_mut() {
             task.vm.thread.set_region_sizes(code, data, slots);
+            task.vm.sync_region_reservations(task.vm.active_code_used_end());
         }
     }
 
@@ -86,6 +87,7 @@ impl Vm {
         // an idle thread must not keep another 1 MiB snapshot of it.
         let mut vm = Vm::with_buffers(Vec::new(), Vec::new());
         vm.native_abi_profile = self.native_abi_profile;
+        vm.modern_pointer_tags = self.modern_pointer_tags;
         vm.graph_text_encoding = self.graph_text_encoding;
         vm.system80_shared = Arc::clone(&self.system80_shared);
         vm.system81_shared = Arc::clone(&self.system81_shared);
@@ -696,7 +698,7 @@ pub(crate) fn local_byte(vm: &Vm, addr: usize) -> u8 {
 
 /// Exchange a parked local window with the active process buffer, including
 /// the write bounds. Child threads borrow their owner's window this way so a
-/// compact snapshot need not expand to 2 MiB merely to lend it for one pass.
+/// compact snapshot need not expand to the full window merely to lend it for one pass.
 pub(crate) fn exchange_saved_local(vm: &mut Vm, window: &mut LocalWindow) {
     if vm.memory.len() < HEAP_MEMORY_BASE {
         vm.memory.resize(HEAP_MEMORY_BASE, 0);

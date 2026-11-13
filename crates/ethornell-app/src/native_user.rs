@@ -1304,6 +1304,11 @@ impl RuntimeTraceApi {
                     // sub_46BC80 clears the input records after MessageBoxA.
                     self.clear_native_input_records();
                 } else {
+                    tracing::warn!(
+                        title = %title,
+                        message = %message,
+                        "native message awaiting confirmation; send Enter or a mouse release to continue"
+                    );
                     self.native_user.begin_blocking_message(title, message);
                     self.frame_yield_requested = true;
                 }

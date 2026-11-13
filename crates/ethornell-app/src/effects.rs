@@ -10,6 +10,9 @@ const MAX_RAIN_EFFECTS: usize = 8;
 #[derive(Debug)]
 pub(crate) struct RuntimeEffects {
     pub(crate) vector_revision: u64,
+    /// FD 408D10 / 415610 / 4160D0: clip vector addresses in X/Y,
+    /// rather than treating a row overflow as a valid flat-buffer address.
+    pub(crate) clip_vectors_xy: bool,
     rain: BTreeMap<i32, RainEffect>,
     rain_step_ms: i32,
     rain_native_step: i32,
@@ -24,6 +27,7 @@ impl Default for RuntimeEffects {
     fn default() -> Self {
         Self {
             vector_revision: 0,
+            clip_vectors_xy: false,
             rain: BTreeMap::new(),
             rain_step_ms: 16,
             rain_native_step: 0,
@@ -445,14 +449,28 @@ impl RuntimeEffects {
                 let wave = i32::from(*waves.get(vector.phase as usize).unwrap_or(&0));
                 let px = i32::from(vector.x) * wave;
                 let py = i32::from(vector.y) * wave;
-                let address = i64::from(y as i32 + origin[1] + (py >> 16)) * i64::from(source.width) + i64::from(x as i32 + origin[0] + (px >> 16));
-                let mut color = pixel(address);
+                let component = |product: i32| -> i32 {
+                    if self.clip_vectors_xy && !wrap && !bilinear {
+                        // mulhi_epi16 + (mullo_epi16 >> 15), then 16-bit add.
+                        ((product >> 16) + ((product as u32 >> 15) & 1) as i32) as i16 as i32
+                    } else { product >> 16 }
+                };
+                let sx = if self.clip_vectors_xy && !wrap { (x as i32 + origin[0] + component(px)) as i16 as i32 }
+                         else { x as i32 + origin[0] + component(px) };
+                let sy = if self.clip_vectors_xy && !wrap { (y as i32 + origin[1] + component(py)) as i16 as i32 }
+                         else { y as i32 + origin[1] + component(py) };
+                let sample = |dx: i32, dy: i32| {
+                    let (sx,sy) = (sx+dx,sy+dy);
+                    if self.clip_vectors_xy && !wrap && (sx<0 || sy<0 || sx>=source.width as i32 || sy>=source.height as i32) { [0;4] }
+                    else { pixel(i64::from(sy)*i64::from(source.width)+i64::from(sx)) }
+                };
+                let mut color = sample(0,0);
                 if bilinear {
                     let fx = (px as u32 >> 12) & 15;
                     let fy = (py as u32 >> 12) & 15;
-                    let right = pixel(address+1);
-                    let below = pixel(address+i64::from(source.width));
-                    let diagonal = pixel(address+i64::from(source.width)+1);
+                    let right = sample(1,0);
+                    let below = sample(0,1);
+                    let diagonal = sample(1,1);
                     for c in 0..4 {
                         let mix = |a: u8,b: u8,t:u32| -> i32 { i32::from(b) + ((i32::from(a)-i32::from(b))*(16-t) as i32 >> 4) };
                         let top = mix(color[c],right[c],fx);
@@ -1093,6 +1111,24 @@ mod tests {
     use super::{RuntimeEffects, VectorSample};
     use ethornell_image::DecodedImage;
     use ethornell_vm::Value;
+
+    #[test]
+    fn modern_raster_option_vector_clipping_and_nearest_rounding() {
+        let mut effects = RuntimeEffects::default();
+        effects.create_vector_map(1,2,2);
+        for v in &mut effects.vector_maps.get_mut(&1).unwrap().samples {
+            *v = VectorSample { x:2,y:0,phase:0 };
+        }
+        let image = ethornell_image::DecodedImage { width:2,height:2,rgba:vec![10,0,0,255,20,0,0,255,30,0,0,255,40,0,0,255] };
+        effects.clip_vectors_xy = true;
+        let nearest = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,false).unwrap();
+        assert_eq!(&nearest.rgba[..8], &[20,0,0,255,0,0,0,0]);
+        let linear = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,true).unwrap();
+        assert_eq!(linear.rgba[4],1); // Never sample the first pixel of row 2.
+        effects.clip_vectors_xy = false;
+        let legacy = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,true).unwrap();
+        assert_eq!(legacy.rgba[4],29);
+    }
 
     #[test]
     fn rain_calls_preserve_script_argument_order_and_equal_handle_values() {
