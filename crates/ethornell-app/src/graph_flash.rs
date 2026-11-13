@@ -164,7 +164,7 @@ impl RuntimeFlashRegistry {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let backends = wgpu::Backends::all();
-            let instance = create_wgpu_instance(backends, wgpu::BackendOptions::default());
+            let instance = create_wgpu_instance(backends, wgpu::BackendOptions::default(), None);
             let (adapter, device, queue) = pollster::block_on(request_adapter_and_device(
                 backends,
                 &instance,

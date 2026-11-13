@@ -21,7 +21,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Unsigned unless a signing config is supplied; CI signs nothing.
+            // CI signs the release APK with the fixed key via platform/android/sign.sh.
         }
     }
 

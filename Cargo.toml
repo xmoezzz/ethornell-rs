@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/game-network",
   "crates/ethornell-core",
   "crates/ethornell-archive",
   "crates/ethornell-image",
@@ -36,10 +37,9 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 byteorder = "1"
 encoding_rs = "0.8"
-# Backends are chosen per target in the crates: dx12/metal natively, WebGL2
-# on the web (ruffle's newer wgpu owns the WebGPU bindings there; linking
-# both makes wasm-bindgen reject the duplicate WebGPU enums).
-wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
+# Native renderers and Flash share one wgpu generation. Target crates select
+# native backends or browser WebGL2/WebGPU without duplicate WebGPU bindings.
+wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl"] }
 winit = "0.31.0-beta.3"
 kira = "0.8"
 pollster = "0.3"

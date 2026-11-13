@@ -224,10 +224,26 @@ fn configured_game_id(manager: &ResourceManager) -> (String, &'static str) {
 
     (DEFAULT_GAME_ID.into(), "fallback")
 }
-fn confirmed_native_profile(
-    manager: &ResourceManager,
-    bootstrap: &[u8],
-) -> ethornell_vm::NativeAbiProfile {
+#[derive(Clone, Copy)]
+struct NativeRuntimeProfile {
+    abi: ethornell_vm::NativeAbiProfile,
+    se_channels: usize,
+    main_code_bytes: u32,
+    main_data_bytes: u32,
+}
+
+impl Default for NativeRuntimeProfile {
+    fn default() -> Self {
+        Self {
+            abi: ethornell_vm::NativeAbiProfile::Tayutama,
+            se_channels: 64,
+            main_code_bytes: 0x80000,
+            main_data_bytes: 0x40000,
+        }
+    }
+}
+
+fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
     // Session version detection uses two exact code-resource fingerprints,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
@@ -237,15 +253,40 @@ fn confirmed_native_profile(
             (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
         })
     }
-    if bootstrap.len() == 10176 && fingerprint(bootstrap) == CONFIRMED_BOOTSTRAP_FNV {
+    let amachoco = NativeRuntimeProfile {
+        abi: ethornell_vm::NativeAbiProfile::Amachoco,
+        ..NativeRuntimeProfile::default()
+    };
+    let expected_title = match (bootstrap.len(), fingerprint(bootstrap)) {
+        (10176, CONFIRMED_BOOTSTRAP_FNV) => {
+            Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV, amachoco))
+        }
+        // Japanese retail release, system.arc dated 2019-12-10.
+        (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a, amachoco)),
+        // Houkago Cinderella FD's validator sub_4A6C30 accepts SE 0..128.
+        // Its other new selectors remain unaudited; do not reuse Amachoco ABI.
+        (12608, 0x46f725982b5b8cd6) => Some((
+            20608,
+            0x603c84fe0ba8bc49,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        _ => None,
+    };
+    if let Some((title_len, title_hash, profile)) = expected_title {
         if let Ok(title) = manager.read_decoded_from_archive("sysprg.arc", "title._bp") {
-            if title.len() == CONFIRMED_TITLE_LEN && fingerprint(&title) == CONFIRMED_TITLE_FNV {
-                return ethornell_vm::NativeAbiProfile::Amachoco;
+            if title.len() == title_len && fingerprint(&title) == title_hash {
+                return profile;
             }
         }
     }
-    ethornell_vm::NativeAbiProfile::Tayutama
+    NativeRuntimeProfile::default()
 }
+
 const CONFIRMED_BOOTSTRAP_FNV: u64 = 0x9f5e9248ec3ad577;
 const CONFIRMED_TITLE_FNV: u64 = 0xc6bdd0d97d4f4893;
 const CONFIRMED_TITLE_LEN: usize = 26272;
@@ -1026,22 +1067,22 @@ struct RuntimeTraceApi {
     /// Independent BGM fade envelope selected by A0:18/A0:19 (target record +0x40).
     bgm_fade_volumes: [u8; 16],
     /// Target SE gain bank set by A0:09 (dword_55EE18 / sub_4A2DF0).
-    sound_primary_volumes: [u8; 64],
+    sound_primary_volumes: Vec<u8>,
     /// Target SE gain bank set by A0:2C (sub_4A2890).
-    sound_secondary_volumes: [u8; 64],
+    sound_secondary_volumes: Vec<u8>,
     /// Per-SE play volume selected by A0:24 (target record +0x28).
-    sound_play_volumes: [u8; 64],
+    sound_play_volumes: Vec<u8>,
     /// Independent SE fade envelope selected by A0:26 (target record +0x40).
-    sound_fade_volumes: [u8; 64],
+    sound_fade_volumes: Vec<u8>,
     /// GetTickCount-domain clock and the two independent sound envelopes.
     native_sound_tick: u32,
     bgm_play_ramps: [Option<NativeSoundRamp>; 16],
     bgm_fade_ramps: [Option<NativeSoundRamp>; 16],
-    sound_fade_ramps: [Option<NativeSoundRamp>; 64],
+    sound_fade_ramps: Vec<Option<NativeSoundRamp>>,
     bgm_channel_active: [bool; 16],
-    sound_channel_active: [bool; 64],
+    sound_channel_active: Vec<bool>,
     bgm_playback_clocks: [NativeAudioClock; 16],
-    sound_playback_clocks: [NativeAudioClock; 64],
+    sound_playback_clocks: Vec<NativeAudioClock>,
     /// Target A0:80-86 CD-audio device. On portable hosts this is backed by
     /// actual decoded track assets rather than an inert unsupported stub.
     native_cd_audio: NativeCdAudioState,
@@ -1440,18 +1481,18 @@ impl RuntimeTraceApi {
             bgm_secondary_volumes: [128; 16],
             bgm_play_volumes: [128; 16],
             bgm_fade_volumes: [128; 16],
-            sound_primary_volumes: [128; 64],
-            sound_secondary_volumes: [128; 64],
-            sound_play_volumes: [128; 64],
-            sound_fade_volumes: [128; 64],
+            sound_primary_volumes: vec![128; 64],
+            sound_secondary_volumes: vec![128; 64],
+            sound_play_volumes: vec![128; 64],
+            sound_fade_volumes: vec![128; 64],
             native_sound_tick: 0,
             bgm_play_ramps: [None; 16],
             bgm_fade_ramps: [None; 16],
-            sound_fade_ramps: [None; 64],
+            sound_fade_ramps: vec![None; 64],
             bgm_channel_active: [false; 16],
-            sound_channel_active: [false; 64],
+            sound_channel_active: vec![false; 64],
             bgm_playback_clocks: [NativeAudioClock::default(); 16],
-            sound_playback_clocks: [NativeAudioClock::default(); 64],
+            sound_playback_clocks: vec![NativeAudioClock::default(); 64],
             native_cd_audio: NativeCdAudioState::default(),
             audio_requests: VecDeque::new(),
             movie_audio_sent: BTreeMap::new(),
@@ -5591,6 +5632,9 @@ impl RuntimeTraceApi {
         if let Some(mode) = self.graph90_sprite_mode(object) {
             // CDspObjSprite::GetProperty (sub_4288F0).
             match parameter {
+                // Houkago FD 42E330 -> 42D8E0: the stored primary bitmap
+                // at object+0x160, without mode or bitmap-existence checks.
+                0x10 => return Ok(vec![properties.format_resource.unwrap_or(-1)]),
                 0x41 => {
                     let rotation = properties.properties.get(&0x41).map(|pair| pair.0);
                     return match mode {
@@ -7445,9 +7489,10 @@ impl RuntimeTraceApi {
         let source_image = crop_decoded_image(self.graph_images.get(&source_key)?, source_region);
         let composite_key = format!("runtime:bitmap:{destination}");
 
-        let mut destination_image = if let Some(image) = self.graph_images.get(&composite_key) {
-            image.clone()
-        } else if let Some((key, region)) = self
+        // A load or region rebind can replace this slot while its previous
+        // runtime image is still cached. Only the slot's current backing is
+        // authoritative; otherwise old expression pixels survive a reload.
+        let mut destination_image = if let Some((key, region)) = self
             .resource_image_region(destination)
             .map(|(key, region)| (key.to_string(), region))
         {
@@ -9515,14 +9560,20 @@ impl RuntimeEngine {
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
-        let mut vm = ethornell_vm::Vm::new();
-        vm.set_native_abi_profile(confirmed_native_profile(&manager, bytes));
+        let profile = confirmed_native_profile(&manager, bytes);
+        let mut vm = ethornell_vm::Vm::with_main_thread_regions(
+            profile.main_code_bytes,
+            profile.main_data_bytes,
+            4096,
+        );
+        vm.set_native_abi_profile(profile.abi);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
             vm,
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
+                api.configure_native_sound_channels(profile.se_channels);
                 api.native_dialog_presentation = native_dialog_presentation;
                 api
             },
@@ -12004,6 +12055,57 @@ mod input_tests {
     }
 
     #[test]
+    fn reloading_a_bitmap_before_blitting_discards_the_previous_expression() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let skin = [240, 200, 160, 255];
+        let first_face = [0, 0, 0, 255];
+        let next_face = [0, 0, 0, 255];
+        for (name, pixels) in [
+            ("body", vec![skin, skin, skin]),
+            ("face1", vec![first_face, [0; 4], [0; 4]]),
+            ("face2", vec![[0; 4], next_face, [0; 4]]),
+        ] {
+            let key = format!("test:{name}");
+            api.store_graph_image(
+                key.clone(),
+                DecodedImage {
+                    width: 3,
+                    height: 1,
+                    rgba: pixels.into_iter().flatten().collect(),
+                },
+            );
+            api.graph_image_formats.insert(key, 2);
+        }
+        let (destination, source) = (7, 8);
+        for face in ["face1", "face2"] {
+            assert!(api.load_graph_image_resource(destination, "test", "body"));
+            assert!(api.load_graph_image_resource(source, "test", face));
+            call_graph(
+                &mut api,
+                0x90,
+                0x18,
+                &mut vec![
+                    Value::Int(destination),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(source),
+                    Value::Int(1),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            [skin, next_face, skin].concat(),
+            "transparent parts of the new expression must reveal the reloaded body",
+        );
+        assert_eq!(api.graph_images["test:body"].rgba, skin.repeat(3));
+    }
+
+    #[test]
     fn synchronous_load_window_follows_sub_402080() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -14347,10 +14449,13 @@ mod input_tests {
         let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut vec![]).unwrap() else {
             panic!()
         };
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![-1]));
         let mut configure = [sprite, 10, 20, 501, 1, 32, 123].map(Value::Int).to_vec();
         call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![501]));
         let mut property = [sprite, 0x10, 502, -999].map(Value::Int).to_vec();
         call_graph(&mut api, 0x90, 0x38, &mut property).unwrap();
+        assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![502]));
         assert!(property.is_empty());
         let layer = &api.graph_layers[&sprite];
         assert_eq!(
@@ -14377,6 +14482,7 @@ mod input_tests {
                 .insert("target-object-mode".into(), mode);
             let mut ignored = [sprite, 0x10, -1, 0].map(Value::Int).to_vec();
             call_graph(&mut api, 0x90, 0x38, &mut ignored).unwrap();
+            assert_eq!(api.graph91_object_get_property(sprite, 0x10, 0), Ok(vec![502]));
             assert_eq!(
                 api.graph_object_properties[&sprite].format_resource,
                 Some(502)
@@ -16548,6 +16654,57 @@ mod input_tests {
                 rgb: 0xffffff,
                 concentration: 192,
             }))
+        );
+    }
+
+    #[test]
+    fn empty_styled_message_wait_preserves_the_already_drawn_text_style() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = message_window(&mut api);
+        api.surface_text_states.entry(window).or_default().font_size = 28;
+        // Draw a coloured sentence with a black edge, then install a wait
+        // with no new text and different colours (FTL scrmsg's two 92:90s).
+        let mut message = [
+            window, 0, 0x88ccff, 1, 0x88ccff, 1, 2, 5, 5, 0, 192, 1, 0, 1, 1,
+        ]
+        .map(Value::Int)
+        .to_vec();
+        message[1] = Value::Str("A completed sentence.".into());
+        call_graph(&mut api, 0x92, 0x90, &mut message).unwrap();
+        api.tick_text(10_000);
+        let node = api.text_runtime.target_node.unwrap();
+        let before = api.text_nodes[&node].clone();
+        let shadow = api.text_node_shadow(&before);
+
+        let mut wait = [
+            window, 0, 0xffffff, 1, 0xffffff, 1, 2, 5, 5, 0x88ccff, 192, 1, 0, 1, 1,
+        ]
+        .map(Value::Int)
+        .to_vec();
+        wait[1] = Value::Str(String::new());
+        call_graph(&mut api, 0x92, 0x90, &mut wait).unwrap();
+        api.tick_text(10_000);
+
+        let after = &api.text_nodes[&node];
+        assert_eq!(after.text, before.text);
+        assert_eq!(
+            after.color, before.color,
+            "a wait must not recolour committed glyphs"
+        );
+        assert_eq!(
+            api.text_node_shadow(after),
+            shadow,
+            "a wait must not replace the black edge"
+        );
+        assert_eq!(
+            api.system92_text_colour, 0xffffff,
+            "the native colour query still observes the wait's colour"
+        );
+        assert!(
+            api.native_message_active,
+            "the empty call must still install the message wait"
         );
     }
 
@@ -21954,7 +22111,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         if file_policy::restricted() {
             return Some("bgi-resource\\".into());
         }
-        Some(self.native_root.to_string_lossy().into_owned())
+        Some(user_files::script_game_root(&self.native_root))
     }
 
     fn directory_exists(&mut self, path: &str) -> bool {
@@ -21966,12 +22123,8 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             return result;
         }
-        let normalized = path.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let candidate = Path::new(&normalized);
-        let path = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.native_root.join(candidate)
+        let Some(path) = runtime_file_path_from_root(&self.manager, &self.native_root, path) else {
+            return false;
         };
         let exists = path.is_dir();
         tracing::debug!(path = %path.display(), exists, "DirectoryExists");
@@ -27677,6 +27830,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let int = |index: usize| value_to_i32(&args[index]);
                     self.set_message_text_style(
                         target,
+                        text.as_deref().unwrap_or_default(),
                         int(8),
                         [int(4), int(3), int(2), int(1), int(0)],
                     );
@@ -27796,6 +27950,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let int = |index: usize| value_to_i32(&args[index]);
                     self.set_message_text_style(
                         target,
+                        text.as_deref().unwrap_or_default(),
                         int(12),
                         [int(8), int(7), int(6), int(5), int(4)],
                     );
@@ -29147,7 +29302,7 @@ fn native_audio_panning(value: i32) -> f64 {
     f64::from(value.clamp(0, 128)) / 128.0
 }
 
-fn set_sound_channel_active(active: &mut [bool; 64], channel: i32, value: bool) {
+fn set_sound_channel_active(active: &mut [bool], channel: i32, value: bool) {
     if let Some(slot) = usize::try_from(channel)
         .ok()
         .and_then(|index| active.get_mut(index))

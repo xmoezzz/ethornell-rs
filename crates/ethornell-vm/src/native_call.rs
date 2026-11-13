@@ -5148,7 +5148,7 @@ pub mod opcodes {
     ///
     /// # Port
     ///
-    /// Audit status: deferred (ADR 0003). Deferred (ADR 0004 file layer): the port reads the whole file through the resource loader into memory; write modes are not modelled.
+    /// Audit status: deferred (ADR 0003). The port buffers streams in memory; write modes create/truncate or preserve user files through SysApi. Worker requests complete synchronously; native asynchronous scheduling remains deferred (ADR 0004).
     pub const SYS81_OPEN_RESOURCE_STREAM: NativeOpcode = NativeOpcode {
         group: 0x81,
         id: 0x28,
@@ -5174,16 +5174,16 @@ pub mod opcodes {
     ///
     /// # Port
     ///
-    /// Audit status: deferred (ADR 0003). Deferred: worker sub_4014D0 unrecovered; the port closes synchronously.
+    /// Audit status: deferred (ADR 0003). The port closes synchronously with completion 1; an unknown handle returns queue status 4 without changing status_out. Native asynchronous scheduling remains deferred.
     pub const SYS81_QUEUE_RESOURCE_CLOSE: NativeOpcode = NativeOpcode {
         group: 0x81,
         id: 0x29,
     };
     /// `81:2A` — `Sys81_2A_QueueResourceRead`, BGI 1.622 handler `sub_48C3E0`.
     ///
-    /// Queue a read from an asynchronous stream.
+    /// Queue a transfer on an asynchronous stream (mode 0 reads; modes 1/2 write).
     ///
-    /// sub_401400 appends a read request (op 0, buffer, length) to the worker list and zeroes \*status_out; the worker fills the buffer and writes its result later.
+    /// sub_401400 queues op 0. sub_4014D0 selects ReadFile or WriteFile by the open mode, completes with the byte count, and maps zero bytes or failure to -1. A null buffer requests a seek.
     ///
     /// # ABI
     ///
@@ -5191,10 +5191,10 @@ pub mod opcodes {
     ///
     /// | # | Name | Type | Meaning | Range |
     /// |---|---|---|---|---|
-    /// | 0 | `status_out` | ptr->i32 or 0 | Zeroed at queue time; completion value written by the worker (unrecovered). | writable, 4 bytes, or null |
+    /// | 0 | `status_out` | ptr->i32 or 0 | Zeroed at queue time; completion byte count, or -1 for zero bytes/failure. | writable, 4 bytes, or null |
     /// | 1 | `handle` | u32 | Stream handle from 81:28. | any |
-    /// | 2 | `destination` | ptr->u8\[length\] | Receives the bytes. | writable, length bytes |
-    /// | 3 | `length` | u32 | Bytes to read. | any |
+    /// | 2 | `destination` | ptr->u8\[length\] | Receives read bytes or supplies write bytes; null requests a seek. | length bytes |
+    /// | 3 | `length` | u32 | Bytes to transfer (or the seek offset for a null buffer). | any |
     ///
     /// Returns: i32: 0 queued, 4 unknown handle.
     ///
@@ -5202,7 +5202,7 @@ pub mod opcodes {
     ///
     /// # Port
     ///
-    /// Audit status: deferred (ADR 0003). Deferred: the port reads synchronously from an in-memory copy and writes the byte count to status_out.
+    /// Audit status: deferred (ADR 0003). The port transfers synchronously through an in-memory stream; writes persist through SysApi and failures complete with -1. Native asynchronous scheduling remains deferred.
     pub const SYS81_QUEUE_RESOURCE_READ: NativeOpcode = NativeOpcode {
         group: 0x81,
         id: 0x2A,
@@ -5211,7 +5211,7 @@ pub mod opcodes {
     ///
     /// Queue a request at an offset on an asynchronous stream.
     ///
-    /// sub_401400 queues op 0 with a null buffer and the offset in the length field, and zeroes \*status_out; the worker's handling (presumably a seek) is unrecovered.
+    /// sub_401400 queues op 0 with a null buffer and the offset in the length field, and zeroes \*status_out; sub_4014D0 seeks to that absolute offset, treats UINT_MAX as EOF, rejects past EOF and completes with 1 or -1.
     ///
     /// # ABI
     ///
@@ -5229,7 +5229,7 @@ pub mod opcodes {
     ///
     /// # Port
     ///
-    /// Audit status: deferred (ADR 0003). Deferred: the port sets the cursor synchronously and writes it to status_out.
+    /// Audit status: deferred (ADR 0003). The port seeks synchronously and writes completion 1 or -1 to status_out. Native asynchronous scheduling remains deferred.
     pub const SYS81_QUEUE_RESOURCE_SEEK: NativeOpcode = NativeOpcode {
         group: 0x81,
         id: 0x2B,

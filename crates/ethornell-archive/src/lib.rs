@@ -841,9 +841,9 @@ fn build_resource_lookup(
 }
 
 fn archive_name_key(name: &str) -> String {
-    Path::new(name)
-        .file_name()
-        .and_then(|name| name.to_str())
+    // Scripts use Windows separators even when the host is Unix.
+    name.rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
         .unwrap_or(name)
         .to_ascii_lowercase()
 }
@@ -2228,6 +2228,26 @@ mod tests {
                 .archive_path,
             PathBuf::from("game/data05000.arc")
         );
+    }
+
+    #[test]
+    fn composite_archive_members_accept_windows_paths_on_every_host() {
+        let manager = manager_over(&[
+            ("Archive/data01000.arc", &["main"]),
+            ("Archive/data02100.arc", &["body", "face"]),
+        ]);
+        assert!(manager.register_composite_archive(
+            "data01xxx.arc",
+            vec!["Archive\\DATA01000.ARC".into()],
+        ));
+        assert!(manager.register_composite_archive(
+            "data02xxx.arc",
+            vec!["Archive\\data02100.arc".into()],
+        ));
+        assert!(manager.find_in_archive("data01xxx.arc", "Main").is_some());
+        assert!(manager.find_in_archive("data02xxx.arc", "face").is_some());
+        assert!(manager.first_in_archive("Archive\\data01000.arc").is_some());
+        assert!(manager.first_in_archive("data02xxx.arc").is_some());
     }
 
     #[test]

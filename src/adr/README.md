@@ -12,6 +12,7 @@ transcripts or re-running IDA.
 | [0003](0003-selector-exactness-audit.md) | Every native selector matches BGI 1.622 exactly | In progress |
 | [0004](0004-windows-filesystem-emulation.md) | Non-Windows hosts emulate the Windows filesystem namespace | Proposed |
 | [0005](0005-vm-value-model.md) | The VM uses BGI 1.622's value and address model | In progress |
+| [0006](0006-houkago-fd-runtime-limits.md) | Houkago Cinderella FD runtime limits | Startup limits verified; remaining differences open |
 
 Template: `# NNNN. Title`, then **Status**, **Context**, **Decision**,
 **Consequences**, and (while open) **Progress / next step**.

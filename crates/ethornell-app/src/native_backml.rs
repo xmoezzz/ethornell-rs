@@ -80,8 +80,21 @@ impl RuntimeTraceApi {
             if !matches!(sf, 1 | 2) {
                 continue;
             }
-            let advance =
-                |delta: i32| ((i64::from(delta) * i64::from(progress as u32)) >> 24) as i32;
+            // Houkago FD sub_423EB1: 0x8E selects a separate source-motion
+            // curve. Older records multiply unsigned 8.24 progress directly.
+            let advance = |delta: i32| match record.source_curve {
+                Some(curve) => {
+                    // sub_420463's default is signed truncating division,
+                    // including curve zero and unknown curve selectors.
+                    let weight = if (1..=15).contains(&curve) {
+                        crate::animation::target_curve_fixed_16(curve, progress)
+                    } else {
+                        progress / 256
+                    };
+                    ((i64::from(delta) * i64::from(weight)) >> 16) as i32
+                }
+                None => ((i64::from(delta) * i64::from(progress as u32)) >> 24) as i32,
+            };
             let source_x = record.source_x.wrapping_add(advance(record.source_delta_x));
             let source_y = record.source_y.wrapping_add(advance(record.source_delta_y));
             let angle_curve = crate::animation::target_curve_fixed_16(record.auxiliary_a, progress);
@@ -266,6 +279,9 @@ impl RuntimeTraceApi {
                 record.scale_delta_x = value;
                 record.scale_delta_y = extra;
             }
+            // sub_423C60 -> sub_423A80: one field of the selected layer;
+            // the extra operand is ignored; other transform fields are kept.
+            0x8e => record.source_curve = Some(value),
             0x8f => {
                 record.auxiliary_a = value;
                 record.auxiliary_b = extra;
@@ -290,6 +306,73 @@ impl RuntimeTraceApi {
 mod tests {
     use super::*;
     use ethornell_vm::{GraphApi, NativeCallFrame, NativeOpcode, Value};
+    #[test]
+    fn backml_source_curve_changes_pixels_and_only_updates_the_selected_layer() {
+        let manager = ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        api.screen_width = 2;
+        api.screen_height = 2;
+        let call = |api: &mut RuntimeTraceApi, g, id, args: &[i32]| {
+            GraphApi::call_graph(
+                api,
+                &mut NativeCallFrame::new(
+                    NativeOpcode { group: g, id },
+                    args.iter().copied().map(Value::Int).collect(),
+                ),
+            )
+            .unwrap()
+        };
+        api.store_runtime_bitmap(
+            100,
+            DecodedImage {
+                width: 8,
+                height: 8,
+                rgba: (0..64).flat_map(|i| [i * 3, 0, 0, 0]).collect(),
+            },
+            1,
+        );
+        call(&mut api, 0x90, 0x4c, &[1, 1]);
+        call(&mut api, 0x91, 0x40, &[0, 0, 100, 0, 0, 0, 65536, 65536, 0]);
+        call(&mut api, 0x91, 0x49, &[0, 4 * 65536, 4 * 65536]);
+        call(&mut api, 0x90, 0x35, &[0, 128]);
+        let first_pixel = |api: &RuntimeTraceApi| api.graph_images["runtime:backml:0"].rgba[0];
+        assert_eq!(
+            first_pixel(&api),
+            54,
+            "legacy half-progress samples source (2,2)"
+        );
+        call(&mut api, 0x90, 0x38, &[0, 0x8e, 4, 123]);
+        assert_eq!(
+            first_pixel(&api),
+            27,
+            "quadratic half-progress samples source (1,1)"
+        );
+        call(&mut api, 0x90, 0x38, &[0, 0x8e, 0, -1]);
+        assert_eq!(
+            first_pixel(&api),
+            54,
+            "curve zero is linear; extra is ignored"
+        );
+        call(&mut api, 0x90, 0x38, &[0, 0x8e, 999, 0]);
+        assert_eq!(
+            first_pixel(&api),
+            54,
+            "unknown selectors use the same linear fallback"
+        );
+        call(&mut api, 0x91, 0x46, &[1, 100, 0, 0]);
+        call(&mut api, 0x91, 0x47, &[1, 90 * 65536, 65536, 65536, 0]);
+        call(&mut api, 0x91, 0x41, &[1]);
+        call(&mut api, 0x90, 0x38, &[0, 0x8f, 2, 3]);
+        let mut expected = api.graph91_multilayer_background.layers[1];
+        expected.source_curve = Some(5);
+        call(&mut api, 0x90, 0x38, &[0, 0x8e, 5, 999]);
+        assert_eq!(api.graph91_multilayer_background.layers[1], expected);
+        assert_eq!(
+            api.graph91_multilayer_background.layers[0].source_curve,
+            Some(999)
+        );
+    }
+
     #[test]
     fn backml_fixed_source_motion_selected_alpha_and_private_blend_execute() {
         let manager = ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();

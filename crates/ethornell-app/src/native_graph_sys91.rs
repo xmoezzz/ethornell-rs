@@ -40,6 +40,8 @@ pub(super) struct Graph91MultiLayerRecord {
     pub rotation: i32,
     pub scale_x: i32,
     pub scale_y: i32,
+    /// Newer BackML property 0x8E. None retains the older linear 8.24 path.
+    pub source_curve: Option<i32>,
     pub auxiliary_a: i32,
     pub auxiliary_b: i32,
     pub source_delta_x: i32,
@@ -66,6 +68,7 @@ impl Default for Graph91MultiLayerRecord {
             rotation: 0,
             scale_x: 0x1_0000,
             scale_y: 0x1_0000,
+            source_curve: None,
             auxiliary_a: 0,
             auxiliary_b: 0,
             source_delta_x: 0,

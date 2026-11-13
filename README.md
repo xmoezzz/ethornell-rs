@@ -30,7 +30,7 @@ The runtime detects the native game identifier from the comparison in
 `Tayutama2TV`. For example:
 
 ```sh
-cargo run -p ethornell-cli -- run --game /path/to/sun_flower
+cargo run -p ethornell-cli -- run --game /path/to/game
 ```
 
 `--game` locates the resource archives, loose files, and user data.
@@ -49,22 +49,17 @@ including the Android and iOS apps and the console ports.
 The window uses the game's icon from `icon.png`, an `.ico` file, or the icon
 resources embedded in its Windows executable, in that order.
 
-On PC (desktop and headless), display text defaults to **Auto**: at startup
-the engine samples BCS scenario strings once to choose Shift-JIS (`cp932`) or
-GBK (`cp936`). It does not detect each line. Short or inconclusive samples fall
-back to Shift-JIS. Override with
-`--text-encoding gbk` (or `cp932` / `auto`), for example:
+For a GBK Chinese translation, also set `ETHORNELL_TEXT_ENCODING=gbk`.
+The default is Shift-JIS (`cp932`). It does not change the encoding of resource names or BP system strings.
 
-```sh
-ethornell run --game /path/to/game --text-encoding auto
-```
 
-`ETHORNELL_TEXT_ENCODING=auto|cp932|gbk` is also supported on desktop/headless;
-the command-line choice takes priority. This selects graphics text buffers,
-including dialogue and speaker names. Resource names and BP system strings
-keep their existing Shift-JIS encoding. Auto selects one display code page for
-the session; it does not select a different encoding for each file.
+## Claims
+<p align="center">
+  <img src="icon/crysirror.svg" width="160" height="160" alt="CrySirror logo">
+</p>
 
-Auto detection is compiled only for PC builds. iOS, Android, Web, Vita and
-Switch retain their existing explicit/fixed encoding configuration and do not
-scan scenario resources for encoding detection.
+This project belongs to `CrySirror` [project](https://github.com/xmoezzz/CrySirror), which is a unified engine backend for visual novels and 3D games. 
+
+1. Bug fixes and improvements for the original Ethornell / BURIKO General Interpreter (a.k.a. "BGI") engine is acceptable in this repository. 
+
+2. If you want to support a new platform (e.g. game console), please create an issue or pull request in the `CrySirror` repository instead of this one. 

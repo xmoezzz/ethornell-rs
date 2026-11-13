@@ -7,6 +7,20 @@ const OWNED_A0_IDS: &[u16] = &[
 ];
 
 impl RuntimeTraceApi {
+    /// Session bootstrap selects the verified engine's bank size. All SE
+    /// state, including clocks and fades, must cover the same channel range.
+    pub(super) fn configure_native_sound_channels(&mut self, channels: usize) {
+        self.sound_primary_volumes.resize(channels, 128);
+        self.sound_secondary_volumes.resize(channels, 128);
+        self.sound_play_volumes.resize(channels, 128);
+        self.sound_fade_volumes.resize(channels, 128);
+        self.sound_fade_ramps.resize(channels, None);
+        self.sound_channel_active.resize(channels, false);
+        self.sound_playback_clocks
+            .resize(channels, NativeAudioClock::default());
+        tracing::debug!(channels, "configured native SE channel count");
+    }
+
     pub(super) fn dispatch_native_sound(
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
@@ -20,9 +34,11 @@ impl RuntimeTraceApi {
         // BGI 1.622 sub_4984C0/498510/498560/4985B0 validate as
         // unsigned, even when no buffer is loaded. Parameter checks precede
         // channel checks (and consume no output values on failure).
+        // Houkago FD sub_4A6C30 raises the SE limit to 128; all SE banks
+        // are sized together from the verified session profile.
         let channel_limit = match id {
             0x08 | 0x14 | 0x16 | 0x17 | 0x18 | 0x19 | 0x1C => Some(16),
-            0x09 | 0x22 | 0x24 | 0x25 | 0x26 | 0x2C | 0x2F => Some(64),
+            0x09 | 0x22 | 0x24 | 0x25 | 0x26 | 0x2C | 0x2F => Some(self.sound_primary_volumes.len()),
             _ => None,
         };
         if let Some(limit) = channel_limit {
@@ -46,7 +62,7 @@ impl RuntimeTraceApi {
                     return Some(Err(ethornell_vm::VmError::Runtime(message)));
                 }
             }
-            if channel as u32 >= limit {
+            if channel as u32 as usize >= limit {
                 // sub_4985B0 (BGM, 16) / sub_4984C0 (SE, 64).
                 let message = if limit == 16 {
                     format!("無効な音楽チャンネル番号 [ {channel} ] が指定されました")
@@ -287,7 +303,7 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel)
+                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
                     .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
@@ -307,7 +323,7 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel)
+                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
                     .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
@@ -349,7 +365,7 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel)
+                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
                     .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
@@ -416,7 +432,7 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel)
+                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
                     .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
@@ -443,7 +459,7 @@ impl RuntimeTraceApi {
                 let descriptor = pop_int_value(stack).unwrap_or_default();
                 let source = stack.pop();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if let Err(error) = target_checks::se_channel(channel) {
+                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len()) {
                     return Some(Err(error));
                 }
                 let valid = source.is_some();
@@ -987,7 +1003,7 @@ impl RuntimeTraceApi {
         decode_gain: f64,
         playback_rate: f64,
     ) -> bool {
-        if !(0..64).contains(&channel) || block.len() < 64 {
+        if target_checks::se_channel(channel, self.sound_primary_volumes.len()).is_err() || block.len() < 64 {
             return false;
         }
         self.sound_slots.insert(
@@ -1131,7 +1147,7 @@ impl RuntimeTraceApi {
                 self.apply_native_bgm_volume(channel as i32);
             }
         }
-        for channel in 0..64 {
+        for channel in 0..self.sound_primary_volumes.len() {
             if !self.sound_slots.contains_key(&(channel as i32)) {
                 continue;
             }
@@ -1401,18 +1417,15 @@ fn set_bgm_channel_active(active: &mut [bool; 16], channel: i32, value: bool) {
     }
 }
 
-fn native_clock<const N: usize>(
-    clocks: &[NativeAudioClock; N],
-    channel: i32,
-) -> Option<NativeAudioClock> {
+fn native_clock(clocks: &[NativeAudioClock], channel: i32) -> Option<NativeAudioClock> {
     usize::try_from(channel)
         .ok()
         .and_then(|index| clocks.get(index))
         .copied()
 }
 
-fn native_clock_mut<const N: usize>(
-    clocks: &mut [NativeAudioClock; N],
+fn native_clock_mut(
+    clocks: &mut [NativeAudioClock],
     channel: i32,
 ) -> Option<&mut NativeAudioClock> {
     usize::try_from(channel)
@@ -1495,6 +1508,63 @@ mod tests {
         assert!(
             error.contains("パンポット"),
             "parameter validation must precede channel validation: {error}"
+        );
+    }
+
+    #[test]
+    fn extended_se_bank_loads_plays_fades_and_releases_upper_channels() {
+        let mut api = api_with_resident_channel();
+        let block = api.sound_slots[&3].asset.bytes.clone();
+        assert!(!api.register_native_sound_memory(78, &block, 0, 1.0, 1.0));
+        api.configure_native_sound_channels(128);
+        for channel in [64, 78, 80, 127] {
+            sound_call(&mut api, 0x09, &[channel, 96]).unwrap();
+            sound_call(&mut api, 0x2C, &[channel, 128]).unwrap();
+            assert_eq!(api.sound_primary_volumes[channel as usize], 96);
+            assert!(api.register_native_sound_memory(channel, &block, 0, 1.0, 1.0));
+            api.audio_requests.clear();
+            assert_eq!(
+                sound_call(&mut api, 0x24, &[channel, 100, 64]).unwrap(),
+                Value::Int(1000)
+            );
+            assert!(api.sound_channel_active[channel as usize]);
+            assert!(api.audio_requests.iter().any(|command| matches!(
+                command, AudioCommand::Play { channel: output, .. } if *output == 0x100 + channel
+            )));
+            sound_call(&mut api, 0x26, &[channel, 100]).unwrap();
+            api.advance_audio_clocks(50);
+            assert_eq!(api.sound_fade_volumes[channel as usize], 64);
+            sound_call(&mut api, 0x25, &[channel]).unwrap();
+            assert!(!api.sound_channel_active[channel as usize]);
+            assert_eq!(
+                sound_call(&mut api, 0x2F, &[channel]).unwrap(),
+                Value::Int(1000)
+            );
+            sound_call(&mut api, 0x22, &[channel]).unwrap();
+            assert!(!api.sound_slots.contains_key(&channel));
+        }
+        for channel in [-1, 128] {
+            assert!(!api.register_native_sound_memory(channel, &block, 0, 1.0, 1.0));
+            for (id, rest) in [
+                (0x09, vec![128]),
+                (0x22, vec![]),
+                (0x24, vec![128, 64]),
+                (0x25, vec![]),
+                (0x26, vec![100]),
+                (0x2C, vec![128]),
+                (0x2F, vec![]),
+            ] {
+                let mut args = vec![channel];
+                args.extend(rest);
+                assert!(
+                    sound_call(&mut api, id, &args).is_err(),
+                    "A0:{id:02X} {args:?}"
+                );
+            }
+        }
+        assert!(
+            sound_call(&mut api, 0x08, &[16, 128]).is_err(),
+            "BGM remains limited to 16"
         );
     }
 

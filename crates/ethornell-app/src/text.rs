@@ -1110,10 +1110,22 @@ impl RuntimeTraceApi {
         state
     }
 
-    /// Records the colour and style a 92:90/92:91 call gives the text it
-    /// draws in `target`.
-    pub(crate) fn set_message_text_style(&mut self, target: i32, packed_rgb: i32, style: [i32; 5]) {
+    /// Records the colour and style of the new text a 92:90/92:91 call draws
+    /// in `target`. An empty message wait leaves committed glyphs unchanged.
+    pub(crate) fn set_message_text_style(
+        &mut self,
+        target: i32,
+        text: &str,
+        packed_rgb: i32,
+        style: [i32; 5],
+    ) {
         self.system92_text_colour = packed_rgb;
+        // 92:90 also installs a message wait for an empty string. The target
+        // has already blitted the previous glyph records into the window;
+        // this call's colours cannot repaint them (sub_435290/sub_437940).
+        if text.is_empty() {
+            return;
+        }
         let font_size = self.window_text_state(Some(target)).font_size.round() as i32;
         self.surface_text_states
             .entry(target)
