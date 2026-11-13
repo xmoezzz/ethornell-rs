@@ -9835,8 +9835,16 @@ impl RuntimeEngine {
         // rule. Do not replay missed VM frames after a delayed redraw.
         self.api.advance_audio_clocks(audio_elapsed_ms);
         if self.api.native_user.has_blocking_message() {
+            // A native MessageBox suspends the host loop. The last VM report
+            // can still describe an unrelated bitmap procedure installed in
+            // that pass; it is not the reason this frame makes no progress.
+            let last_report = self.last_report.clone().map(|mut report| {
+                report.steps = 0;
+                report.stop_reason = ethornell_vm::VmStopReason::WaitingForHost;
+                report
+            });
             return RuntimeFrameReport {
-                last_report: self.last_report.clone(),
+                last_report,
                 total_steps: 0,
                 scheduler_passes: 0,
                 yields: 0,
