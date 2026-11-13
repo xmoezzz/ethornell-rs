@@ -3733,6 +3733,26 @@ impl RuntimeTraceApi {
         true
     }
 
+    /// BGI 1.652 Sys81:0E (0x494B70 -> 0x467430) reads the initialized
+    /// adapter dimensions, not an unavailable `(0, 0)` display. Hosted mobile
+    /// and web sessions use their full-screen surface; a CPU/headless session
+    /// uses the native canvas as its virtual display until a host supplies one.
+    /// Returning zero makes scripts exhaust their resolution choices and can
+    /// select an unrelated legacy mode. Do not constrain Sys80:60 mode changes.
+    fn available_display_size(&self) -> (u32, u32) {
+        match self.desktop_display_size {
+            (width, height) if width > 0 && height > 0 => (width, height),
+            _ if self.window_surface_width > 0 && self.window_surface_height > 0 => (
+                self.window_surface_width as u32,
+                self.window_surface_height as u32,
+            ),
+            _ => (
+                self.screen_width.max(1) as u32,
+                self.screen_height.max(1) as u32,
+            ),
+        }
+    }
+
     /// sub_45EDE0: mode 2 falls back to 0 when the adjusted desktop
     /// (sub_45EAE0(.., 1)) is narrower or lower than the display mode.
     pub(crate) fn effective_fullscreen_scale_mode(&self) -> i32 {
@@ -3740,7 +3760,7 @@ impl RuntimeTraceApi {
         if mode != 2 {
             return mode;
         }
-        let (mut width, mut height) = self.desktop_display_size;
+        let (mut width, mut height) = self.available_display_size();
         if height != 0 && 4u32.wrapping_mul(width) / height >= 10 {
             width >>= 1;
         }
@@ -22499,13 +22519,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     /// spanned dual monitor) against the display mode's size, both as
     /// (int)(10000.0 * w / h) in double precision.
     fn display_aspect_mismatch(&mut self) -> bool {
-        let (mut width, mut height) = match self.desktop_display_size {
-            (0, _) | (_, 0) => (
-                self.window_surface_width.max(0) as u32,
-                self.window_surface_height.max(0) as u32,
-            ),
-            size => size,
-        };
+        let (mut width, mut height) = self.available_display_size();
         let (mode_width, mode_height) = self.display_mode_size();
         if width == 0 || height == 0 || mode_width <= 0 || mode_height <= 0 {
             return false;
@@ -22586,7 +22600,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn desktop_display_size(&mut self) -> (u32, u32) {
-        self.desktop_display_size
+        self.available_display_size()
     }
 
     fn fullscreen_scale_mode(&mut self) -> i32 {
