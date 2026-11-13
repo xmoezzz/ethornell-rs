@@ -1246,6 +1246,9 @@ struct RuntimeTraceApi {
     /// dword_566778 / dword_56677C: the last left/right press went to a Knob.
     left_press_captured: bool,
     right_press_captured: bool,
+    /// Keep icon ownership until physical release, even if activation replaces
+    /// the input processor or the per-tick pending edge has been drained.
+    graph_icon_press_consumed: bool,
     /// IsIconic(hWndParent), refreshed by the window frontend.
     window_iconic: bool,
     /// dword_566708: set by Sys80:65, cleared when the window is activated
@@ -1639,6 +1642,7 @@ impl RuntimeTraceApi {
             window_focused: true,
             left_press_captured: false,
             right_press_captured: false,
+            graph_icon_press_consumed: false,
             window_iconic: false,
             window_minimize_latch: false,
             window_center_lock: 0,
@@ -19846,6 +19850,33 @@ mod input_tests {
             [0; 3],
             "base DCIPIcon must not synthesize DCIPIconEx 0x10000006/07 events"
         );
+
+        // The activated button may replace its processor before the host
+        // delivers UP. Per-tick consumption must not lose gesture ownership.
+        api.finish_native_tick_input();
+        api.graph_input_objects.remove(&77);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 21.0, y: 31.0 },
+        );
+        assert!(api.pending_input_consumed);
+        assert_eq!(api.pending_click, None);
+        assert!(!api.mouse_pressed);
+        assert!(!api.input_physically_held.contains(&super::INPUT_DESCRIPTOR_MOUSE_LEFT));
+        assert!(!api.input_down_descriptors.contains(&super::INPUT_DESCRIPTOR_MOUSE_LEFT));
+        assert_eq!(SysApi::read_input_state(&mut api, super::INPUT_DESCRIPTOR_MOUSE_LEFT), 0);
+
+        api.finish_native_tick_input();
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 200.0, y: 200.0 },
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 200.0, y: 200.0 },
+        );
+        assert!(!api.pending_input_consumed);
+        assert_eq!(api.pending_click, Some((200.0, 200.0)));
     }
 
     #[test]
@@ -20602,6 +20633,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             api.pending_input_state = Some(0x1000_0002);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
             api.pending_input_consumed = false;
+            api.graph_icon_press_consumed = false;
             // WM_LBUTTONDOWN: a Knob under the pointer (sub_463CE0) captures
             // the press and only the activation accumulator moves
             // (sub_46E080); otherwise the record takes the press
@@ -20618,6 +20650,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             } {
                 // DCIPIcon participates in the same native input-descriptor
                 // drain as CProcDspMsg. Preserve that one-owner consumption.
+                api.graph_icon_press_consumed = true;
                 api.pending_input_consumed = true;
             }
             push_runtime_window_message(api, 0x0201, pack_window_message_point(x, y), 1);
@@ -20633,17 +20666,21 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             let point = Some((x, y));
             api.mouse_pos = point;
             api.mouse_pressed = false;
+            let icon_press_consumed = std::mem::take(&mut api.graph_icon_press_consumed);
             let knob_consumed = api.process_graph_knob_mouse_release((x, y));
             let graph_input_consumed = if knob_consumed {
                 true
             } else {
                 api.process_graph_input_mouse_release((x, y))
             };
+            // Run deferred icon release handling before combining ownership:
+            // an immediately activated icon may already have closed its UI.
+            let graph_input_consumed = graph_input_consumed || icon_press_consumed;
             api.pending_click = if graph_input_consumed { None } else { point };
             api.pending_click_age_frames = 0;
             api.pending_input_state = Some(0x1000_0006);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
-            // A captured Knob or release-triggered DCIPIconEx item consumes the
+            // A captured Knob or press/release-triggered icon consumes the
             // complete physical gesture. Do not expose it to CProcDspMsg as a
             // second "advance text" action.
             api.pending_input_consumed = graph_input_consumed;
