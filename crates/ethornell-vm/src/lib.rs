@@ -2638,6 +2638,7 @@ impl Vm {
             ..Self::default()
         };
         vm.thread.set_thread_id(MAIN_THREAD_ID);
+        vm.sync_region_reservations(0);
         vm
     }
 
@@ -2652,6 +2653,7 @@ impl Vm {
     ) -> Self {
         let mut vm = Self::new();
         vm.thread.set_region_sizes(code_bytes, data_bytes, operand_slots);
+        vm.sync_region_reservations(0);
         vm
     }
 
@@ -3257,12 +3259,13 @@ impl Vm {
             BpOpcode::Known { code: 0x11, .. } => {
                 let previous = self.mem_ptr;
                 let next = self.pop_int()? as u32;
-                // sub_4738A0: the new frame pointer must stay below the data
-                // region limit.
-                if next >= self.thread.data_region_size() {
+                // sub_4738A0 -> sub_444C40: SP is owner-relative, so a
+                // child's bound is base + length. The owner must also stop
+                // before blocks reserved for its children.
+                let limit = self.data_region_limit();
+                if next >= limit {
                     return Err(VmError::Runtime(format!(
-                        "store_base: SP 0x{next:08X} outside the {}-byte data region",
-                        self.thread.data_region_size()
+                        "store_base: SP 0x{next:08X} outside data region ending at 0x{limit:08X}"
                     )));
                 }
                 if next > previous {
@@ -18980,6 +18983,74 @@ mod tests {
         }
         assert!(vm.halted, "{report:?}");
         assert_eq!(report.stop_reason, VmStopReason::InterpreterTerminated, "{report:?}");
+    }
+
+    #[test]
+    fn frame_updates_use_the_child_block_end_not_its_length() {
+        let program = ethornell_script::parse_bp_program(Some("frame-owner._bp".into()), &[0x17]);
+        let mut owner = Vm::new();
+        owner.start(&program);
+        owner.start_child_thread(16, 0x100, 0x100, 0, false).unwrap();
+        let mut task = owner.async_tasks.remove(0);
+        super::child_thread::lend_local_window(&mut owner, &mut task.vm);
+        let child = &mut task.vm;
+        let base = child.mem_ptr;
+        assert_eq!(base, 0x3ff00);
+        let store = test_instruction(0, 0x11, "store_base", vec![0x11], Vec::new());
+        for next in [base + 184, 0x3ffff, base] {
+            child.stack.push(Value::Int(next as i32));
+            child.dispatch(&store, &mut TraceApi).unwrap();
+            assert_eq!(child.mem_ptr, next);
+        }
+        for rejected in [0x40000, u32::MAX] {
+            child.stack.push(Value::Int(rejected as i32));
+            assert!(child.dispatch(&store, &mut TraceApi).is_err());
+            assert_eq!(child.mem_ptr, base, "a failed update must preserve SP");
+        }
+        super::child_thread::lend_local_window(&mut owner, &mut task.vm);
+    }
+
+    #[test]
+    fn frame_updates_cannot_enter_a_reserved_child_block() {
+        let program = ethornell_script::parse_bp_program(Some("frame-owner._bp".into()), &[0x17]);
+        let mut owner = Vm::new();
+        owner.start(&program);
+        owner.start_child_thread(16, 0x100, 0x100, 0, false).unwrap();
+        let limit = 0x3ff00;
+        owner.write_int(crate::FRAME_SEGMENT | limit, 2, 0x12345678).unwrap();
+        let store = test_instruction(0, 0x11, "store_base", vec![0x11], Vec::new());
+        owner.stack.push(Value::Int(limit as i32 - 1));
+        owner.dispatch(&store, &mut TraceApi).unwrap();
+        for rejected in [limit, limit + 184, 0x40000, u32::MAX] {
+            owner.stack.push(Value::Int(rejected as i32));
+            assert!(owner.dispatch(&store, &mut TraceApi).is_err());
+            assert_eq!(owner.mem_ptr, limit - 1);
+            assert_eq!(owner.read_int(crate::FRAME_SEGMENT | limit, 2).unwrap(), 0x12345678);
+        }
+    }
+
+    #[test]
+    fn frame_limits_are_initialized_before_direct_dispatch_and_after_resizing() {
+        let store = test_instruction(0, 0x11, "store_base", vec![0x11], Vec::new());
+        let mut default = Vm::new();
+        default.stack.push(Value::Int(184));
+        default.dispatch(&store, &mut TraceApi).unwrap();
+        assert_eq!(default.mem_ptr, 184);
+        for size in [0x100, 0x80000] {
+            let mut vm = Vm::with_main_thread_regions(0x80000, size, 16);
+            vm.stack.push(Value::Int(size as i32 - 1));
+            vm.dispatch(&store, &mut TraceApi).unwrap();
+            vm.stack.push(Value::Int(size as i32));
+            assert!(vm.dispatch(&store, &mut TraceApi).is_err());
+            assert_eq!(vm.mem_ptr, size - 1);
+        }
+        let program = ethornell_script::parse_bp_program(Some("frame-worker._bp".into()), &[0x17]);
+        default.start_async_program_with_args(Value::Program(Arc::new(program)), Vec::new(), false).unwrap();
+        default.set_newest_async_thread_regions(0x100, 0x80, 16);
+        let worker = &mut default.async_tasks.last_mut().unwrap().vm;
+        worker.stack.push(Value::Int(0x80));
+        assert!(worker.dispatch(&store, &mut TraceApi).is_err());
+        assert_eq!(worker.mem_ptr, 0);
     }
 
     #[test]
