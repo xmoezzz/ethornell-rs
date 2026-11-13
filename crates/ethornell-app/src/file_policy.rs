@@ -1092,6 +1092,56 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
+    fn native_userdata_directory_queries_follow_private_saves_across_reopen() {
+        use ethornell_vm::{SysApi, NativeCallFrame, NativeOpcode, Value};
+        let (base, policy) = roots("userdata-reopen");
+        let make_api = |policy: &FilePolicy| {
+            let mut api = super::super::RuntimeTraceApi::new_with_native_root(
+                policy.open_manager().unwrap(), policy.resource.clone());
+            api.host.enabled = true;
+            api
+        };
+        let query = |api: &mut super::super::RuntimeTraceApi, path: &str| {
+            api.call_sys(&mut NativeCallFrame::new(NativeOpcode { group: 0x80, id: 0x2a },
+                vec![Value::Str(path.into())])).unwrap()
+        };
+        let mut api = make_api(&policy);
+        scope(&policy, || {
+            assert_eq!(query(&mut api, "bgi-resource\\UserData"), Value::Int(0));
+            let result = api.call_sys(&mut NativeCallFrame::new(
+                NativeOpcode { group: 0x80, id: 0x28 },
+                vec![Value::Str("bgi-resource\\UserData".into())])).unwrap();
+            assert_eq!(result, Value::Int(1));
+            assert_eq!(query(&mut api, "bgi-resource\\UserData"), Value::Int(1));
+            assert!(api.write_file_bytes("bgi-resource\\UserData/slot.sud", b"session save"));
+        });
+        drop(api);
+        let reopened = FilePolicy::new(&policy.resource, &policy.user).unwrap();
+        let mut api = make_api(&reopened);
+        scope(&reopened, || {
+            for path in ["UserData", "bgi-user\\userdata", "bgi-resource\\USERDATA"] {
+                assert_eq!(query(&mut api, path), Value::Int(1), "{path}");
+                assert!(api.directory_exists(path));
+                assert!(api.probe_directory_writable(path));
+                let attrs = api.call_sys(&mut NativeCallFrame::new(
+                    NativeOpcode { group: 0x80, id: 0x2c },
+                    vec![Value::Str(path.into())])).unwrap();
+                assert_eq!(attrs, Value::Int(0x10));
+            }
+            let attrs = api.call_sys(&mut NativeCallFrame::new(
+                NativeOpcode { group: 0x80, id: 0x2c },
+                vec![Value::Str("bgi-resource\\UserData/slot.sud".into())])).unwrap();
+            assert_eq!(attrs, Value::Int(0x20));
+            assert_eq!(api.read_user_file_bytes("bgi-resource\\UserData/slot.sud").unwrap(), b"session save");
+            assert!(!api.write_file_bytes("bgi-resource/story.arc", b"denied"));
+        });
+        assert!(!policy.resource.join("UserData").exists());
+        assert_eq!(std::fs::read(policy.user.join("UserData/slot.sud")).unwrap(), b"session save");
+        drop(api);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn install_global_database_uses_private_storage_without_importing_original_data() {
         use ethornell_vm::SysApi;
         let (base, p) = roots("global-database");

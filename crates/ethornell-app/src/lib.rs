@@ -24182,14 +24182,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0x2a) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                if let Some(policy) = file_policy::active() {
-                    return Ok(ethornell_vm::Value::Int(i32::from(
-                        policy.metadata(&path).is_some_and(|m| m.is_dir()),
-                    )));
-                }
-                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
-                    .map(|path| path.is_dir())
-                    .unwrap_or(false);
+                // Match validated user-root checks (80:68) and directory
+                // creation: resource/UserData is a private storage alias.
+                let exists = ethornell_vm::SysApi::directory_exists(self, &path);
                 tracing::info!(path, exists, "DirectoryExists");
                 return Ok(ethornell_vm::Value::Int(i32::from(exists)));
             }
@@ -29879,7 +29874,7 @@ fn windows_wildcard_matches(pattern: &str, value: &str) -> bool {
 fn runtime_file_attributes(manager: &ResourceManager, file: &str) -> i32 {
     if let Some(policy) = file_policy::active() {
         return policy
-            .metadata(file)
+            .user_metadata(file)
             .map(|m| (if m.readonly() { 1 } else { 0 }) | if m.is_dir() { 0x10 } else { 0x20 })
             .unwrap_or(-1);
     }
