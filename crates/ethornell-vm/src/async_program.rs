@@ -27,6 +27,7 @@ impl Vm {
     pub(crate) fn set_newest_async_thread_regions(&mut self, code: u32, data: u32, slots: u32) {
         if let Some(task) = self.async_tasks.last_mut() {
             task.vm.thread.set_region_sizes(code, data, slots);
+            task.vm.sync_region_reservations(task.vm.active_code_used_end());
         }
     }
 
