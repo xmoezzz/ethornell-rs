@@ -20,14 +20,14 @@ impl Vm {
             );
             return Ok(1);
         };
-        let clipped = clip_sjis_c_string(&text, max_len);
-        self.write_c_string(dst, &clipped)?;
+        let clipped = self.bounded_native_string_bytes(&text, max_len.saturating_sub(1));
+        self.write_c_string_native_bytes(dst, &clipped)?;
         tracing::info!(
             dst = format_args!("0x{dst:08X}"),
             max_len,
             key,
             default = default_text,
-            result = clipped,
+            result = self.decode_native_string_lossy(&clipped),
             "ReadProfileString"
         );
         Ok(0)
@@ -60,25 +60,6 @@ fn resolve_profile_default(key: &str, default_text: &str) -> Option<String> {
         _ if default_text.is_empty() => None,
         _ => Some(default_text.to_string()),
     }
-}
-
-fn clip_sjis_c_string(text: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let mut buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut buf);
-        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode(encoded);
-        if used + sjis.len() >= max_len {
-            break;
-        }
-        used += sjis.len();
-        out.push(ch);
-    }
-    out
 }
 
 fn value_label(value: &Value) -> String {
