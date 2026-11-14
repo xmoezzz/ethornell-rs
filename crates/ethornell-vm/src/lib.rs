@@ -6997,6 +6997,7 @@ impl Vm {
             && matches!((opcode.group, opcode.id), (0x81, 0x00..=0x03) | (0x91, 0x05 | 0x09..=0x0a) | (0x92, 0x0e | 0x95 | 0x99))
         { return true; }
         if matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) && (opcode.group, opcode.id) == (0x92, 0x0f) { return true; }
+        if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) && (opcode.group, opcode.id) == (0x81, 0x21) { return true; }
         native_call::is_strictly_supported(opcode)
     }
 
@@ -7565,7 +7566,11 @@ impl Vm {
     }
 
     fn pop_int(&mut self) -> VmResult<i32> {
-        Ok(self.pop_value()?.as_i32())
+        // A host String shadows a native char pointer, not the integer zero.
+        // In particular modern BP tests string-table entries against NULL
+        // before loading bitmaps. Use the same materialization as arithmetic.
+        let value = self.pop_value()?;
+        self.value_as_numeric_operand(value)
     }
 
     fn pop_ptr(&mut self) -> VmResult<u32> {
@@ -7586,11 +7591,7 @@ impl Vm {
                         return Ok(ptr as i32);
                     }
                 }
-                let byte_len = encoding_rs::SHIFT_JIS
-                    .encode(&text)
-                    .0
-                    .len()
-                    .saturating_add(1);
+                let byte_len = self.encode_native_string(&text).len().saturating_add(1);
                 let ptr = self.alloc_heap(byte_len.min(u32::MAX as usize) as u32);
                 if ptr == 0 {
                     return Err(VmError::Runtime(

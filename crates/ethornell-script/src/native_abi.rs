@@ -125,6 +125,9 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
             // FD native 49F1E0 / 4956F0 and the matching later tables.
             (0x81, 0x00) | (0x81, 0x02) | (0x91, 0x09) => (1, 1),
             (0x81, 0x01) | (0x81, 0x03) => (0, 1),
+            // The CP932 -> UTF-8 conversion retains two pops and no result
+            // across ESchoolLife's pre-fused and later native tables.
+            (0x81, 0x21) => (2, 0),
             (0x91, 0x05) => (4, 1),
             (0x91, 0x0a) => (2, 1),
             (0x92, 0x0e) => (3, 0),

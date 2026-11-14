@@ -1,7 +1,7 @@
-//! Detect the display code page from BCS text, without feeding binary code or
+//! Detect the display encoding from BCS text, without feeding binary code or
 //! the Japanese BP framework to the detector. Explicit settings take priority.
 use chardetng::EncodingDetector;
-use encoding_rs::{Encoding, GBK, SHIFT_JIS};
+use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8};
 use ethornell_archive::ResourceManager;
 use std::collections::BTreeSet;
 
@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 pub enum TextEncoding {
     ShiftJis,
     Gbk,
+    Utf8,
     #[default]
     Auto,
 }
@@ -22,8 +23,9 @@ impl std::str::FromStr for TextEncoding {
             "auto" => Ok(Self::Auto),
             "shift_jis" | "shift-jis" | "sjis" | "cp932" => Ok(Self::ShiftJis),
             "gbk" | "cp936" | "windows-936" => Ok(Self::Gbk),
+            "utf8" | "utf-8" => Ok(Self::Utf8),
             _ => Err(format!(
-                "unsupported text encoding {label:?}; use auto, cp932 or gbk"
+                "unsupported text encoding {label:?}; use auto, cp932, gbk or utf8"
             )),
         }
     }
@@ -37,6 +39,7 @@ impl TextEncoding {
                 Self::Auto => "auto",
                 Self::ShiftJis => "cp932",
                 Self::Gbk => "gbk",
+                Self::Utf8 => "utf8",
             }),
         )
     }
@@ -54,6 +57,7 @@ pub(crate) fn select(manager: &ResourceManager, label: Option<&str>) -> &'static
         let encoding = match label.trim().to_ascii_lowercase().as_str() {
             "gbk" | "cp936" | "windows-936" => Some(GBK),
             "shift_jis" | "shift-jis" | "sjis" | "cp932" => Some(SHIFT_JIS),
+            "utf8" | "utf-8" => Some(UTF_8),
             "" | "auto" => None,
             _ => {
                 tracing::warn!(%label, "unsupported ETHORNELL_TEXT_ENCODING; detecting the text encoding");
@@ -167,6 +171,12 @@ fn append_scenario_text(bytes: &[u8], sample: &mut Vec<u8>) {
 }
 
 fn detect_sample(sample: &[u8]) -> &'static Encoding {
+    // Localized BCS may be mostly ASCII with only a few UTF-8 quotation
+    // marks. Do not require the legacy detector's 64 non-ASCII byte minimum
+    // before recognizing an otherwise fully valid Unicode sample.
+    if !sample.is_ascii() && std::str::from_utf8(sample).is_ok() {
+        return UTF_8;
+    }
     if sample.iter().filter(|byte| **byte >= 0x80).count() < MIN_NON_ASCII_BYTES {
         return SHIFT_JIS;
     }
@@ -244,13 +254,25 @@ mod tests {
 
     #[test]
     fn detects_chinese_and_japanese_from_original_scenario_bytes() {
-        for (text, expected) in [(CHINESE, GBK), (JAPANESE, SHIFT_JIS)] {
+        for (text, expected) in [
+            (CHINESE, GBK),
+            (JAPANESE, SHIFT_JIS),
+            ("“You HAVE to hear this!”…", UTF_8),
+        ] {
             let bytes = scenario(&text.repeat(8), expected);
             let mut sample = Vec::new();
             append_scenario_text(&bytes, &mut sample);
             assert_eq!(detect_sample(&sample), expected);
             assert!(!sample.contains(&0));
         }
+    }
+
+    #[test]
+    fn recognizes_sparse_utf8_punctuation_without_reinterpreting_legacy_bytes() {
+        assert_eq!(detect_sample("You HAVE to hear this!…".as_bytes()), UTF_8);
+        assert_eq!(detect_sample(b"Only ASCII dialogue"), SHIFT_JIS);
+        assert_eq!(detect_sample(&SHIFT_JIS.encode(JAPANESE).0), SHIFT_JIS);
+        assert_eq!(detect_sample(&GBK.encode(&CHINESE.repeat(8)).0), GBK);
     }
 
     #[test]
@@ -283,13 +305,15 @@ mod tests {
         ] {
             assert_eq!(label.parse::<TextEncoding>(), Ok(choice));
         }
-        assert!("utf8".parse::<TextEncoding>().is_err());
+        assert_eq!("utf8".parse::<TextEncoding>(), Ok(TextEncoding::Utf8));
+        assert_eq!("utf-8".parse::<TextEncoding>(), Ok(TextEncoding::Utf8));
         let game = GameFixture::new();
         game.archive("scenario.arc", "scene", &scenario(&CHINESE.repeat(8), GBK));
         let manager = game.manager();
         assert_eq!(TextEncoding::Auto.resolve(&manager), GBK);
         assert_eq!(TextEncoding::ShiftJis.resolve(&manager), SHIFT_JIS);
         assert_eq!(TextEncoding::Gbk.resolve(&manager), GBK);
+        assert_eq!(TextEncoding::Utf8.resolve(&manager), UTF_8);
     }
 
     #[test]

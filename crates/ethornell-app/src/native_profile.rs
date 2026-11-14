@@ -10,6 +10,7 @@ struct Capabilities {
     modern_tags: bool,
     fused_bp: bool,
     legacy_graph_extensions: bool,
+    legacy_utf8_strings: bool,
 }
 
 struct Executable<'a> {
@@ -165,6 +166,32 @@ impl<'a> Executable<'a> {
             })
     }
 
+    fn legacy_utf8_strings(&self) -> bool {
+        if self.width != 4 { return false; }
+        // ESchoolLife 1.683: 81:00 -> 494970 -> 49E510. Identify the
+        // original CP932/UTF-8 selector independently of translated IPL/title
+        // bytes and of unrelated Graph91 additions in the same release.
+        self.tables(
+            &[0, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 0x20, 0x21, 0x27, 0x28, 0x30, 0x60, 0x62, 0x68],
+            &[5, 0x12, 0x13, 0x15, 0x1a, 0x1c, 0x22, 0x23, 0x24, 0x25, 0x26],
+        ).iter().any(|table| {
+            let calls = self.calls(table[0]);
+            let Some(code) = calls.get(1).and_then(|&call| self.follow_thunks(call)) else { return false };
+            let code = &code[..code.len().min(80)];
+            let stores: Vec<(u32, u32)> = code.windows(10).filter_map(|bytes| {
+                (bytes[..2] == [0xc7, 0x05]).then(|| (
+                    u32::from_le_bytes(bytes[2..6].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[6..10].try_into().unwrap()),
+                ))
+            }).collect();
+            stores.iter().any(|&(address, value)| value == 65001 && stores.contains(&(address, 932)))
+                && stores.iter().any(|&(address, value)| value == 1 && stores.contains(&(address, 0)))
+                && code.windows(3).any(|bytes| bytes == [0x83, 0xe9, 1])
+                && code.windows(3).any(|bytes| bytes == [0x33, 0xc0, 0xc3])
+                && code.windows(5).any(|bytes| bytes == [0xb8, 1, 0, 0, 0])
+        })
+    }
+
     fn display_modes(&self) -> Option<[(i32,i32);16]> {
         // 1.687 heights[16] at 1401CB780, widths[16] at 1401CB7C0.
         // Discover their values rather than treating later size IDs as aliases
@@ -303,6 +330,7 @@ fn inspect_image(bytes: &[u8]) -> Option<Capabilities> {
         modern_tags,
         fused_bp: tables.iter().any(|t| [0xd4,0xd5,0xd6,0xd7,0xd8,0xda,0xdb,0xdc,0xdd,0xde,0xdf,0xf4,0xf5,0xfa,0xfb].iter().all(|&i| exe.code(t[i]).is_some())),
         legacy_graph_extensions: exe.legacy_graph_extensions(),
+        legacy_utf8_strings: exe.legacy_utf8_strings(),
     })
 }
 
@@ -400,6 +428,9 @@ pub(super) fn apply(manager: &ResourceManager, profile: &mut NativeRuntimeProfil
     if caps.legacy_graph_extensions && profile.abi == ethornell_vm::NativeAbiProfile::Tayutama {
         profile.abi = ethornell_vm::NativeAbiProfile::Anipani;
     }
+    if caps.legacy_utf8_strings && profile.abi == ethornell_vm::NativeAbiProfile::Tayutama {
+        profile.abi = ethornell_vm::NativeAbiProfile::Amachoco;
+    }
     if caps.modern_tags {
         profile.abi = if caps.fused_bp { ethornell_vm::NativeAbiProfile::ModernFused } else { ethornell_vm::NativeAbiProfile::Modern };
         profile.modern_gradient_blur = true;
@@ -415,5 +446,14 @@ mod tests {
     fn rejects_non_pe_and_truncated_executables() {
         assert_eq!(inspect(b"MZ"), None);
         assert_eq!(inspect(&[0; 1024]), None);
+    }
+
+    #[test]
+    #[ignore = "requires ETHORNELL_NATIVE_TEST_SOURCE pointing to an authorized ESchoolLife executable"]
+    fn legacy_utf8_profile_does_not_require_original_bootstrap_bytes() {
+        let bytes = std::fs::read(std::env::var_os("ETHORNELL_NATIVE_TEST_SOURCE").unwrap()).unwrap();
+        let caps = inspect(&bytes).expect("native runtime configuration");
+        assert!(caps.legacy_utf8_strings);
+        assert!(!caps.modern_tags);
     }
 }
