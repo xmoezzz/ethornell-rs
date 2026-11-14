@@ -26265,7 +26265,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x03) => {
                 // sub_479F60 -> sub_439C80: a new DCCache of `limit` bytes
-                // (0 drops it); more than 0x20000000 is fatal.
+                // (the SDK applies its resident-memory cap; 0 drops it); more than 0x20000000 is fatal.
                 let limit = pop_int_value(stack).unwrap_or_default() as u32;
                 if limit > 0x2000_0000 {
                     return Err(ethornell_vm::VmError::Runtime(format!(
