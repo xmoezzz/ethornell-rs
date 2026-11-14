@@ -275,6 +275,24 @@ pub(crate) fn compose_runtime_frame(api: &RuntimeTraceApi, include_text: bool) -
     compose_runtime_frame_through_priority(api, include_text, None)
 }
 
+/// DCTraditionalVR clears its video surface and presents samples independently
+/// of the display tree. No scene objects/text are evaluated on this path.
+pub(crate) fn compose_global_movie_frame(api: &RuntimeTraceApi) -> DecodedImage {
+    let (width, height) = runtime_frame_size(api);
+    let Some(mut out) = new_raster(width, height) else {
+        return DecodedImage { width: 0, height: 0, rgba: Vec::new() };
+    };
+    for pixel in out.rgba.as_chunks_mut::<4>().0 {
+        *pixel = [0, 0, 0, 255];
+    }
+    if let Some(item) = api.directshow_movie_draw_item()
+        && let Some(source) = api.graph_images.get(&item.key)
+    {
+        composite_runtime_item(&mut out, source, &item);
+    }
+    out
+}
+
 pub(crate) fn compose_runtime_frame_with_diagnostics(
     api: &RuntimeTraceApi,
     include_text: bool,
