@@ -153,8 +153,9 @@ use user_files::{
 #[cfg(feature = "desktop-window")]
 use winit::keyboard::KeyCode;
 #[cfg(not(feature = "desktop-window"))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyCode {
+    Escape,
     ArrowLeft,
     ArrowUp,
     ArrowRight,
