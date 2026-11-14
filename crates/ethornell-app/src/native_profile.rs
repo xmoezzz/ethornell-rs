@@ -6,7 +6,9 @@ use super::*;
 struct Capabilities {
     regions: Option<(u32, u32)>,
     sound: Option<usize>,
+    display_modes: Option<[(i32,i32);16]>,
     modern_tags: bool,
+    fused_bp: bool,
     legacy_graph_extensions: bool,
 }
 
@@ -163,6 +165,23 @@ impl<'a> Executable<'a> {
             })
     }
 
+    fn display_modes(&self) -> Option<[(i32,i32);16]> {
+        // 1.687 heights[16] at 1401CB780, widths[16] at 1401CB7C0.
+        // Discover their values rather than treating later size IDs as aliases
+        // for old modes. Both prefixes and all sixteen dimensions must agree.
+        for section in self.pe.section_headers() {
+            if section.Characteristics & 0x20000000 != 0 {continue;}
+            let Ok(bytes)=self.pe.get_section_bytes(section) else {continue};
+            for data in bytes.windows(128).step_by(4) {
+                let word=|i:usize|i32::from_le_bytes(data[i*4..i*4+4].try_into().unwrap());
+                if (0..5).any(|i|word(i)!=[240,480,600,768,576][i] || word(16+i)!=[320,640,800,1024,1024][i]) {continue;}
+                let sizes=std::array::from_fn(|i|(word(16+i),word(i)));
+                if sizes.iter().all(|&(w,h)|(1..=16384).contains(&w)&&(1..=16384).contains(&h)) {return Some(sizes);}
+            }
+        }
+        None
+    }
+
     fn regions(&self) -> Option<(u32, u32)> {
         let mut found = None;
         for section in self
@@ -218,7 +237,7 @@ impl<'a> Executable<'a> {
     }
 }
 
-fn inspect(bytes: &[u8]) -> Option<Capabilities> {
+fn inspect_image(bytes: &[u8]) -> Option<Capabilities> {
     let pe = pelite::PeFile::from_bytes(bytes).ok()?;
     if pe.section_headers().as_slice().len() > 96
         || pe
@@ -280,9 +299,32 @@ fn inspect(bytes: &[u8]) -> Option<Capabilities> {
     Some(Capabilities {
         regions: exe.regions(),
         sound: bound,
+        display_modes: exe.display_modes(),
         modern_tags,
+        fused_bp: tables.iter().any(|t| [0xd4,0xd5,0xd6,0xd7,0xd8,0xda,0xdb,0xdc,0xdd,0xde,0xdf,0xf4,0xf5,0xfa,0xfb].iter().all(|&i| exe.code(t[i]).is_some())),
         legacy_graph_extensions: exe.legacy_graph_extensions(),
     })
+}
+
+// The 32-bit launcher in Triple Pairing 1.687 embeds the complete x64
+// Ethornell PE at file offset 0x48000. Inspect it as data, never load it.
+// Require the same version-resource identity and verified dispatch shapes
+// as a standalone engine; an arbitrary MZ sequence is not a native profile.
+fn inspect(bytes: &[u8]) -> Option<Capabilities> {
+    let mut detected = inspect_image(bytes);
+    let mut candidates = 0;
+    for (offset, magic) in bytes.windows(2).enumerate().skip(1) {
+        if magic != b"MZ" || offset % 16 != 0 { continue; }
+        let nested = &bytes[offset..];
+        let Some(pe_offset) = nested.get(0x3c..0x40).and_then(|s| <[u8;4]>::try_from(s).ok()).map(u32::from_le_bytes) else { continue };
+        if nested.get(pe_offset as usize..).and_then(|s| s.get(..4)) != Some(b"PE\0\0") { continue; }
+        candidates += 1;
+        if candidates > 8 { return None; }
+        let Some(caps) = inspect_image(nested) else { continue };
+        if detected.is_some_and(|old| old != caps) { return None; }
+        detected = Some(caps);
+    }
+    detected
 }
 
 pub(super) fn apply(manager: &ResourceManager, profile: &mut NativeRuntimeProfile) {
@@ -354,11 +396,12 @@ pub(super) fn apply(manager: &ResourceManager, profile: &mut NativeRuntimeProfil
         profile.se_channels = channels;
     }
     profile.modern_pointer_tags = caps.modern_tags;
+    profile.display_modes = caps.display_modes;
     if caps.legacy_graph_extensions && profile.abi == ethornell_vm::NativeAbiProfile::Tayutama {
         profile.abi = ethornell_vm::NativeAbiProfile::Anipani;
     }
     if caps.modern_tags {
-        profile.abi = ethornell_vm::NativeAbiProfile::Modern;
+        profile.abi = if caps.fused_bp { ethornell_vm::NativeAbiProfile::ModernFused } else { ethornell_vm::NativeAbiProfile::Modern };
         profile.modern_gradient_blur = true;
     }
     tracing::info!(?caps, "read native runtime configuration");

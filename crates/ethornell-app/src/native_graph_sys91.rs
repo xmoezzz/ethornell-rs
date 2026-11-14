@@ -299,6 +299,13 @@ impl RuntimeTraceApi {
         let id = call.id();
         let stack = call.args_mut();
         let value = match id {
+            0x00 => {
+                // ESchoolLife 48A560 -> 46AAB0; Triple Pairing 1400E3200
+                // -> 1400B6190. Preserve the integer, not just its low bit.
+                self.graph_force_present = pop_int_value(stack).unwrap_or_default();
+                ethornell_vm::Value::None
+            }
+
             // The VM owns the BP source pointer and performs the exact copy.
             0x03 => {
                 unreachable!("0x91:03 is handled by the VM binary-cache pointer bridge")
@@ -1245,7 +1252,7 @@ impl RuntimeTraceApi {
                 // property. Wonderful Everyday's boot script (a different BGI)
                 // sets 0x80000004 and carries on in the original: an unknown
                 // property is ignored.
-                if matches!(property, 0 | 0x8000_0000 | 0x8000_0001 | 0x8000_0002) {
+                if matches!(property, 0 | 0x8000_0000 | 0x8000_0001 | 0x8000_0002 | 0x8000_0009) {
                     if property == 0x8000_0001 && value < 0 {
                         return Some(Err(ethornell_vm::VmError::Runtime(format!(
                             "無効なファンクションパラメータ [ {value} ] が指定されました"
@@ -1872,7 +1879,7 @@ impl RuntimeTraceApi {
         Some(Ok(value))
     }
 
-    fn graph91_set_object_suppressed(&mut self, object: i32, suppressed: bool) {
+    pub(super) fn graph91_set_object_suppressed(&mut self, object: i32, suppressed: bool) {
         if !self.graph_handle_exists(object) {
             return;
         }

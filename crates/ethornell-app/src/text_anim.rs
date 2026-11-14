@@ -40,6 +40,8 @@ pub(crate) struct RuntimeTextStyle {
     pub(crate) packed_rgb: Option<u32>,
     pub(crate) bold: bool,
     pub(crate) italic: bool,
+    pub(crate) font_size: Option<i32>,
+    pub(crate) width_power: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +87,8 @@ pub(crate) struct ParsedMessageMarkup {
     pub(crate) style_spans: Vec<RuntimeTextStyleSpan>,
     pub(crate) link_spans: Vec<RuntimeLinkSpan>,
     pub(crate) timeline: Vec<RuntimeTimelineMark>,
+    /// (character boundary, set rather than maximize, font height).
+    pub(crate) line_metrics: Vec<(usize,bool,i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,8 +446,8 @@ pub(crate) fn parse_message_markup_styled(text: &str) -> ParsedMessageMarkup {
 /// Target tag names in `sub_435290` comparison order. Index 0 is compared
 /// exactly; the rest are prefix matches, so `ruby` precedes `r` and `cr`
 /// precedes `c`.
-const TARGET_TAGS: [&str; 15] = [
-    "/", "b", "/b", "i", "/i", "ruby", "r", "/r", "cr", "c", "/c", "l", "/l", "t", "ev",
+const TARGET_TAGS: [&str; 20] = [
+    "/", "b", "/b", "i", "/i", "ruby", "r", "/r", "cr", "c", "/c", "l", "/l", "t", "ev", "2x", "/2x", "fs", "/fs", "mxfs",
 ];
 
 /// `sub_437E40` keeps at most sixteen 128-byte records, each holding a text
@@ -527,12 +531,16 @@ pub(crate) fn parse_message_markup_with(
     registry: &mut RubyRegistry,
     link_color: Option<u32>,
 ) -> ParsedMessageMarkup {
+    parse_message_markup_with_version(text,registry,link_color,false)
+}
+
+pub(crate) fn parse_message_markup_with_version(text:&str,registry:&mut RubyRegistry,link_color:Option<u32>,modern:bool)->ParsedMessageMarkup {
     let mut parser = MarkupParser::new(text);
-    parser.run(registry, link_color);
-    parser.finish()
+    parser.modern=modern;parser.run(registry,link_color);parser.finish()
 }
 
 struct MarkupParser<'t> {
+    modern:bool,
     text: &'t str,
     chars: Vec<char>,
     byte_offsets: Vec<usize>,
@@ -541,6 +549,7 @@ struct MarkupParser<'t> {
     style: RuntimeTextStyle,
     /// Shared by `<c>` and `<l>` (target `v158`/`v167`).
     color_stack: Vec<Option<u32>>,
+    font_size_stack: Vec<Option<i32>>,
     open_ruby: Option<OpenRuby>,
     open_link: Option<OpenLink>,
     ruby_skip_until: usize,
@@ -553,6 +562,7 @@ impl<'t> MarkupParser<'t> {
         let mut byte_offsets = text.char_indices().map(|(at, _)| at).collect::<Vec<_>>();
         byte_offsets.push(text.len());
         Self {
+            modern:false,
             text,
             chars: text.chars().collect(),
             byte_offsets,
@@ -560,6 +570,7 @@ impl<'t> MarkupParser<'t> {
             out_chars: 0,
             style: RuntimeTextStyle::default(),
             color_stack: Vec::new(),
+            font_size_stack: Vec::new(),
             open_ruby: None,
             open_link: None,
             ruby_skip_until: 0,
@@ -688,12 +699,35 @@ impl<'t> MarkupParser<'t> {
         let Some((command, argument)) = target_markup_command(tag) else {
             return;
         };
+        if !self.modern&&matches!(command,"2x"|"/2x"|"fs"|"/fs"|"mxfs") {return}
         match command {
             "/" => self.escaped = true,
             "b" => self.style.bold = true,
             "/b" => self.style.bold = false,
             "i" => self.style.italic = true,
             "/i" => self.style.italic = false,
+            "2x" => {
+                self.style.width_power=self.style.width_power.saturating_add(1).min(6);
+                self.style.bold=true;
+            }
+            "/2x" if self.style.width_power>0=>{
+                self.style.width_power-=1;self.style.bold=false;
+            }
+            "fs"=>{
+                if let Some(size)=leading_number(argument).filter(|n|(4..=200).contains(n)) {
+                    self.font_size_stack.push(self.style.font_size);
+                    self.style.font_size=Some(size);
+                    self.parsed.line_metrics.push((self.out_chars,false,size));
+                }
+            }
+            "/fs"=>{
+                if let Some(previous)=self.font_size_stack.pop() {self.style.font_size=previous;}
+            }
+            "mxfs"=>{
+                if let Some(size)=leading_number(argument).filter(|n|(4..=200).contains(n)) {
+                    self.parsed.line_metrics.push((self.out_chars,true,size));
+                }
+            }
             "ruby" => {
                 // `<ruby base,reading>`: both halves come from the lower-cased
                 // tag. A tag without a comma registers nothing.

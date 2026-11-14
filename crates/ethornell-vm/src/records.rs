@@ -18,6 +18,7 @@ pub(crate) struct IndexedRecordEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedRecordState {
+    pub(crate) compression_mode: u32,
     pub(crate) slot: u32,
     pub(crate) capacity: u32,
     pub(crate) record_size: u32,
@@ -41,7 +42,6 @@ impl Vm {
         if size == 0 {
             return;
         }
-        self.clear_shadow_values(dst, size);
         let src_start = self.value_key(src);
         let dst_start = self.value_key(dst);
         let end = src_start.saturating_add(size as u32);
@@ -50,6 +50,9 @@ impl Vm {
             .range(src_start..end)
             .map(|(addr, value)| (dst_start.saturating_add(*addr - src_start), value.clone()))
             .collect();
+        // Capture first: memcpy to the same address (or an overlapping
+        // destination) must not erase its own typed BP source values.
+        self.clear_shadow_values(dst, size);
         self.mem_values.extend(copied);
     }
 
@@ -527,6 +530,67 @@ impl Vm {
         Ok(Value::Int(0))
     }
 
+    /// 81:B8/B9, 1400FA270/FA520/FA610: typed record predicates, not
+    /// registry operations. The low word selects an integer type, or FFFF
+    /// for a byte block whose size is in the high word.
+    pub(super) fn search_native_records(&mut self, all: bool) -> VmResult<i32> {
+        let flags = self.pop_int()? as u32;
+        let descriptor = self.pop_int()? as u32;
+        let operand = self.pop_value()?;
+        let stride = self.pop_int()? as u32;
+        let count = self.pop_int()? as u32;
+        let source = self.pop_ptr()?;
+        let output = if all { self.pop_ptr()? } else { 0 };
+        let kind = descriptor as i16;
+        let size = if kind == -1 { (descriptor >> 16) as usize }
+            else { 1usize << (descriptor & 3) };
+        let missing = if all {0} else {-1};
+        if size == 0 || size > stride as usize || count == 0 {return Ok(missing)}
+        if count > 1_048_576 {return Err(crate::VmError::Runtime("native record predicate count limit".into()))}
+        let right = if kind == -1 {
+            match operand {
+                Value::Str(text) => { let mut bytes = self.encode_native_string(&text).into_owned(); bytes.push(0);
+                    if bytes.len() < size { return Err(crate::VmError::Runtime("native record predicate string is shorter than byte block".into())) } bytes[..size].to_vec() },
+                value => {let range=self.resolve_range(value.as_i32() as u32,size)?;self.memory[range].to_vec()}
+            }
+        } else {
+            // Original wrappers take a 32-bit value's stack address. For the
+            // 64-bit selector the following word is uninitialized; use zero
+            // rather than inheriting unrelated host stack contents.
+            (operand.as_i32() as u32 as u64).to_le_bytes()[..size].to_vec()
+        };
+        let numeric = |bytes: &[u8]| {let mut raw=[0;8];raw[..bytes.len()].copy_from_slice(bytes);u64::from_le_bytes(raw)};
+        let rhs = if kind == -1 {0} else {numeric(&right)};
+        let mut hits = Vec::new();
+        for index in 0..count {
+            let offset=index.checked_mul(stride).and_then(|v|source.checked_add(v))
+                .ok_or_else(||crate::VmError::Runtime("native record predicate address overflow".into()))?;
+            let range=self.resolve_range(offset,size)?;
+            let left=&self.memory[range];
+            let lhs=if kind == -1 {0} else {numeric(left)};
+            if kind != -1 && flags & 0x10000 != 0 && lhs == 0 {continue}
+            let matches=match flags & 0xffff {
+                0=>left==right,1=>left!=right,
+                2=>left.iter().zip(&right).all(|(a,b)|a&b==0),
+                3=>left.iter().zip(&right).any(|(a,b)|a&b!=0),
+                mode @ 4..=7 if matches!(kind,0..=2|4..=6)=>{
+                    // FA270 sign-extends only the left signed operand before
+                    // comparing its 64-bit word with the zero-filled RHS.
+                    let lhs=match kind {4=>(lhs as i8 as i64) as u64,5=>(lhs as i16 as i64) as u64,6=>(lhs as i32 as i64) as u64,_=>lhs};
+                    if kind >= 4 { match mode {4=>(lhs as i64)<rhs as i64,5=>(lhs as i64)<=rhs as i64,6=>(lhs as i64)>rhs as i64,_=>(lhs as i64)>=rhs as i64} }
+                    else { match mode {4=>lhs<rhs,5=>lhs<=rhs,6=>lhs>rhs,_=>lhs>=rhs} }
+                },
+                _=>false,
+            };
+            if matches {if !all {return Ok(index as i32)} hits.push(index);}
+        }
+        if all {
+            self.resolve_write_range(output,hits.len()*4)?;
+            for (i,index) in hits.iter().enumerate() {self.write_int(output+i as u32*4,2,*index)?;}
+            Ok(hits.len() as i32)
+        } else {Ok(-1)}
+    }
+
     pub(crate) fn sys_indexed_record_open(
         &mut self,
         slot: u32,
@@ -542,6 +606,7 @@ impl Vm {
         self.indexed_record_tables.insert(
             self.value_key(handle),
             IndexedRecordState {
+                compression_mode: 0,
                 slot,
                 capacity,
                 record_size,
@@ -628,6 +693,7 @@ impl Vm {
         };
         let size = state.record_size as usize;
         let capacity = state.capacity as usize;
+        let compressed = state.compression_mode == 1;
         let slot = state.slot;
         let src_range = self.resolve_range(src, size)?;
         let src_start = self.value_key(src);
@@ -638,7 +704,7 @@ impl Vm {
             .map(|(addr, value)| (*addr - src_start, value.clone()))
             .collect();
         let entry = IndexedRecordEntry {
-            bytes: self.memory[src_range].to_vec(),
+            bytes: if compressed { encode_indexed_record(&self.memory[src_range]) } else { self.memory[src_range].to_vec() },
             shadow_values,
         };
         let state = self.indexed_record_tables.get_mut(&key).unwrap();
@@ -674,12 +740,15 @@ impl Vm {
         else {
             return Ok(2);
         };
-        // sub_46C8E0: memcpy of the stored record.
+        // 476090 deliberately consults the table mode, not the saved entry mode.
         let size = state.record_size as usize;
+        let bytes = if state.compression_mode == 1 { decode_indexed_record(&entry.bytes, size)? } else {
+            entry.bytes.get(..size).ok_or_else(|| crate::VmError::Runtime("indexed record mode changed: raw read exceeds stored record".into()))?.to_vec()
+        };
         let record_size = state.record_size;
         let capacity = state.capacity;
         let range = self.resolve_write_range(dst, size)?;
-        self.memory[range].copy_from_slice(&entry.bytes);
+        self.memory[range].copy_from_slice(&bytes);
         self.clear_shadow_values(dst, size);
         let dst_start = self.value_key(dst);
         self.mem_values.extend(
@@ -710,6 +779,15 @@ impl Vm {
             );
         }
         Ok(0)
+    }
+
+    /// 493870 -> 4761B0: 1 missing handle, 2 invalid mode, 0 success.
+    pub(crate) fn sys_indexed_record_mode(&mut self, handle: u32, mode: u32) -> i32 {
+        let key = self.value_key(handle);
+        let Some(table) = self.indexed_record_tables.get_mut(&key) else { return 1; };
+        if mode > 1 { return 2; }
+        table.compression_mode = mode;
+        0
     }
 
     pub(crate) fn sys_indexed_record_remove(&mut self, handle: u32, start: i32, count: u32) -> i32 {
@@ -982,5 +1060,90 @@ mod tests {
         let mut vm = Vm::new();
         assert_eq!(vm.sys_indexed_record_open(0x100, 0, 8).unwrap(), 2);
         assert_eq!(vm.sys_indexed_record_open(0x100, 8, 0).unwrap(), 2);
+    }
+}
+
+/// 475C80 / 475CF0: unsigned LEB128 length, alternating zero and literal runs.
+fn encode_indexed_record(bytes: &[u8]) -> Vec<u8> {
+    fn varint(out: &mut Vec<u8>, mut n: usize) {
+        loop { let b = (n & 127) as u8; n >>= 7; out.push(b | if n != 0 { 128 } else { 0 }); if n == 0 { break; } }
+    }
+    let mut out = Vec::new();
+    varint(&mut out, bytes.len());
+    let mut at = 0;
+    loop {
+        let start = at;
+        while at < bytes.len() && bytes[at] == 0 { at += 1; }
+        varint(&mut out, at - start);
+        if at == bytes.len() { break; }
+        let start = at;
+        while at < bytes.len() {
+            if bytes[at] == 0 && bytes.get(at + 1) == Some(&0) { break; }
+            at += 1;
+        }
+        varint(&mut out, at - start);
+        out.extend_from_slice(&bytes[start..at]);
+        if at == bytes.len() { break; }
+    }
+    out
+}
+
+/// 475CB0 / 475DA0, with checked bounds instead of the original unchecked reads.
+fn decode_indexed_record(bytes: &[u8], capacity: usize) -> VmResult<Vec<u8>> {
+    fn varint(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let mut n = 0u32;
+        for shift in (0..35).step_by(7) {
+            let b = *bytes.get(*at)?; *at += 1;
+            if shift == 28 && b > 15 { return None; }
+            n |= u32::from(b & 127) << shift;
+            if b & 128 == 0 { return Some(n as usize); }
+        }
+        None
+    }
+    let bad = || crate::VmError::Runtime("invalid compressed indexed record".into());
+    let mut at = 0;
+    let size = varint(bytes, &mut at).ok_or_else(bad)?;
+    if size != capacity { return Err(bad()); }
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
+        let zero = varint(bytes, &mut at).ok_or_else(bad)?;
+        let end = out.len().checked_add(zero).filter(|&n| n <= size).ok_or_else(bad)?;
+        out.resize(end, 0);
+        if out.len() == size { break; }
+        let count = varint(bytes, &mut at).ok_or_else(bad)?;
+        if out.len().checked_add(count).is_none_or(|n| n > size) || zero == 0 && count == 0 { return Err(bad()); }
+        let end = at.checked_add(count).ok_or_else(bad)?;
+        out.extend_from_slice(bytes.get(at..end).ok_or_else(bad)?); at = end;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod version_record_tests {
+    use super::*;
+    #[test]
+    fn version_records_compression_search_and_shadow_roundtrip() {
+        let source = [0,0,0,9,0,5,0,0,4,8,0,0,0,0,0,0];
+        assert_eq!(encode_indexed_record(&source), [16,3,3,9,0,5,2,2,4,8,6]);
+        assert_eq!(decode_indexed_record(&encode_indexed_record(&source),16).unwrap(), source);
+        assert!(decode_indexed_record(&[16,17],16).is_err());
+        let mut vm=Vm::new();
+        vm.write_int(256,2,0x90000000).unwrap();
+        vm.memory[512..528].copy_from_slice(&source);
+        vm.mem_values.insert(vm.value_key(516),Value::Str("typed".into()));
+        assert_eq!(vm.sys_indexed_record_open(256,2,16).unwrap(),0);
+        let h=vm.read_int(256,2).unwrap();
+        assert_eq!(vm.sys_indexed_record_mode(h,1),0);
+        assert_eq!(vm.sys_indexed_record_push(h,512).unwrap(),0);
+        assert_eq!(vm.sys_indexed_record_load(768,h,0).unwrap(),0);
+        assert_eq!(vm.memory[768..784],source);
+        assert_eq!(vm.mem_values.get(&vm.value_key(772)),Some(&Value::Str("typed".into())));
+        assert_eq!(vm.sys_indexed_record_mode(h,2),2);
+        // Four signed byte records, predicate LT 1; native sign extension.
+        vm.memory[1024..1028].copy_from_slice(&[255,0,1,2]);
+        vm.stack=vec![Value::Ptr(1200),Value::Ptr(1024),Value::Int(4),Value::Int(1),Value::Int(1),Value::Int(4),Value::Int(4)];
+        assert_eq!(vm.search_native_records(true).unwrap(),2);
+        assert_eq!(vm.read_int(1200,2).unwrap(),0);
+        assert_eq!(vm.read_int(1204,2).unwrap(),1);
     }
 }

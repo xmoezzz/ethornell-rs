@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// Host-private process identity, outside the native bitmap-slot range
+// 0..0x4000. Global movie selectors expose duration/state, never this handle.
+
 mod animation;
 mod audio_runtime;
 mod auto_input;
@@ -22,7 +26,9 @@ mod display_tree;
 mod effects;
 mod file_policy;
 mod native_profile;
+mod version_graph;
 mod frame_presenter;
+mod presentation;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
 pub use file_policy::hosted as hosted_files;
@@ -78,6 +84,8 @@ mod native_sprite_link;
 mod native_sprite_perspective;
 mod native_system;
 mod native_user;
+mod property_inspector;
+mod object_inspector;
 mod perspective_blit;
 mod platform;
 mod resource_lookup;
@@ -146,8 +154,9 @@ use user_files::{
 #[cfg(feature = "desktop-window")]
 use winit::keyboard::KeyCode;
 #[cfg(not(feature = "desktop-window"))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyCode {
+    Escape,
     ArrowLeft,
     ArrowUp,
     ArrowRight,
@@ -238,6 +247,7 @@ struct NativeRuntimeProfile {
     se_channels: usize,
     modern_gradient_blur: bool,
     modern_pointer_tags: bool,
+    display_modes: Option<[(i32,i32);16]>,
     main_code_bytes: u32,
     main_data_bytes: u32,
 }
@@ -249,6 +259,7 @@ impl Default for NativeRuntimeProfile {
             se_channels: 64,
             modern_gradient_blur: false,
             modern_pointer_tags: false,
+            display_modes: None,
             main_code_bytes: 0x80000,
             main_data_bytes: 0x40000,
         }
@@ -879,7 +890,8 @@ struct RuntimeTraceApi {
     window_mode: i32,
     screen_width: i32,
     screen_height: i32,
-    display_mode_sizes: [Option<(i32, i32)>; 8],
+    display_mode_sizes: [Option<(i32, i32)>; 16],
+    display_mode_limit: usize,
     /// dword_506B88 / dword_518614: the Sys80:60 size index and pixel mode.
     display_size_index: i32,
     /// GetAdapterDisplayMode width/height (dword_5177C0/C4); 0 when unknown.
@@ -1043,6 +1055,9 @@ struct RuntimeTraceApi {
     graph_dc_cache: Option<dc_cache::DcCache>,
     /// dword_566714 / dword_506BD0: a pending redraw, Some(full).
     graph_redraw_requested: Option<bool>,
+    /// Graph91:00 / 1400B6190: force presentation even without a due redraw.
+    graph_force_present: i32,
+    version_graph: version_graph::VersionGraphState,
     graph_global_offset: (f32, f32),
     /// SystemB0:08 CProcShakeScreen transient screen displacement.
     screen_shake_offset: (f32, f32),
@@ -1296,6 +1311,8 @@ struct RuntimeTraceApi {
     modern_gradient_blur: bool,
     native_additive_coverage: bool,
     pending_transition_destination: Option<i32>,
+    portable_window_identity: u64,
+    pending_window_resizable: Option<bool>,
     pending_window_title: Option<String>,
     pending_window_position: Option<(i32, i32)>,
     pending_window_size: Option<(u32, u32)>,
@@ -1337,6 +1354,7 @@ struct RuntimeTraceApi {
     system_config_input_mode: i32,
     shader_effect_enabled: bool,
     native_system: native_system::NativeSystemState,
+    bp_profile: ethornell_vm::NativeAbiProfile,
     native_user: native_user::NativeUserState,
     native_effect: native_effect::NativeEffectState,
     /// Portable backend for Windows-only registry/installer metadata. Native
@@ -1384,7 +1402,7 @@ impl RuntimeTraceApi {
             screen_width: 1280,
             screen_height: 720,
             // dword_506B8C / dword_506BAC.
-            display_mode_sizes: [
+            display_mode_sizes: std::array::from_fn(|i| [
                 Some((320, 240)),
                 Some((640, 480)),
                 Some((800, 600)),
@@ -1393,7 +1411,8 @@ impl RuntimeTraceApi {
                 Some((1024, 600)),
                 Some((1280, 720)),
                 Some((1920, 1080)),
-            ],
+            ].get(i).copied().flatten()),
+            display_mode_limit: 8,
             display_size_index: 2,
             desktop_display_size: (0, 0),
             display_adapter_description: String::new(),
@@ -1504,6 +1523,8 @@ impl RuntimeTraceApi {
             graph_memory_limit: 0,
             graph_dc_cache: None,
             graph_redraw_requested: None,
+            graph_force_present: 0,
+            version_graph: Default::default(),
             graph_global_offset: (0.0, 0.0),
             screen_shake_offset: (0.0, 0.0),
             graph_special_watches: BTreeSet::new(),
@@ -1699,6 +1720,8 @@ impl RuntimeTraceApi {
             modern_gradient_blur: false,
             native_additive_coverage: false,
             pending_transition_destination: None,
+            portable_window_identity: 0,
+            pending_window_resizable: None,
             pending_window_title: None,
             pending_window_position: None,
             pending_window_size: None,
@@ -1726,6 +1749,7 @@ impl RuntimeTraceApi {
             system_config_input_mode: 0,
             shader_effect_enabled: false,
             native_system: native_system::NativeSystemState::default(),
+            bp_profile: ethornell_vm::NativeAbiProfile::Tayutama,
             native_user: native_user::NativeUserState::default(),
             native_effect: native_effect::NativeEffectState::default(),
             platform_store: platform::PortablePlatformStore::from_environment(),
@@ -1856,8 +1880,19 @@ impl RuntimeTraceApi {
 
     fn store_movie_frame(&mut self, update: graph_effect::MovieFrameUpdate) {
         let bitmap = update.bitmap;
+        // Global renderers never publish bitmap-slot samples (DCTraditionalVR
+        // and Media Foundation both own a distinct output surface).
+        if matches!(bitmap,version_graph::DS_MOVIE_HANDLE|version_graph::MF_MOVIE_HANDLE) {
+            self.store_graph_image(format!("runtime:movie:{bitmap}"),update.image);return;
+        }
         let width = update.image.width;
         let height = update.image.height;
+        if self.global_movie_handle == Some(bitmap) {
+            // DCTraditionalVR owns a video surface, not a bitmap-registry
+            // slot. Its host handle can numerically equal a script bitmap.
+            self.store_graph_image(format!("runtime:movie:{bitmap}"), update.image);
+            return;
+        }
         // A 92:F2 slot was created at the picture size when the graph
         // connected; sub_45C260 copies each sample into that same descriptor.
         // Keep its resource (and generation) so projected sprites bound to it
@@ -1897,11 +1932,27 @@ impl RuntimeTraceApi {
         self.refresh_bitmap_nodes(bitmap);
     }
 
-    fn open_runtime_movie(
+    fn close_global_movie(&mut self) {
+        if let Some(handle)=self.global_movie_handle.take() {
+            self.graph_effects.release(handle);self.graph_process_handles.remove(&handle);
+            let key=format!("runtime:movie:{handle}");self.graph_images.remove(&key);self.graph_image_revisions.remove(&key);
+            self.sync_movie_audio();
+        }
+    }
+
+    fn open_runtime_movie(&mut self,archive:&str,resource:&str,size:(i32,i32)) -> Option<(i32,i32)> {
+        self.close_global_movie();
+        let result=self.open_movie_process(archive,resource,self.global_movie_volume,version_graph::DS_MOVIE_HANDLE)?;
+        self.global_movie_handle=Some(result.0);self.global_movie_size=size;
+        Some(result)
+    }
+
+    fn open_movie_process(
         &mut self,
         archive: &str,
         resource: &str,
-        size: (i32, i32),
+        volume: i32,
+        handle: i32,
     ) -> Option<(i32, i32)> {
         #[cfg(feature = "console")]
         let bytes = {
@@ -1911,7 +1962,6 @@ impl RuntimeTraceApi {
         };
         #[cfg(not(feature = "console"))]
         let bytes = MovieBytes::from_vec(read_runtime_bytes(&self.manager, archive, resource)?);
-        let handle = self.alloc_object();
         if self.graph_effects.configure_media(
             handle,
             archive.to_string(),
@@ -1928,10 +1978,8 @@ impl RuntimeTraceApi {
         }
         let _ = self
             .graph_effects
-            .set_volume(handle, self.global_movie_volume);
+            .set_volume(handle, volume);
         self.graph_process_handles.insert(handle);
-        self.global_movie_handle = Some(handle);
-        self.global_movie_size = size;
         Some((handle, invocation.duration_ms))
     }
 
@@ -1943,14 +1991,19 @@ impl RuntimeTraceApi {
     /// `runtime:movie:<handle>`, and the renderers draw them through this
     /// item on top of the frame. Once the movie has ended the scripts don't
     /// always close it, so a finished movie is not drawn.
+    pub(crate) fn active_global_movie_handle(&self)->Option<i32> {
+        self.version_graph.mf_handle.filter(|&h|self.graph_effects.state(h)==0)
+            .or_else(||self.global_movie_handle.filter(|&h|self.graph_effects.state(h)==0))
+    }
+
     pub(crate) fn directshow_movie_draw_item(&self) -> Option<RuntimeGraphDrawItem> {
-        let handle = self.global_movie_handle?;
+        let handle = self.active_global_movie_handle()?;
         if self.graph_effects.state(handle) != 0 {
             return None;
         }
         let key = format!("runtime:movie:{handle}");
         let image = self.graph_images.get(&key)?;
-        let (width, height) = match self.global_movie_size {
+        let (width, height) = match if self.version_graph.mf_handle==Some(handle) { (0,0) } else { self.global_movie_size } {
             (width, height) if width > 0 && height > 0 => (width as f32, height as f32),
             _ => (self.screen_width as f32, self.screen_height as f32),
         };
@@ -2425,7 +2478,7 @@ impl RuntimeTraceApi {
             return program.clone();
         }
         let program = match self.manager.read_decoded_from_archive(archive, file) {
-            Ok(bytes) => ethornell_script::parse_bp_program(Some(key.clone()), &bytes),
+            Ok(bytes) => ethornell_script::parse_bp_program_profile(Some(key.clone()), &bytes,self.bp_profile),
             Err(err) => {
                 if file_policy::restricted() {
                     self.host
@@ -3150,6 +3203,7 @@ impl RuntimeTraceApi {
     }
 
     fn alloc_object(&mut self) -> i32 {
+        while matches!(self.next_object_handle,version_graph::DS_MOVIE_HANDLE|version_graph::MF_MOVIE_HANDLE) {self.next_object_handle+=1;}
         let handle = self.next_object_handle;
         self.next_object_handle += 1;
         self.display_tree
@@ -3821,7 +3875,7 @@ impl RuntimeTraceApi {
         }
         let now = self.clock_base_ms.wrapping_add(self.engine_time_ms as u32);
         if self.graph_next_present_ms > now {
-            return false;
+            return self.graph_force_present != 0;
         }
         let interval = self.graph_frame_interval_ms.max(1);
         self.graph_redraw_requested = None;
@@ -6641,12 +6695,14 @@ impl RuntimeTraceApi {
             // every delivered sample is a native event; sysmsg._bp posts it
             // to moviemngr._bp, which counts frames at record +52 and
             // refreshes the sprite showing the slot.
-            self.queued_system_events
-                .push_back([0x10000, update.bitmap, 0]);
+            if !matches!(update.bitmap,version_graph::DS_MOVIE_HANDLE|version_graph::MF_MOVIE_HANDLE) {
+                self.queued_system_events.push_back([0x10000, update.bitmap, 0]);
+            }
             self.store_movie_frame(update);
         }
         self.sync_movie_audio();
         self.drain_graph_input_messages();
+        self.tick_eex_icon_paths();
         self.tick_icon_input_actions();
         // Target sub_496430 samples each registered Sprite once per main-loop
         // pass and stores only bit zero of the primary-input query. The portable
@@ -9698,8 +9754,8 @@ impl RuntimeEngine {
         native_dialog_presentation: bool,
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
-        let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
         let profile = confirmed_native_profile(&manager, bytes);
+        let program = ethornell_script::parse_bp_program_profile(Some(script.to_string()), bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
             profile.main_data_bytes,
@@ -9714,7 +9770,9 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.bp_profile=profile.abi;
                 api.modern_gradient_blur = profile.modern_gradient_blur;
+                if let Some(sizes)=profile.display_modes {api.display_mode_sizes=sizes.map(Some);api.display_mode_limit=16;}
                 api.native_dialog_presentation = native_dialog_presentation;
                 api
             },
@@ -9903,6 +9961,10 @@ impl RuntimeEngine {
             };
         }
 
+        // Performance history samples the host loop's elapsed time, before
+        // engine pause/jump filtering. Modal-host waits do not add records.
+        self.api.native_system.frame_history.push_front(audio_elapsed_ms as u32 as i32);
+        self.api.native_system.frame_history.truncate(600);
         let mut changes = self.api.display_changes;
         let mut report = self.run_native_pass(pacing, elapsed_ms);
         // Input edges are visible for one cooperative main-loop pass.
@@ -10318,6 +10380,122 @@ mod directshow_movie_tests {
             center(&snapshot::compose_runtime_frame(&api, true)),
             [0, 0, 0]
         );
+    }
+
+    #[test]
+    fn global_samples_present_independently_and_restore_the_frozen_scene() {
+        use super::presentation::CpuPresenter;
+        use ethornell_vm::{GraphApi, NativeCallFrame, NativeOpcode, Value};
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        api.screen_width = 4;
+        api.screen_height = 3;
+        let solid = |rgb: [u8; 3]| DecodedImage {
+            width: 4,
+            height: 3,
+            rgba: [rgb[0], rgb[1], rgb[2], 255].repeat(12),
+        };
+        let pixel = |f: &snapshot::RuntimeFrameComposition| f.framebuffer.rgba[..3].to_vec();
+        api.store_runtime_bitmap(10, solid([0, 0, 200]), 2);
+        let mut create = NativeCallFrame::new(
+            NativeOpcode {
+                group: 0x90,
+                id: 0x50,
+            },
+            Vec::new(),
+        );
+        let Value::Int(sprite) = GraphApi::call_graph(&mut api, &mut create).unwrap() else {
+            panic!("sprite")
+        };
+        api.graph90_replace_sprite_primary(sprite, 10).unwrap();
+        api.set_graph_object_draw_enabled(sprite, true);
+        let mut presenter = CpuPresenter::default();
+        assert_eq!(pixel(presenter.frame(&mut api)), [0, 0, 200]);
+        api.graph_scheduler_enabled = false;
+        let deadline = api.graph_next_present_ms;
+        api.replace_graph_bitmap_pixels(10, solid([0, 200, 0]));
+
+        let handle = 10; // Deliberate collision with the scene bitmap slot.
+        assert_eq!(
+            api.graph_effects.configure_media(
+                handle,
+                String::new(),
+                "m".into(),
+                MovieBytes::from_vec(tiny_movie())
+            ),
+            0
+        );
+        assert_eq!(api.graph_effects.invoke(handle).status, 0);
+        assert_eq!(
+            api.graph_effects.configure_media(
+                20,
+                String::new(),
+                "bitmap".into(),
+                MovieBytes::from_vec(tiny_movie())
+            ),
+            0
+        );
+        assert_eq!(api.graph_effects.invoke(20).status, 0);
+        api.global_movie_handle = Some(handle);
+        api.global_movie_size = (4, 3);
+        assert_eq!(
+            pixel(presenter.frame(&mut api)),
+            [0, 0, 0],
+            "opening has no sample yet"
+        );
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: handle,
+            image: solid([200, 0, 0]),
+        });
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 0, 0]);
+        assert_eq!(&api.graph_bitmap_image(10).unwrap().rgba[..3], &[0, 200, 0]);
+        let retained = presenter.frame(&mut api).framebuffer.rgba.as_ptr();
+        api.engine_time_ms += 16;
+        assert_eq!(
+            presenter.frame(&mut api).framebuffer.rgba.as_ptr(),
+            retained,
+            "no duplicate composition without a new sample"
+        );
+        assert_eq!(api.graph_next_present_ms, deadline);
+
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: handle,
+            image: solid([200, 100, 0]),
+        });
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 100, 0]);
+        api.global_movie_size = (2, 3);
+        let frame = presenter.frame(&mut api);
+        assert_eq!(
+            &frame.framebuffer.rgba[12..15],
+            &[0, 0, 0],
+            "geometry changes repaint without a new sample"
+        );
+        api.close_global_movie();
+        assert_eq!(api.graph_effects.state(handle), 4);
+        assert_eq!(
+            api.graph_effects.state(20),
+            0,
+            "closing a global movie leaves bitmap video running"
+        );
+        assert_eq!(
+            pixel(presenter.frame(&mut api)),
+            [0, 0, 200],
+            "restore the submitted scene, not unpresented green pixels"
+        );
+
+        // A bitmap movie still follows the script's scene gate and keeps its
+        // existing binding generation, unlike a global video sample.
+        let generation = api.graph_resources[&10].generation;
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: 10,
+            image: solid([200, 200, 0]),
+        });
+        assert_eq!(api.graph_resources[&10].generation, generation);
+        assert_eq!(pixel(presenter.frame(&mut api)), [0, 0, 200]);
+        api.graph_scheduler_enabled = true;
+        api.engine_time_ms += 1000;
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 200, 0]);
     }
 }
 
@@ -20875,6 +21053,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             push_runtime_window_message(api, 0x0202, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::MouseWheel { delta_y } => {
+            if api.native_user.inspectors.wheel(delta_y)||api.handle_native_child_wheel(delta_y) {return;}
             if delta_y == 0.0 {
                 return;
             }
@@ -21881,6 +22060,10 @@ impl RuntimeTraceApi {
                     if words.len() == 2 {
                         input.enabled = words[1];
                     }
+                    continue;
+                }
+                if input.extra_extended && words.first()==Some(&0x3000_0000) {
+                    refresh |= self.trigger_eex_icon_path(object,&words);
                     continue;
                 }
                 refresh |= input.handle_message(&words, &pointer_local);
@@ -23031,6 +23214,8 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         tracing::info!(width, height, explicit, "native window size requested");
     }
 
+    fn display_mode_capacity(&self) -> usize {self.display_mode_limit}
+
     fn register_display_mode(&mut self, index: usize, width: i32, height: i32) {
         if let Some(slot) = self.display_mode_sizes.get_mut(index) {
             *slot = Some((width, height));
@@ -23176,6 +23361,38 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         }
         tracing::debug!(root, file, path = %path.display(), ok, "DeleteFile");
         ok
+    }
+
+    fn inspect_native_display_object(&self,object:i32)->std::result::Result<ethornell_vm::NativeObjectInspector,i32> {
+        self.native_object_inspector(object)
+    }
+    fn edit_native_display_object(&mut self,object:i32,key:u8,value:i32)->ethornell_vm::VmResult<()> {
+        self.edit_native_object_inspector(object,key,value)
+    }
+    fn publish_native_inspector(&mut self,view:&ethornell_vm::NativeInspectorView)->ethornell_vm::VmResult<bool> {
+        if !self.graph_resources.contains_key(&property_inspector::PANEL_BITMAP) {
+            self.store_runtime_bitmap(property_inspector::PANEL_BITMAP,DecodedImage {width:1,height:1,rgba:vec![32,36,44,255]},1);
+        }
+        self.native_user.inspectors.publish(view)
+    }
+    fn close_native_inspector(&mut self,handle:u32)->ethornell_vm::VmResult<()> {
+        self.native_user.inspectors.close(handle);Ok(())
+    }
+    fn take_native_inspector_events(&mut self,handle:u32)->ethornell_vm::VmResult<Vec<ethornell_vm::NativeInspectorEvent>> {
+        Ok(self.native_user.inspectors.take_events(handle))
+    }
+
+    fn portable_window_identity(&self)->u64 {self.portable_window_identity}
+
+    fn configure_window_resizable(&mut self,enabled:bool) {
+        self.pending_window_resizable=Some(enabled);
+    }
+
+    fn configure_presentation_size(&mut self,width:i32,height:i32)->bool {
+        if width<=0||height<=0 {return false}
+        self.windowed_client_size=(width,height);
+        if self.window_mode==0 {self.pending_window_size=Some((width as u32,height as u32));}
+        true
     }
 
     fn user_data_root(&mut self, kind: i32) -> Option<String> {
@@ -24169,6 +24386,23 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         std::mem::take(&mut self.frame_yield_requested)
     }
 
+    fn native_frame_history(&self, count: usize) -> Option<Vec<i32>> {
+        (count <= 600).then(|| self.native_system.frame_history.iter().copied()
+            .chain(std::iter::repeat(0)).take(count).collect())
+    }
+
+    fn secure_random_u32(&mut self) -> ethornell_vm::VmResult<u32> {
+        #[cfg(not(any(target_os="vita",target_os="horizon")))]
+        {
+            let mut bytes = [0;4];
+            getrandom::fill(&mut bytes).map_err(|error|
+                ethornell_vm::VmError::Runtime(format!("OS random source: {error}")))?;
+            return Ok(u32::from_ne_bytes(bytes));
+        }
+        #[cfg(any(target_os="vita",target_os="horizon"))]
+        Err(ethornell_vm::VmError::Runtime("secure random source is unavailable on this host".into()))
+    }
+
     fn call_sys(
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
@@ -24469,7 +24703,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                         "無効なピクセルモードが設定されました".into(),
                     ));
                 }
-                if !(0..8).contains(&mode) {
+                if mode<0 || mode as usize>=self.display_mode_limit {
                     return Err(ethornell_vm::VmError::Runtime(
                         "無効なスクリーンサイズが設定されました".into(),
                     ));
@@ -24774,6 +25008,12 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         color: i32,
     ) -> bool {
         self.draw_window_item_grid(window, items, columns, centered, color)
+    }
+
+    fn poll_native_graph_result(&mut self, opcode:ethornell_vm::NativeOpcode, cancel:bool) -> ethornell_vm::VmResult<Option<i32>> {
+        if (opcode.group,opcode.id)!=(0x91,0xf8) { return Err(ethornell_vm::VmError::UnknownDispatch {group:opcode.group,id:opcode.id}); }
+        if cancel { self.close_mf_movie(); return Ok(Some(-1)); }
+        Ok(if self.version_graph.mf_handle.is_some_and(|h|self.graph_effects.state(h)==0) { None } else { Some(0) })
     }
 
     fn native_graph_procedure_is_active(&self, opcode: ethornell_vm::NativeOpcode) -> bool {
@@ -25097,6 +25337,38 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         true
     }
 
+    fn register_decoded_graph_bitmap(&mut self,bitmap:i32,bytes:&[u8],namespace:Option<&str>,name:Option<&str>,bg_store:bool) -> i32 {
+        self.register_decoded_bitmap(bitmap,bytes,namespace,name,bg_store)
+    }
+
+    fn text_line_height_record(&mut self, token:i32, drain:bool) -> Vec<i32> { self.get_line_height_record(token,drain) }
+    fn configure_icon_path(&mut self,args:[i32;10],points:&[[i32;4]]) -> ethornell_vm::VmResult<i32> { self.configure_eex_icon_path(args,points) }
+
+    fn pointer_graph_object(&self) -> Option<(i32,i32)> {
+        if !self.window_restored || self.window_iconic { return None; }
+        for &object in self.display_tree.chain_handles().iter().rev() {
+            if !self.graph_object_enabled.get(&object).copied().unwrap_or(true) { continue; }
+            let scope = self.graph90_native_sort_key(object).unwrap_or_default();
+            if !native_pointer_scope_eligible_at(self,scope as i32,self.mouse_pos) { continue; }
+            if self.graph_object_pointer_hit(object).unwrap_or(0) == 0 { continue; }
+            let kind = match self.display_tree.kind(object)? {
+                NativeDisplayKind::Sprite => 2,
+                NativeDisplayKind::Filter => 7,
+                NativeDisplayKind::Map => 1,
+                NativeDisplayKind::Effector => 6,
+                NativeDisplayKind::Window => 3,
+                NativeDisplayKind::Landscape => 8,
+                NativeDisplayKind::ParticleScreen => 4,
+                NativeDisplayKind::RainScreen => 5,
+                NativeDisplayKind::Knob => 9,
+                NativeDisplayKind::Group => 10,
+                _ => 1,
+            };
+            return Some((object,kind));
+        }
+        None
+    }
+
     fn query_graph_window_valid_region(&self, window: i32) -> Option<[i32; 4]> {
         if !Self::is_window_surface_handle(window) {
             return None;
@@ -25109,6 +25381,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 surface.valid_bottom,
             ]
         })
+    }
+
+    fn blend_native_bitmap_sources(&mut self,destination:i32,first:i32,second:i32,mix:i32,transparency:i32)->ethornell_vm::VmResult<()> {
+        if self.bitmap_formats.get(&destination)!=Some(&1)||self.bitmap_formats.get(&first)!=Some(&2)||self.bitmap_formats.get(&second)!=Some(&2) {return Ok(())}
+        let (Some(mut d),Some(a),Some(b))=(self.graph_bitmap_image(destination),self.graph_bitmap_image(first),self.graph_bitmap_image(second)) else {return Ok(())};
+        bitmap_blend::blend_two_sources_over_rgb(&mut d,&a,&b,mix,transparency);
+        if !self.replace_graph_bitmap_pixels(destination,d) {return Err(ethornell_vm::VmError::Runtime("native bitmap blend destination was retired".into()))}
+        Ok(())
     }
 
     fn query_graph91_object_property(
@@ -25502,6 +25782,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         object: i32,
         mut descriptor: ethornell_vm::GraphInputDescriptor,
     ) {
+        self.version_graph.icon_paths.retain(|(owner,_,_),_|*owner!=object);
         if descriptor.compact_uses_valid_region_origin {
             for region in &mut descriptor.regions {
                 if region.width > 0 && region.height > 0 {
@@ -25911,6 +26192,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
+        if let Some(result) = self.call_version_graph(call) { return result; }
         if let Some(result) = self.dispatch_native_graph(call) {
             return result;
         }
@@ -26118,8 +26400,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0xf1) => {
                 // sub_480260 releases the process owned by the global
                 // DirectShow movie slot.
-                self.graph_effects.stop_all_movies();
-                self.global_movie_handle = None;
+                self.close_global_movie();
                 tracing::info!("MovieStop");
             }
             (0x90, 0xf2) => {
@@ -29327,6 +29608,8 @@ impl ethornell_vm::SoundApi for RuntimeTraceApi {
         self.query_native_cd_audio_mode()
     }
 
+    fn native_child_window_property(&self,handle:i32,property:i32)->std::result::Result<i32,i32> {self.native_child_property(handle,property)}
+
     fn current_user_text(&self) -> String {
         self.native_user.text.clone()
     }
@@ -30201,7 +30484,7 @@ fn run_headless(
         .map(|runtime| runtime.api.total_native_calls)
         .unwrap_or_default();
     let mut next_frame = Instant::now();
-    let mut last_composition: Option<snapshot::RuntimeFrameComposition> = None;
+    let mut presenter = presentation::CpuPresenter::default();
     let mut runtime_failure = None;
     for frame in 0..max_frames {
         if let Some(runtime) = runtime.as_mut() {
@@ -30229,24 +30512,9 @@ fn run_headless(
                 .total_native_calls
                 .wrapping_sub(previous_native_calls);
             previous_native_calls = runtime.api.total_native_calls;
-            // Headless differs from the window frontend only at final
-            // presentation: every logical frame still traverses the shared
-            // render tree and produces a complete offscreen framebuffer.
-            // sub_462100: a frame that is not due shows the last one again.
-            let movie_playing = runtime.api.directshow_movie_draw_item().is_some();
-            let frame_composition = if runtime.api.take_present_due()
-                || last_composition.is_none()
-                || movie_playing
-            {
-                runtime.api.performance_profile.begin();
-                let composition =
-                    snapshot::compose_runtime_frame_with_diagnostics(&runtime.api, true);
-                runtime.api.performance_profile.end(true);
-                last_composition = Some(composition.clone());
-                composition
-            } else {
-                last_composition.clone().expect("checked above")
-            };
+            // Use the same scene/sample scheduling as GPU frontends; a global
+            // movie never causes a traversal of the suspended display tree.
+            let frame_composition = presenter.frame(&mut runtime.api).clone();
             if snapshot_frames.contains(&frame)
                 && let Some(base_path) = snapshot_path.as_ref()
             {

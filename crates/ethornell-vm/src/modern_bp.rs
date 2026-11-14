@@ -13,7 +13,7 @@ fn offset(ins: &BpInstruction, index: usize) -> VmResult<u32> {
     }
 }
 
-fn predicate(mode: i32, left: i32, right: i32) -> i32 {
+pub(super) fn predicate(mode: i32, left: i32, right: i32) -> i32 {
     match mode {
         0 => i32::from(left == right),
         1 => i32::from(left != right),
@@ -225,7 +225,7 @@ impl Vm {
         Ok(None)
     }
 
-    fn modern_frame_offset(&self, displacement: u32) -> VmResult<u32> {
+    pub(super) fn modern_frame_offset(&self, displacement: u32) -> VmResult<u32> {
         self.mem_ptr
             .checked_sub(displacement)
             .map(|p| crate::FRAME_SEGMENT | p)

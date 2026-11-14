@@ -16,6 +16,7 @@ struct Graphics {
     window: Arc<dyn Window>,
     texture: Option<TextureHandle>,
     graph_textures: BTreeMap<String, CachedGraphTexture>,
+    presenter: frame_presenter::GpuPresenter,
     /// The game size the window was last fitted to.
     fitted_game_size: Option<(i32, i32)>,
 }
@@ -141,6 +142,7 @@ impl ApplicationHandler for WindowApp {
             window,
             texture,
             graph_textures,
+            presenter,
             fitted_game_size,
         }) = graphics.as_mut()
         else {
@@ -478,6 +480,8 @@ impl ApplicationHandler for WindowApp {
                         let size = monitor.current_video_mode()?.size();
                         Some([origin.x, origin.y, origin.x + size.width as i32, origin.y + size.height as i32])
                     };
+                    // A stable session-local token, never the OS window pointer.
+                    runtime.api.portable_window_identity=1;
                     runtime.api.monitor_rects =
                         window.available_monitors().filter_map(|monitor| monitor_rect(&monitor)).collect();
                     runtime.api.current_monitor_rect =
@@ -556,6 +560,7 @@ impl ApplicationHandler for WindowApp {
                         target.exit();
                         return;
                     }
+                    if let Some(resizable)=runtime.api.pending_window_resizable.take() {window.set_resizable(resizable);}
                     if let Some(title) = runtime.api.pending_window_title.take() {
                         window.set_title(&title);
                     }
@@ -689,29 +694,13 @@ impl ApplicationHandler for WindowApp {
                 if let Some(runtime) = runtime.as_mut() {
                     runtime.api.performance_profile.begin();
                 }
-                // sub_462100: without a due presentation the window shows the
-                // last composed frame again (WM_PAINT path).  A playing
-                // DirectShow movie updates independently of the graph
-                // scheduler (the scripts disable it during playback), so the
-                // window must still re-derive the frame while a movie is
-                // active to pick up newly decoded samples.
-                let movie_playing = runtime.as_ref().is_some_and(|r| r.api.directshow_movie_draw_item().is_some());
-                if runtime.as_mut().is_some_and(|runtime| !runtime.api.take_present_due()) && !movie_playing {
-                    if let Some(runtime) = runtime.as_mut() {
-                        runtime.api.performance_profile.end(false);
-                    }
-                    window.pre_present_notify();
-                    if let Err(err) = renderer.render() {
-                        tracing::error!(%err, "render failed");
-                        if let Ok(mut slot) = failure.lock() {
-                            *slot = Some(err.to_string());
-                        }
-                        target.exit();
-                    }
-                    return;
-                }
-                let commands = if let Some(runtime) = runtime.as_ref() {
-                    match frame_presenter::prepare_frame(renderer, &runtime.api, graph_textures) {
+                let commands = if let Some(runtime) = runtime.as_mut() {
+                    match frame_presenter::prepare_frame(
+                        renderer,
+                        &mut runtime.api,
+                        graph_textures,
+                        presenter,
+                    ) {
                         Ok(commands) => commands,
                         Err(error) => {
                             if let Ok(mut slot) = failure.lock() {
@@ -759,11 +748,14 @@ impl ApplicationHandler for WindowApp {
                             z: 10,
                         });
                     }
-                    commands
+                    Some(commands)
                 };
-                renderer.submit(&commands);
+                let changed = commands.is_some();
+                if let Some(commands) = commands {
+                    renderer.submit(&commands);
+                }
                 if let Some(runtime) = runtime.as_mut() {
-                    runtime.api.performance_profile.end(true);
+                    runtime.api.performance_profile.end(changed);
                 }
                 window.pre_present_notify();
                 match renderer.render() {
@@ -838,6 +830,7 @@ impl WindowApp {
             window,
             texture,
             graph_textures: BTreeMap::new(),
+            presenter: frame_presenter::GpuPresenter::default(),
             fitted_game_size: None,
         })
     }

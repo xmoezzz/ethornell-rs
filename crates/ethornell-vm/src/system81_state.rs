@@ -64,10 +64,16 @@ impl BlobTable {
 
 #[derive(Debug)]
 pub(crate) struct System81SharedState {
+    pub(crate) memory_guard: crate::native_memory_guard::NativeMemoryGuard,
+    pub(crate) inspectors: crate::native_inspector::NativeInspectors,
+    pub(crate) extensions: crate::native_extension::NativeExtensions,
+    pub(crate) diagnostics: crate::native_diagnostics::NativeDiagnostics,
+    pub(crate) resource_checksums:BTreeMap<(String,String),[u32;2]>,
     pub(crate) native_utf8_override: Option<bool>,
     pub(crate) ui_language: Option<i32>,
     pub(crate) graph91_resource_mode: i32,
     pub(crate) sentence_table: crate::sentence_table::SentenceTable,
+    pub(crate) native_buffers: crate::native_buffers::NativeBuffers,
     pub(crate) clock_jump_threshold_ms: i32,
     pub(crate) input_binding_values: [i32; 256],
     pub(crate) keyboard_polling_override: i32,
@@ -96,10 +102,16 @@ pub(crate) struct System81SharedState {
 impl Default for System81SharedState {
     fn default() -> Self {
         Self {
+            memory_guard: Default::default(),
+            inspectors: Default::default(),
+            extensions: Default::default(),
+            diagnostics: Default::default(),
+            resource_checksums:Default::default(),
             native_utf8_override: None,
             ui_language: None,
             graph91_resource_mode: 0,
             sentence_table: crate::sentence_table::SentenceTable::default(),
+            native_buffers: Default::default(),
             // dword_503DE8
             clock_jump_threshold_ms: 500,
             input_binding_values: [0; 256],

@@ -377,10 +377,9 @@ impl RuntimeTraceApi {
     ) -> Option<(i32, (i32, i32))> {
         let link_color = (self.system92_text_render_override != -1)
             .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
-        let parsed = parse_message_markup_with(
-            raw_text,
-            &mut self.graph_defaults.ruby_registry,
-            link_color,
+        let parsed = crate::text_anim::parse_message_markup_with_version(
+            raw_text,&mut self.graph_defaults.ruby_registry,link_color,
+            self.bp_profile==ethornell_vm::NativeAbiProfile::ModernFused,
         );
         let mut image = self.graph_bitmap_image(bitmap)?;
         let params = crate::text_layout::LayoutParams {
@@ -395,9 +394,15 @@ impl RuntimeTraceApi {
         };
         let transform = self.named_font_transform_for_id(font);
         let advance = transform.map_or(0.0, |t| t.advance_adjustment(size));
-        let layout = crate::text_layout::layout_text(&parsed.text, &params, &|ch| {
-            (crate::snapshot::glyph_advance(ch, size, horizontal_scale) + advance).max(0.0)
-        });
+        let style_of=|index:usize|parsed.style_spans.iter().find(|span|span.start_char<=index&&index<span.end_char).map(|span|span.style).unwrap_or_default();
+        let size_of=|index:usize|style_of(index).font_size.map_or(size,|n|n as f32);
+        let width_of=|index:usize|horizontal_scale*(1u32<<style_of(index).width_power) as f32;
+        let capture=self.graph_config.text_global_properties.get(&0x8000_0009).copied().unwrap_or(0)!=0;
+        let (layout,line_heights) = crate::text_layout::layout_text_variable(&parsed.text, &params, &|index,ch| {
+            let height=size_of(index);
+            let extra=transform.map_or(advance,|t|t.advance_adjustment(height));
+            (crate::snapshot::glyph_advance(ch,height,width_of(index))+extra).max(0.0)
+        },&size_of,&parsed.line_metrics,capture);
         let spans = parsed.style_spans.clone();
         let color_of = move |index: usize| {
             spans
@@ -414,7 +419,7 @@ impl RuntimeTraceApi {
                 })
         };
         let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
-        crate::snapshot::rasterize_transformed_glyph_records(
+        crate::snapshot::rasterize_styled_glyph_records(
             &mut image,
             format,
             &layout.glyphs,
@@ -423,6 +428,7 @@ impl RuntimeTraceApi {
             &color_of,
             shadow,
             transform,
+            &|index| {let style=style_of(index);(size_of(index),width_of(index)/100.,style.bold,style.italic)},
         );
         // `<l>` fragments feed Graph92:9E with the position the layout gave
         // the first glyph of each link.
@@ -442,7 +448,13 @@ impl RuntimeTraceApi {
             return None;
         }
         self.clear_bitmap_text(bitmap);
-        Some((layout.lines, (layout.end_x.round() as i32, layout.end_y.round() as i32)))
+        // 1.687 140074BC0 / 140077950: optional line-height capture
+        // returns a token instead of the line count. 92:94 can query its
+        // size without consuming it, then copy and remove the DWORDs.
+        let result = if capture {
+            self.store_line_height_record(line_heights)
+        } else {layout.lines};
+        Some((result, (layout.end_x.round() as i32, layout.end_y.round() as i32)))
     }
 
     /// `Graph91:9C` / `Graph91:9D` (`sub_484A30`, `sub_484C40`): draw markup text
@@ -1201,8 +1213,7 @@ impl RuntimeTraceApi {
         // `92:9F` stores dword_507650; -1 leaves link glyphs uncoloured.
         let link_color = (self.system92_text_render_override != -1)
             .then(|| (self.system92_text_render_override as u32) & 0x00ff_ffff);
-        let next =
-            parse_message_markup_with(text, &mut self.graph_defaults.ruby_registry, link_color);
+        let next = crate::text_anim::parse_message_markup_with_version(text,&mut self.graph_defaults.ruby_registry,link_color,self.bp_profile==ethornell_vm::NativeAbiProfile::ModernFused);
         let (page_chars, markup) = match self.message_pages.get(&window) {
             Some(page) => {
                 // window_text_state measured the room from the cursor; the
@@ -2318,12 +2329,14 @@ fn wrap_parsed_message(
             },
         })
         .collect();
+    let line_metrics=parsed.line_metrics.into_iter().map(|(at,set,size)|(remap(at),set,size)).collect();
     let wrapped = ParsedMessageMarkup {
         text: wrapped,
         ruby_spans,
         style_spans,
         link_spans,
         timeline,
+        line_metrics,
     };
     (wrapped, map)
 }
@@ -2340,6 +2353,7 @@ fn append_message_markup(
         ..page.clone()
     };
     out.text.push_str(&next.text);
+    out.line_metrics.extend(next.line_metrics.iter().map(|&(at,set,size)|(at+offset,set,size)));
     out.ruby_spans
         .extend(next.ruby_spans.into_iter().map(|span| RuntimeRubySpan {
             start_char: span.start_char + offset,

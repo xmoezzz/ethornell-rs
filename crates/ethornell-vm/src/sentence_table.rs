@@ -9,7 +9,10 @@ const MAX_STRING:usize=64*1024;
 #[derive(Debug,Default)]
 pub(crate) struct SentenceTable {groups:BTreeMap<String,BTreeMap<String,String>>}
 impl SentenceTable {
-    pub(crate) fn parse(bytes:&[u8])->Option<Self> {
+    pub(crate) fn parse(bytes:&[u8])->Option<Self> { Self::parse_with_replacements(bytes, false) }
+    pub(crate) fn parse_native(bytes:&[u8])->Option<Self> { Self::parse_with_replacements(bytes, true) }
+    pub(crate) fn merge(&mut self, other: Self) { self.groups.extend(other.groups); }
+    fn parse_with_replacements(bytes:&[u8], replace:bool)->Option<Self> {
         if bytes.len()>MAX_BYTES {return None;}
         struct Reader<'a>{b:&'a[u8],p:usize}
         impl<'a> Reader<'a> {
@@ -21,8 +24,8 @@ impl SentenceTable {
         for _ in 0..count {
             let group=r.text()?;let count=r.u32()? as usize;total=total.checked_add(count)?;if total>MAX_ENTRIES {return None;}
             let mut entries=BTreeMap::new();
-            for _ in 0..count {let key=r.text()?;let text=r.text()?;if entries.insert(key,text).is_some(){return None;}}
-            if table.groups.insert(group,entries).is_some(){return None;}
+            for _ in 0..count {let key=r.text()?;let text=r.text()?;if entries.insert(key,text).is_some() && !replace {return None;}}
+            if table.groups.insert(group,entries).is_some() && !replace {return None;}
         }
         if r.p!=bytes.len(){return None;}
         Some(table)

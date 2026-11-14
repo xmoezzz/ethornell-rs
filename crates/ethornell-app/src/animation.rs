@@ -1751,13 +1751,13 @@ struct NativeSplineObjectControlAnimation {
 }
 
 #[derive(Debug, Clone)]
-struct NativeNaturalCubicSpline {
+pub(crate) struct NativeNaturalCubicSpline {
     values: Vec<i32>,
     second_derivatives: Vec<f64>,
 }
 
 impl NativeNaturalCubicSpline {
-    fn new(values: Vec<i32>) -> Self {
+    pub(crate) fn new(values: Vec<i32>) -> Self {
         let count = values.len();
         let mut second_derivatives = vec![0.0; count];
         if count > 2 {
@@ -1781,9 +1781,11 @@ impl NativeNaturalCubicSpline {
         }
     }
 
-    fn sample(&self, t: f64) -> i32 {
+    fn sample(&self, t:f64) -> i32 { self.sample_real(t) as i32 }
+
+    pub(crate) fn sample_real(&self, t: f64) -> f64 {
         if self.values.len() <= 1 {
-            return self.values.first().copied().unwrap_or_default();
+            return f64::from(self.values.first().copied().unwrap_or_default());
         }
         let scaled = t.clamp(0.0, 1.0) * (self.values.len() - 1) as f64;
         let index = (scaled.floor() as usize).min(self.values.len() - 2);
@@ -1795,7 +1797,7 @@ impl NativeNaturalCubicSpline {
             + ((a * a * a - a) * self.second_derivatives[index]
                 + (b * b * b - b) * self.second_derivatives[index + 1])
                 / 3.0;
-        value as i32
+        value
     }
 }
 

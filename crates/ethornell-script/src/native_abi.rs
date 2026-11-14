@@ -28,16 +28,99 @@ pub enum NativeAbiProfile {
     Anipani,
     HoukagoFd,
     Modern,
+    /// 1.687 fused BP / Media Foundation generation.
+    ModernFused,
 }
 
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
+    if matches!(profile, NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused) {
+        let extension = match (group,id) {
+            (0x80,0x03|0x9f|0xec) | (0x81,0xd8) => Some((2,1)),
+            (0x80,0xed) | (0x81,0x00|0x27) => Some((1,1)),
+            (0x80,0xee) => Some((6,1)),
+            (0x81,0x06) if profile==NativeAbiProfile::ModernFused => Some((1,1)),
+            (0x81,0x20|0xda) => Some((3,1)),
+            (0x81,0x21) => Some((2,0)),
+            (0xb0,0xc5) => Some((2,1)),
+            (0x81,0x48) => Some((4,0)),
+            (0xb0,0x2a) => Some((1,1)),
+            (0x81,0x80) => Some((5,1)),
+            (0x81,0xb8) => Some((6,1)),
+            (0x81,0xb9) => Some((7,1)),
+            (0x81,0x8c..=0x8f) if profile==NativeAbiProfile::ModernFused => Some((2,1)),
+            (0xd0,0x62|0x63) => Some((4,1)),
+            (0xd0,0x71) => Some((9,1)),
+            (0xd0,0x7b) => Some((13,1)),
+            _ => None,
+        };
+        if let Some((argc,stack_outputs))=extension {
+            return Some(NativeCallAbi {argc,stack_outputs,installs_procedure:false,raw_descriptor_bit8:stack_outputs!=0});
+        }
+    }
+
+    let common = match (group,id) {
+        (0x90,0xc1) => Some((3,1)),
+        (0x90,0xcf) => Some((4,0)),
+        (0x92,0x31) | (0x92,0x3d) => Some((1,1)),
+        _ => None,
+    };
+    if let Some((argc,stack_outputs)) = common {
+        return Some(NativeCallAbi { argc,stack_outputs,installs_procedure:false,raw_descriptor_bit8:stack_outputs!=0 });
+    }
+    // 1.653 48A560 / 1.687 1400E3200 set the forced-present flag.
+    if profile != NativeAbiProfile::Tayutama && (group,id) == (0x91,0x00) {
+        return Some(NativeCallAbi { argc:1, stack_outputs:0, installs_procedure:false, raw_descriptor_bit8:false });
+    }
+    if profile == NativeAbiProfile::Anipani && (group,id) == (0x92,0x99) {
+        return Some(NativeCallAbi { argc:7, stack_outputs:1, installs_procedure:false, raw_descriptor_bit8:true });
+    }
+    if profile==NativeAbiProfile::ModernFused && (group,id)==(0xb0,0xcf) {return Some(NativeCallAbi {argc:0,stack_outputs:0,installs_procedure:false,raw_descriptor_bit8:false});}
+    if profile == NativeAbiProfile::ModernFused && group==0x7f {
+        // 8A/8B additionally consume the arguments named by their format.
+        let argc=match id {0=>5,0x80|0x82|0x88|0x8b=>2,0x81|0x83|0x89=>1,0x84..=0x86=>4,0x8a=>3,_=>return None};
+        return Some(NativeCallAbi {argc,stack_outputs:1,installs_procedure:false,raw_descriptor_bit8:true});
+    }
+    if profile == NativeAbiProfile::ModernFused {
+        let (argc, outputs, procedure) = match (group,id) {
+            (0x81,0x34) => (2,1,true),
+            (0xb0,0x12) => (6,1,false),
+            (0xb0,0x1b) => (8,0,false),
+            (0xb0,0x1e|0x1f) => (3,1,false),
+            (0xb0,0x60|0x6d) => (7,1,false),
+            (0xb0,0x61|0x66) => (1,1,false),
+            (0xb0,0x62|0x68|0x6a) => (3,1,false),
+            (0xb0,0x63|0x67) => (2,1,false),
+            (0xb0,0x6c) => (6,1,false),
+            (0xb0,0x6f) => (5,1,false),
+            (0x81,0x66|0x67) => (1,0,false),
+            (0x81,0x6c) => (2,1,false),
+            (0xb0,0xc8) => (2,0,false),
+            (0xb0,0xcf) => (0,0,false),
+            (0xd0,0xc0|0xc4|0xc7) => (3,1,false),
+            (0xd0,0xc1|0xc2) => (1,1,false),
+            (0xd0,0xc5) => (2,1,false),
+            (0xd0,0xc6|0xc8) => (6,1,false),
+            (0x91,0x04) => (6,0,true),
+            (0x91,0xbc) => (1,1,false),
+            (0x91,0xbd) => (11,1,false),
+            (0x91,0xf8) => (3,0,true),
+            (0x91,0xf9) | (0x91,0xfa) => (0,1,false),
+            (0x91,0xfb) => (1,1,false),
+            (0x92,0x94) => (2,1,false),
+            _ => (0,0,false),
+        };
+        if argc != 0 || outputs != 0 || procedure {
+            return Some(NativeCallAbi { argc, stack_outputs:outputs, installs_procedure:procedure, raw_descriptor_bit8:outputs!=0 || procedure });
+        }
+    }
+
     if profile == NativeAbiProfile::Anipani && group == 0x91 && matches!(id, 0x09 | 0x0a) {
         // Legacy extended table: 48A600 pops value then key, calls
         // 401EC0 -> 408840, and pushes success. Both raster option keys are
         // shared with the later FD/Modern tables; this is not a zero-arg slot.
         return Some(NativeCallAbi { argc: if id == 0x09 { 1 } else { 2 }, stack_outputs: 1, installs_procedure: false, raw_descriptor_bit8: true });
     }
-    if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
+    if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) {
         let (argc, stack_outputs) = match (group, id) {
             // FD native 49F1E0 / 4956F0 and the matching later tables.
             (0x81, 0x00) | (0x81, 0x02) | (0x91, 0x09) => (1, 1),
@@ -45,7 +128,7 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
             (0x91, 0x05) => (4, 1),
             (0x91, 0x0a) => (2, 1),
             (0x92, 0x0e) => (3, 0),
-            (0x92, 0x0f) if profile == NativeAbiProfile::Modern => (2, 0),
+            (0x92, 0x0f) if matches!(profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) => (2, 0),
             (0x92, 0x95) => (1, 1),
             (0x92, 0x99) => (7, 1),
             _ => return lookup(group, id),

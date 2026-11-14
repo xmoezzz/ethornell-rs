@@ -3,7 +3,8 @@
 //! and `src/engine/logic_grid_field.c` for the cleaned target code.
 
 mod grid;
-mod msvc_qsort;
+mod network;
+pub(super) mod msvc_qsort;
 mod slg;
 mod space;
 mod spline;
@@ -55,6 +56,7 @@ pub(crate) fn status_to_script(status: u32) -> i32 {
         0xA000_0004 => 8,
         0xA000_0005 => 21,
         0xA000_0006 => 22,
+        0xA000_0007..=0xA000_000B => (status-0xA000_0007+24) as i32,
         0xFFFF_FFFE => -2,
         _ => -1,
     }
@@ -66,6 +68,7 @@ const MAX_TILES: i64 = 1 << 22;
 
 #[derive(Debug, Default)]
 pub(crate) struct LogicState {
+    networks: network::Networks,
     /// dword_5669EC, newest first when searched; ids from dword_5669E4++ (0..).
     grids: Vec<(i32, GridFieldManager)>,
     next_grid: i32,
@@ -506,6 +509,12 @@ impl Vm {
                     .space(int(0))
                     .map(|space| space.remove(int(1) as u32)),
             ),
+            0x62 => done(self.logic.space(int(0)).map(|space|space.set_property(int(1) as u32,int(2),int(3)))),
+            // (out*, handle, body, property), output untouched on error.
+            0x63 => match self.logic.space(int(1)).and_then(|space|space.property(int(2) as u32,int(3))) {
+                Ok(value)=>{self.logic_write_i32(ptr(0),value)?;0},
+                Err(status)=>status,
+            },
             0x64 => done(
                 self.logic
                     .space(int(0))
@@ -562,6 +571,26 @@ impl Vm {
                     .space(int(0))
                     .map(|space| space.sweep_body(int(1) as u32, xyz(2), int(5), int(6))),
             ),
+            // 1.687 A2FF0 -> A1C20: collect swept bodies.
+            // No collisions is native 1, translated to script status 29;
+            // neither output is changed on that path.
+            0x71 => match self.logic.space(int(2)).and_then(|space|
+                space.swept_bodies(int(3) as u32,xyz(4),int(7),int(8))) {
+                Ok(list) if list.is_empty()=>return Ok(Some(29)),
+                Ok(list)=>self.write_space_list(ptr(0),ptr(1),&list)?,
+                Err(status)=>status,
+            },
+            // (out*, space, three reserved arguments, cell size, width, height,
+            // reserved, refinement, unsupported mode, excluded body, mask).
+            // A3B10 consumes only indices 5,6,7,9,10,11,12.
+            0x7b => match self.logic.space(int(1)) {
+                Err(status)=>status,
+                Ok(_) if int(10)!=0=>0xa0000007,
+                Ok(space)=>match space.density_peak(int(5),int(6),int(7),int(9),int(11),int(12))? {
+                    Err(status)=>status,
+                    Ok(point)=>{self.logic_write_i32s(ptr(0),&point)?;0}
+                }
+            },
             // (out*, count*, h, from, to, range, step, mask, sweep, resolution, threaded)
             0x72 => match self.logic.space(int(2)).and_then(|space| {
                 space.path(

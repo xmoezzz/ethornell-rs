@@ -39405,6 +39405,9 @@ pub struct NativeProcedureCompletion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeProcedureClass {
+    RegisterBitmap,
+    PlayMovieMf,
+    ExamineHealthOfFile,
     LoadSound,
     RegisterSound,
     EncodeData,
@@ -39424,6 +39427,9 @@ pub enum NativeProcedureClass {
 impl NativeProcedureClass {
     pub const fn target_class_name(self) -> &'static str {
         match self {
+            Self::RegisterBitmap => "DCProcRegisterBmp",
+            Self::PlayMovieMf => "DCProcPlayMovieByMF",
+            Self::ExamineHealthOfFile => "DCProcExamineHealthOfFile",
             Self::LoadSound => "CProcLoadSound",
             Self::RegisterSound => "DCProcRgstrSound",
             Self::EncodeData => "CProcEncodeData",

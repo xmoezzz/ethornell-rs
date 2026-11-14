@@ -27,6 +27,8 @@ struct Body {
     probe: f32,
     mask: i32,
     priority: i32,
+    /// 1.653 45CA90 / 1.687 A4200 expose two further scalar cells.
+    extended_scalars: [f32; 2],
     parent: [i32; 2],
     /// Slot lists; -1 is a free slot.
     children: [Vec<i32>; 2],
@@ -224,6 +226,7 @@ impl SpaceManager {
             probe,
             mask,
             priority,
+            extended_scalars: [0.0; 2],
             parent: [-1, -1],
             children: [Vec::new(), Vec::new()],
             pos: [snap(pos[0]), snap(pos[1]), snap(pos[2]), 0.0],
@@ -232,6 +235,43 @@ impl SpaceManager {
         };
         self.set_dir(index, dir);
         0
+    }
+
+    /// 1.653 45CA90 / 1.687 1400A4200: no radius/mask validation and
+    /// no derived-velocity update on a property write, unlike body_add.
+    pub(crate) fn set_property(&mut self, index: u32, property: i32, value: i32) -> u32 {
+        let body = match self.body_mut(index) {
+            Ok(body) => body,
+            Err(status) => return status,
+        };
+        let fixed = value as f32 * (1.0 / 65536.0);
+        match property {
+            0 => body.radius = fixed,
+            1 => body.speed = fixed,
+            2 => body.probe = fixed,
+            3 => body.mask = value,
+            4 => body.priority = value,
+            5 | 6 => body.extended_scalars[(property - 5) as usize] = fixed,
+            _ => return BAD_OTHER,
+        }
+        0
+    }
+
+    /// 1.653 45CB30 / 1.687 1400A40E0: scalar cells return 16.16;
+    /// integer mask/priority cells are copied without conversion.
+    pub(crate) fn property(&self, index: u32, property: i32) -> Result<i32, u32> {
+        let body = self.body(index)?;
+        Ok(match property {
+            0 => super::super::extended_opcodes::float_to_fixed(body.radius),
+            1 => super::super::extended_opcodes::float_to_fixed(body.speed),
+            2 => super::super::extended_opcodes::float_to_fixed(body.probe),
+            3 => body.mask,
+            4 => body.priority,
+            5 | 6 => super::super::extended_opcodes::float_to_fixed(
+                body.extended_scalars[(property - 5) as usize],
+            ),
+            _ => return Err(BAD_OTHER),
+        })
     }
 
     /// D0:61 sub_455C30.
@@ -450,10 +490,19 @@ impl SpaceManager {
         )
     }
 
-    /// sub_456D70: COLLISION when a body of `radius` moving from `a` to
-    /// `b` hits another body.
+    /// sub_456D70: old collision-only query; newer A1C20 also publishes IDs.
     #[allow(clippy::too_many_arguments)]
-    fn sweep(
+    fn sweep(&self, a: Vec4, b: Vec4, radius: f32, priority: i32, exclude: i32, mask: i32, sweep: i32) -> u32 {
+        if self.sweep_collisions(a,b,radius,priority,exclude,mask,sweep,false).is_empty() {0} else {COLLISION}
+    }
+
+    pub(crate) fn swept_bodies(&self, index: u32, point: [f32;3], mask: i32, sweep: i32) -> Result<Vec<i32>,u32> {
+        let body=self.body(index)?;
+        Ok(self.sweep_collisions(body.pos,[point[0],point[1],point[2],0.],body.radius,body.priority,index as i32,mask,sweep,true))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_collisions(
         &self,
         a: Vec4,
         b: Vec4,
@@ -462,11 +511,14 @@ impl SpaceManager {
         exclude: i32,
         mask: i32,
         sweep: i32,
-    ) -> u32 {
+        extended_mask: bool,
+    ) -> Vec<i32> {
         if a == b {
-            return 0;
+            return Vec::new();
         }
+        let flags = mask & 0x300;
         let mask = mask_or_all(mask);
+        let mut collisions = Vec::new();
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let dz = b[2] - a[2];
@@ -489,10 +541,13 @@ impl SpaceManager {
         }
         // Kept edge distances; the target leaves them in a stack array.
         let mut kept = [[f32::INFINITY; 2]; 2];
-        for (index, body) in self.bodies.iter().enumerate() {
+        'bodies: for (index, body) in self.bodies.iter().enumerate() {
             if !body.used || index as i32 == exclude || body.mask as u8 & mask == 0 {
                 continue;
             }
+            if extended_mask && !((body.mask & 0x100 != 0 && flags & 0x100 != 0)
+                || (body.mask & 0x200 != 0 && flags & 0x200 != 0)
+                || (body.mask & 0x300 == 0 && flags == 0)) { continue; }
             let c = body.pos;
             let reach = radius + body.radius;
             let rr = reach * reach;
@@ -500,7 +555,7 @@ impl SpaceManager {
             let db = len2(sub(b, c));
             if db < rr {
                 if da >= rr || priority <= body.priority {
-                    return COLLISION;
+                    collisions.push(index as i32);
                 }
                 continue;
             }
@@ -527,7 +582,8 @@ impl SpaceManager {
                     }
                 }
                 if hit[0] && hit[1] {
-                    return COLLISION;
+                    collisions.push(index as i32);
+                    continue 'bodies;
                 }
             }
             let wide = (radius + radius) * (radius + radius);
@@ -537,10 +593,90 @@ impl SpaceManager {
                 }
             }
             if hit[0] && hit[1] {
-                return COLLISION;
+                collisions.push(index as i32);
             }
         }
-        0
+        collisions
+    }
+
+    /// 1.653 45D1F0 / 1.687 A3170: find the most densely weighted XY
+    /// cell, then refine within it using body properties 5 (radius) and 6
+    /// (weight). This is a spatial query, not a drawing operation.
+    pub(crate) fn density_peak(&self,cell:i32,width:i32,height:i32,refinement:i32,exclude:i32,mask:i32)
+        -> crate::VmResult<Result<[i32;4],u32>> {
+        if cell==0 {return Ok(Err(0xa0000008))}
+        if width==0 || height==0 {return Ok(Err(0xa0000009))}
+        if refinement==0 {return Ok(Err(0xa000000a))}
+        let budget=||crate::VmError::Runtime("native density grid allocation/work limit".into());
+        let (w,h,r)=(usize::try_from(width).map_err(|_|budget())?,usize::try_from(height).map_err(|_|budget())?,usize::try_from(refinement).map_err(|_|budget())?);
+        let cells=w.checked_mul(h).filter(|&n|n<=1_048_576).ok_or_else(budget)?;
+        let fine=r.checked_mul(r).filter(|&n|n<=1_048_576).ok_or_else(budget)?;
+        if fine.checked_mul(self.bodies.len()).is_none_or(|n|n>16_777_216) {return Err(budget())}
+        let step=cell as f32;
+        let offset=[width as f32*step*0.5,height as f32*step*0.5];
+        let reciprocal=rcp_newton(step);
+        let mut grid=vec![0f64;cells];
+        let mut occupied=vec![None;self.bodies.len()];
+        let mask=mask_or_all(mask);
+        for (index,body) in self.bodies.iter().enumerate() {
+            if !body.used || index as i32==exclude || body.mask as u8&mask==0 {continue}
+            let xy=[((body.pos[0]+offset[0])*reciprocal).trunc(),((body.pos[1]+offset[1])*reciprocal).trunc()];
+            // Native SIMD checks only upper bounds and can index before the
+            // allocation for negative cells. Reject those cells explicitly.
+            if xy[0]<0. || xy[1]<0. || xy[0]>=width as f32 || xy[1]>=height as f32 {continue}
+            let slot=xy[0] as usize+xy[1] as usize*w;
+            grid[slot]+=f64::from(body.extended_scalars[1]);occupied[index]=Some(slot);
+        }
+        fn snapped(v:f64)->f64 {
+            let floor=v.floor();let fraction=v-floor;let epsilon=1./16384.;
+            if fraction>=1.-epsilon {v.ceil()} else if fraction>epsilon {v} else {floor}
+        }
+        fn select(grid:&[f64],w:usize,h:usize)->Option<[usize;2]> {
+            let get=|x:isize,y:isize|if x<0||y<0||x as usize>=w||y as usize>=h {0.} else {grid[x as usize+y as usize*w]};
+            let (mut best,mut neighbours,mut selected)=(0.,0.,None);
+            for y in 0..h {for x in 0..w {
+                let score=snapped(grid[x+y*w]);if score<=0. || score<best {continue}
+                // Preserve A3170's axis-origin tie break: these four probes
+                // use x=0/y=0, rather than the current row/column.
+                let around=snapped(((get(0,y as isize-1)+get(x as isize-1,0))+get(x as isize+1,0))+get(0,y as isize+1));
+                if score>best || around>neighbours {best=score;neighbours=around;selected=Some([x,y]);}
+            }} selected
+        }
+        let Some(coarse)=select(&grid,w,h) else {return Ok(Err(0xa000000b))};
+        let sub_step=step/refinement as f32;
+        let snap_float=|v:f32| {let f=v.floor();let fraction=v-f;let epsilon=1f32/16384.;if fraction>=1.-epsilon {v.ceil()} else if fraction>epsilon {v} else {f}};
+        let base=[snap_float(coarse[0] as f32*step+sub_step*0.5)-offset[0],snap_float(coarse[1] as f32*step+sub_step*0.5)-offset[1]];
+        let mut point=base;
+        if refinement>=2 {
+            let mut grid=vec![0f64;fine];let cell_index=coarse[0]+coarse[1]*w;
+            for (index,body) in self.bodies.iter().enumerate() {
+                let Some(slot)=occupied[index] else {continue};
+                // Native neighbours are linear slots, including row wrap.
+                if slot!=cell_index && slot as isize!=cell_index as isize-1 && slot!=cell_index+1
+                    && slot as isize!=cell_index as isize-w as isize && slot!=cell_index+w {continue}
+                let radius=body.extended_scalars[0];
+                let weight=body.extended_scalars[1];
+                let core=weight*0.66666698;
+                let slope=(weight*0.33333299)*rcp_newton(radius);
+                for y in 0..r {
+                    let mut px=base[0];let py=base[1]+y as f32*sub_step;
+                    for x in 0..r {
+                        let dx=body.pos[0]-px;let dy=body.pos[1]-py;let distance=(dx*dx+dy*dy).sqrt();
+                        if radius>=distance {grid[x+y*r]+=f64::from((radius-distance)*slope+core);}
+                        px+=sub_step;
+                    }
+                }
+            }
+            let Some(fine)=select(&grid,r,r) else {return Ok(Err(0xa000000b))};
+            point=[snap_float(fine[0] as f32*sub_step+base[0]),snap_float(fine[1] as f32*sub_step+base[1])];
+        }
+        let fixed=|v:f32| {
+            let v=(v*65536.).round_ties_even();
+            let raw=if v>=-2147483648. && v<2147483648. {v as i32} else {i32::MIN};
+            let whole=raw&!0xffff;let fraction=raw.wrapping_sub(whole);
+            if fraction>0xffc0 {whole.wrapping_add(65536)} else if fraction<0x40 {whole} else {raw}
+        };
+        Ok(Ok([fixed(point[0]),fixed(point[1]),0,0]))
     }
 
     /// D0:72 sub_456280: path from `from` to touching `to`, one 16.16
@@ -772,6 +908,39 @@ mod tests {
             );
         }
         space
+    }
+
+    #[test]
+    fn version_space_density_refinement_and_swept_output_filter() {
+        let mut space=space_with(&[([0.,0.,0.],1.),([5.,0.,0.],1.),([0.,5.,0.],1.)]);
+        assert_eq!(space.swept_bodies(0,[10.,0.,0.],0,1),Ok(vec![1]));
+        space.set_property(1,3,0x101);
+        assert_eq!(space.swept_bodies(0,[10.,0.,0.],0,1),Ok(vec![]));
+        assert_eq!(space.swept_bodies(0,[10.,0.,0.],0x101,1),Ok(vec![1]));
+        assert_eq!(space.density_peak(2,10,10,2,-1,0).unwrap(),Err(0xa000000b));
+        space.set_property(1,5,2<<16);space.set_property(1,6,10<<16);
+        let point=space.density_peak(2,10,10,2,-1,0).unwrap().unwrap();
+        assert!((point[0]-5*65536).abs()<=65536);assert!(point[1].abs()<=65536);
+        assert_eq!(space.density_peak(2,10,10,2,1,0).unwrap(),Err(0xa000000b));
+        assert_eq!(space.density_peak(0,10,10,2,-1,0).unwrap(),Err(0xa0000008));
+    }
+
+    #[test]
+    fn native_body_properties_preserve_raw_integers_and_fixed_scalars() {
+        let mut space = space_with(&[([0.0; 3], 1.0)]);
+        for property in 0..=6 {
+            let value = if matches!(property, 3 | 4) {
+                i32::MIN + 31
+            } else {
+                -0x18000
+            };
+            assert_eq!(space.set_property(0, property, value), 0);
+            assert_eq!(space.property(0, property), Ok(value));
+        }
+        assert_eq!(space.set_property(0, 7, 1), BAD_OTHER);
+        assert_eq!(space.property(0, 7), Err(BAD_OTHER));
+        assert_eq!(space.set_property(1, 0, 1), BAD_BODY);
+        assert_eq!(space.property(1, 0), Err(BAD_BODY));
     }
 
     #[test]

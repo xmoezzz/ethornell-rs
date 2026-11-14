@@ -5,6 +5,7 @@ use crate::{
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
 use ethornell_core::{EthornellError, Result, composite_native_rgba};
 use ethornell_image::{DecodedImage, write_rgba_png};
+use ethornell_render::FontProvider;
 use std::path::Path;
 
 thread_local! {
@@ -275,12 +276,40 @@ pub(crate) fn compose_runtime_frame(api: &RuntimeTraceApi, include_text: bool) -
     compose_runtime_frame_through_priority(api, include_text, None)
 }
 
+/// DCTraditionalVR clears its video surface and presents samples independently
+/// of the display tree. No scene objects/text are evaluated on this path.
+pub(crate) fn compose_global_movie_frame(api: &RuntimeTraceApi) -> DecodedImage {
+    let (width, height) = runtime_frame_size(api);
+    let Some(mut out) = new_raster(width, height) else {
+        return DecodedImage { width: 0, height: 0, rgba: Vec::new() };
+    };
+    for pixel in out.rgba.as_chunks_mut::<4>().0 {
+        *pixel = [0, 0, 0, 255];
+    }
+    if let Some(item) = api.directshow_movie_draw_item()
+        && let Some(source) = api.graph_images.get(&item.key)
+    {
+        composite_runtime_item(&mut out, source, &item);
+    }
+    out
+}
+
 pub(crate) fn compose_runtime_frame_with_diagnostics(
     api: &RuntimeTraceApi,
     include_text: bool,
 ) -> RuntimeFrameComposition {
     let render_tree_nodes = api.graph_output_draw_items().len();
-    let framebuffer = compose_runtime_frame(api, include_text);
+    let mut framebuffer = compose_runtime_frame(api, include_text);
+    // Auxiliary host controls are presentation UI, not part of the engine's
+    // bitmap capture API. Keep them out of save/transition source captures.
+    for item in api.native_control_draw_items() {
+        if let Some(image)=api.graph_images.get(&item.key) {composite_runtime_item(&mut framebuffer,image,&item);}
+    }
+    if include_text {
+        for (text,x,y,size) in api.user_modeless_dialog_text_lines() {
+            rasterize_bitmap_text(&mut framebuffer,&text,x as i32,y as i32,size,0.,100.,[0.95,0.95,0.95,1.]);
+        }
+    }
     let framebuffer_hash = stable_framebuffer_hash(&framebuffer);
     RuntimeFrameComposition {
         framebuffer,
@@ -738,12 +767,13 @@ fn draw_transformed_text_node(
         TextNodeShadow::Default(shadow) => (shadow, None),
         TextNodeShadow::Message(effect) => (None, effect),
     };
-    let scale = PxScale::from(node.size.max(12.0));
+    let scale = FontProvider::pixel_em_scale(&font, node.size.max(12.0));
     let scaled = font.as_scaled(scale);
     let line_height = layout.line_height;
     let max_x = (dst.width as f32 - 36.0).max(node.x + 64.0);
     let mut x = node.x;
-    let mut y = node.y + layout.body_y_offset + scaled.ascent();
+    let ascent = FontProvider::cell_ascent(&font, node.size.max(12.0));
+    let mut y = node.y + layout.body_y_offset + ascent;
     let mut char_index = 0usize;
 
     for ch in node.text.chars() {
@@ -769,7 +799,7 @@ fn draw_transformed_text_node(
                 ch,
                 index: char_index,
                 x,
-                y: y - scaled.ascent(),
+                y: y - ascent,
             };
             rasterize_transformed_glyph_records(
                 dst,
@@ -856,9 +886,9 @@ fn draw_text_run(
         return;
     }
     check_font_coverage(font, text.chars());
-    let scale = PxScale::from(size);
+    let scale = FontProvider::pixel_em_scale(font, size);
     let scaled = font.as_scaled(scale);
-    let baseline = y + scaled.ascent();
+    let baseline = y + FontProvider::cell_ascent(font, size);
     for ch in text.chars() {
         let glyph_id = font.glyph_id(ch);
         let advance = scaled.h_advance(glyph_id).max(size * 0.5);
@@ -964,7 +994,7 @@ pub(crate) fn rasterize_bitmap_text(
         return (x.round() as i32, line_y.round() as i32);
     };
 
-    let scale = PxScale::from(size);
+    let scale = FontProvider::pixel_em_scale(&font, size);
     let scaled = font.as_scaled(scale);
     for ch in text.chars() {
         if ch == '\n' {
@@ -974,7 +1004,7 @@ pub(crate) fn rasterize_bitmap_text(
         }
         let glyph_id = font.glyph_id(ch);
         let advance = scaled.h_advance(glyph_id).max(size * 0.5);
-        let baseline = line_y + scaled.ascent();
+        let baseline = line_y + FontProvider::cell_ascent(&font, size);
         let glyph = glyph_id.with_scale_and_position(scale, point(x, baseline));
         draw_glyph(dst, &font, glyph, color, 0, 0, false, false, None);
         // Config resources use 100%; preserve the target's horizontal-scale
@@ -1124,8 +1154,9 @@ pub(crate) fn layout_styled_bitmap_text(
         allocated=allocated.saturating_add(cell.rgba.len());if allocated>MAX_RASTER_BYTES {record_raster_error("styled text cell budget exceeded");return (Vec::new(),0);}
         let mut ink_left=cell.width;let mut ink_right=0u32;let mut has_ink=false;
         if let Some(font)=&font {
-            let scale=PxScale{x:size as f32*width_percent as f32/100.0,y:size as f32};
-            let baseline=font.as_scaled(scale).ascent();
+            let base = FontProvider::pixel_em_scale(font, size as f32);
+            let scale = PxScale { x: base.x * width_percent as f32 / 100.0, y: base.y };
+            let baseline = FontProvider::cell_ascent(font, size as f32);
             if let Some(outlined)=font.outline_glyph(font.glyph_id(ch).with_scale_and_position(scale,point(0.0,baseline))) {
                 let bounds=outlined.px_bounds();
                 if valid_glyph_bounds(bounds) {outlined.draw(|gx,gy,coverage|{
@@ -1180,13 +1211,13 @@ fn direct_text_glyph_cell(code: u32, size: u32, bold: bool) -> Vec<bool> {
     let Some(font) = snapshot_font() else {
         return ink;
     };
-    let scale = PxScale::from(size as f32);
+    let scale = FontProvider::pixel_em_scale(&font, size as f32);
     let scaled = font.as_scaled(scale);
     let mut pen = 0.0_f32;
     for ch in text.chars() {
         let glyph = font
             .glyph_id(ch)
-            .with_scale_and_position(scale, point(pen, scaled.ascent()));
+            .with_scale_and_position(scale, point(pen, FontProvider::cell_ascent(&font, size as f32)));
         pen += scaled.h_advance(font.glyph_id(ch));
         let Some(outlined) = font.outline_glyph(glyph) else {
             continue;
@@ -1225,7 +1256,7 @@ pub(crate) fn glyph_advance(ch: char, size: f32, horizontal_scale_percent: f32) 
     let size = size.max(1.0);
     let base = match snapshot_font() {
         Some(font) => font
-            .as_scaled(PxScale::from(size))
+            .as_scaled(FontProvider::pixel_em_scale(&font, size))
             .h_advance(font.glyph_id(ch))
             .max(size * 0.5),
         None if ch.is_ascii() => size * 0.5,
@@ -1247,8 +1278,8 @@ pub(crate) fn rasterize_placed_glyphs(
         return;
     }
     let size = size.max(1.0);
-    let scale = PxScale::from(size);
     let font = snapshot_font();
+    let scale = font.as_ref().map_or(PxScale::from(size), |f| FontProvider::pixel_em_scale(f, size));
     if let Some(font) = font.as_ref() {
         check_font_coverage(font, glyphs.iter().map(|glyph| glyph.ch));
     }
@@ -1259,7 +1290,7 @@ pub(crate) fn rasterize_placed_glyphs(
         let color = color_of(glyph.index).unwrap_or(color);
         match font.as_ref() {
             Some(font) => {
-                let baseline = glyph.y + font.as_scaled(scale).ascent();
+                let baseline = glyph.y + FontProvider::cell_ascent(font, size);
                 let placed = font
                     .glyph_id(glyph.ch)
                     .with_scale_and_position(scale, point(glyph.x, baseline));
@@ -1308,14 +1339,18 @@ fn glyph_cell(
     y: f32,
     size: f32,
     rgb: [u8; 3],
+    horizontal_scale:f32,
+    bold:bool,
+    italic:bool,
     transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
 ) -> Option<(DecodedImage, i32, i32)> {
     if !valid_text_position(x, y) {
         return None;
     }
     let ratios = transform.map_or([1.0; 2], |t| t.scales());
-    let scale = PxScale { x: size * ratios[0], y: size * ratios[1] };
-    let baseline = (y + font.as_scaled(PxScale::from(size)).ascent()) * ratios[1];
+    let base = FontProvider::pixel_em_scale(font, size);
+    let scale = PxScale { x: base.x * horizontal_scale * ratios[0], y: base.y * ratios[1] };
+    let baseline = (y + FontProvider::cell_ascent(font, size)) * ratios[1];
     let outlined = font.outline_glyph(
         font.glyph_id(ch)
             .with_scale_and_position(scale, point(x * ratios[0], baseline)),
@@ -1325,15 +1360,18 @@ fn glyph_cell(
         return None;
     }
     let (left, top) = (bounds.min.x as i32, bounds.min.y as i32);
-    let width = (bounds.max.x as i32 - left).max(1) as u32;
     let height = (bounds.max.y as i32 - top).max(1) as u32;
+    let width = (bounds.max.x as i32 - left).max(1) as u32
+        +u32::from(bold)+if italic {(height as f32*0.2).ceil() as u32} else {0};
     let mut cell = new_raster(width, height)?;
     outlined.draw(|gx, gy, coverage| {
-        if gx < width && gy < height {
-            let at = ((gy * width + gx) * 4) as usize;
-            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
-            if alpha > cell.rgba[at + 3] {
-                cell.rgba[at..at + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+        let gx=gx+if italic {((height-gy) as f32*0.2).round() as u32} else {0};
+        for stroke in 0..=u32::from(bold) {
+            let gx=gx+stroke;
+            if gx < width && gy < height {
+                let at = ((gy * width + gx) * 4) as usize;
+                let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                if alpha > cell.rgba[at + 3] {cell.rgba[at..at + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);}
             }
         }
     });
@@ -1374,6 +1412,15 @@ pub(crate) fn rasterize_transformed_glyph_records(
     shadow: Option<TextShadow>,
     transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
 ) {
+    rasterize_styled_glyph_records(dst,dst_format,glyphs,size,color,color_of,shadow,transform,&|_|(size,1.,false,false));
+}
+
+pub(crate) fn rasterize_styled_glyph_records(
+    dst:&mut DecodedImage,dst_format:i32,glyphs:&[crate::text_layout::PlacedGlyph],size:f32,
+    color:[f32;4],color_of:&dyn Fn(usize)->Option<[f32;4]>,shadow:Option<TextShadow>,
+    transform:Option<crate::native_graph_sys91::Graph91FontTransform>,
+    metrics:&dyn Fn(usize)->(f32,f32,bool,bool),
+) {
     if !valid_raster(dst) || !valid_text_raster(size, glyphs.len()) {
         return;
     }
@@ -1382,13 +1429,14 @@ pub(crate) fn rasterize_transformed_glyph_records(
         return;
     };
     check_font_coverage(&font, glyphs.iter().map(|glyph| glyph.ch));
-    let size = size.max(1.0);
     let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     let shadow = shadow.filter(|shadow| matches!(shadow.mode, 1 | 2));
     for glyph in glyphs {
+        let (size,width,bold,italic)=metrics(glyph.index);
+        if !valid_text_raster(size,1)||!width.is_finite()||width<=0.||width>128. {record_raster_error("invalid styled glyph metrics");return;}
         let color = color_of(glyph.index).unwrap_or(color);
         let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
-        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb, transform)
+        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb,width,bold,italic,transform)
         else {
             continue;
         };
@@ -1474,7 +1522,7 @@ pub(crate) fn measure_text_advance(text: &str, size: f32, spacing: f32) -> i32 {
         return 0;
     }
     let width = if let Some(font) = snapshot_font() {
-        let scaled = font.as_scaled(PxScale::from(size.max(1.0)));
+        let scaled = font.as_scaled(FontProvider::pixel_em_scale(&font, size));
         text.chars()
             .map(|character| scaled.h_advance(font.glyph_id(character)))
             .sum::<f32>()
@@ -1567,6 +1615,7 @@ fn draw_transformed_glyph(
     if !valid_text_position(glyph.position.x, glyph.position.y) { return; }
     let ratios = transform.scales();
     let size = glyph.scale.y;
+    let logical_size = size / FontProvider::pixel_em_scale(font, 1.0).y;
     let high = ab_glyph::Glyph {
         scale: PxScale { x: glyph.scale.x * ratios[0], y: size * ratios[1] },
         position: point(glyph.position.x * ratios[0], glyph.position.y * ratios[1]),
@@ -1581,8 +1630,8 @@ fn draw_transformed_glyph(
         cell.rgba[at..at+4].copy_from_slice(&[255, 255, 255, (coverage * 255.0).round() as u8]);
     });
     let cell = crate::font_transform::reduce_glyph_coverage(&cell, ratios);
-    let left = (bounds.min.x / ratios[0] + size * transform.offset_x as f32 / 65536.0).floor() as i32;
-    let top = (bounds.min.y / ratios[1] + size * transform.offset_y as f32 / 65536.0).floor() as i32;
+    let left = (bounds.min.x / ratios[0] + logical_size * transform.offset_x as f32 / 65536.0).floor() as i32;
+    let top = (bounds.min.y / ratios[1] + logical_size * transform.offset_y as f32 / 65536.0).floor() as i32;
     for gy in 0..cell.height {
         for gx in 0..cell.width {
             let coverage = cell.rgba[((gy * cell.width + gx) * 4 + 3) as usize] as f32 / 255.0;
@@ -2397,6 +2446,7 @@ mod styled_text_snapshot_tests {
                     packed_rgb: Some(0xff0000),
                     bold: true,
                     italic: true,
+                    ..RuntimeTextStyle::default()
                 },
             }],
         };

@@ -2,11 +2,8 @@ use super::{Value, Vm, VmError, VmResult};
 
 #[derive(Debug, Default)]
 pub(super) struct ExtendedOpcodeState {
-    memory_handle_mode: bool,
     clipboard_text: String,
     last_modal_list: Option<(i32, String)>,
-    last_resource_transform: [i32; 7],
-    last_resource_blend: [i32; 5],
     last_legacy_3d_call: Option<(u8, Vec<i32>)>,
     last_debug_inspection: Option<u8>,
 }
@@ -117,7 +114,8 @@ impl Vm {
     }
 
     pub(super) fn execute_set_memory_mode(&mut self) -> VmResult<()> {
-        self.extended_opcodes.memory_handle_mode = self.pop_int()? != 0;
+        let enabled=self.pop_int()?!=0;
+        self.system81_shared.lock().expect("system81 state poisoned").memory_guard.enabled=enabled;
         Ok(())
     }
 
@@ -130,12 +128,28 @@ impl Vm {
         Ok(0)
     }
 
-    pub(super) fn execute_resource_transform(&mut self) -> VmResult<()> {
-        let mut values = [0; 7];
-        for value in &mut values {
-            *value = self.pop_int()?;
+    /// BP 7D, 140037570 -> 041380: a hexadecimal memory dump drawn into
+    /// a bitmap, sixteen input bytes per row, using the stock font.
+    pub(super) fn execute_resource_transform<A:super::GraphApi>(&mut self,api:&mut A) -> VmResult<()> {
+        let color=self.pop_int()?;
+        let height=self.pop_int()?;
+        let size=self.pop_int()?;
+        let source=self.pop_ptr()?;
+        let y=self.pop_int()?;
+        let x=self.pop_int()?;
+        let bitmap=self.pop_int()?;
+        if !(0..0x4000).contains(&bitmap) {return Err(VmError::Runtime(format!("invalid hex-dump bitmap {bitmap}")))}
+        if !(1..=1024).contains(&size) {return Err(VmError::Runtime(format!("invalid hex-dump size {size}")))}
+        let range=self.resolve_range(source,size as usize)?;
+        let bytes=self.memory[range].to_vec();
+        for (row,bytes) in bytes.chunks(16).enumerate() {
+            let mut text=format!("{:04X} : ",row*16);
+            for b in bytes {use std::fmt::Write;write!(&mut text,"{b:02X} ").unwrap();}
+            let args=vec![Value::Int(bitmap),Value::Int(x),Value::Int(y.wrapping_add((row as i32).wrapping_mul(height))),
+                Value::Str(text),Value::Int(0),Value::Int(height),Value::Int(0),Value::Int(0),Value::Int(color)];
+            let mut call=super::NativeCallFrame::new(super::native_call::opcodes::GRAPH92_DRAW_BITMAP_TEXT,args);
+            api.call_graph(&mut call)?;
         }
-        self.extended_opcodes.last_resource_transform = values;
         Ok(())
     }
 
@@ -144,16 +158,25 @@ impl Vm {
         Ok(1)
     }
 
-    pub(super) fn execute_resource_blend(&mut self) -> VmResult<()> {
-        let mut values = [0; 5];
-        for value in &mut values {
-            *value = self.pop_int()?;
-        }
-        self.extended_opcodes.last_resource_blend = values;
-        Ok(())
+    /// 475510 -> 40BD60/40BDB0: premultiplied interpolation of two ARGB
+    /// sources over an RGB destination. Missing or wrong-format resources
+    /// are deliberate native no-ops; the opcode has no return value.
+    pub(super) fn execute_resource_blend<A:super::GraphApi>(&mut self,api:&mut A) -> VmResult<()> {
+        let transparency=self.pop_int()?;
+        let mix=self.pop_int()?;
+        let second=self.pop_int()?;
+        let first=self.pop_int()?;
+        let destination=self.pop_int()?;
+        api.blend_native_bitmap_sources(destination,first,second,mix,transparency)
     }
 
     pub(super) fn execute_legacy_3d(&mut self, id: u8) -> VmResult<Option<Value>> {
+        if let Some(result) = self.execute_network(id)? { return Ok(Some(result)); }
+        if matches!(id,0x62|0x63|0x71|0x7b) && !matches!(self.native_abi_profile,
+            crate::NativeAbiProfile::Anipani | crate::NativeAbiProfile::ModernFused) {
+            return Err(VmError::UnknownDispatch {group:0xd0,id:id as u16});
+        }
+
         let Some((argc, returns_value)) = legacy_3d_abi(id) else {
             return Err(VmError::UnknownDispatch {
                 group: 0xd0,
@@ -171,11 +194,18 @@ impl Vm {
             return Ok(returns_value.then_some(Value::Int(result)));
         }
 
-        // Every registered selector is ported; keep the stack balanced anyway.
-        let result = 0;
-        Ok(returns_value.then_some(Value::Int(result)))
+        Err(VmError::UnknownDispatch {
+            group: 0xd0,
+            id: u16::from(id),
+        })
     }
 
+    // Native table audit: 1.653 has E0:00/40/80 (diagnostic lists), plus
+    // 90/92/94/96/C0/C2. 1.687 has those three lists plus
+    // 20/3F/90/91/92/93/C0/C2. Only the lists have a windowless policy here;
+    // Operational selectors are implemented by native_diagnostics and
+    // native_inspector; none may alias a zero-argument diagnostic list.
+    // See 4653F0 / 1400AA5D0 and their tables.
     pub(super) fn execute_debug_inspect(&mut self, id: u8) -> VmResult<()> {
         if !matches!(id, 0x00 | 0x40 | 0x80) {
             return Err(VmError::UnknownDispatch {
@@ -250,6 +280,7 @@ fn legacy_3d_abi(id: u8) -> Option<(usize, bool)> {
         0x40 | 0x41 => (1, true),
         0x60 => (13, true),
         0x61 => (2, true),
+        0x62 | 0x63 => (4, true),
         0x64 => (5, true),
         0x65 => (3, true),
         0x66 => (5, true),
@@ -257,6 +288,7 @@ fn legacy_3d_abi(id: u8) -> Option<(usize, bool)> {
         0x68 | 0x69 => (4, true),
         0x6a => (5, true),
         0x70 => (7, true),
+        0x71 => (9, true),
         0x72 => (11, true),
         0x74 => (5, true),
         0x75 => (9, true),
@@ -264,6 +296,7 @@ fn legacy_3d_abi(id: u8) -> Option<(usize, bool)> {
         0x79 => (4, true),
         // sub_4787C0 pops five integers and one pointer.
         0x7a => (6, true),
+        0x7b => (13, true),
         0x80 => (1, false),
         0x81 => (1, true),
         0x84 | 0x87 | 0x8c => (2, true),

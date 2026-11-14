@@ -6,12 +6,23 @@ impl RuntimeTraceApi {
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
     ) -> Option<ethornell_vm::VmResult<ethornell_vm::Value>> {
-        if call.group() != 0x92 || call.id() > 0x1f {
+        if call.group() != 0x92 || (call.id() > 0x1f && call.id() != 0x31) {
             return None;
         }
         let id = call.id();
         let stack = call.args_mut();
         let value = match id {
+            0x31 => {
+                // 48F940 -> 46B120 -> 449CA0: release by resolved native
+                // class. Return false for an invalid handle, without a trap.
+                let object = pop_int_value(stack).unwrap_or_default();
+                let removed = match self.release_native_display_object(object) {
+                    Ok(removed)=>removed,Err(error)=>return Some(Err(error)),
+                };
+                if removed { self.display_changes += 1; }
+                ethornell_vm::Value::Int(i32::from(removed))
+            }
+
             0x00 => {
                 // sub_485FA0 -> sub_462430 -> sub_409AE0. pop_args keeps
                 // native reverse-pop order, which configure_compact_wave_table

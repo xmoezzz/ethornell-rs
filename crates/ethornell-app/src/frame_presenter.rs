@@ -6,6 +6,69 @@ const MAX_FRAME_ITEMS: usize = 65_536;
 const MAX_FRAME_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FRAME_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Default)]
+pub(crate) struct GpuPresenter {
+    schedule: presentation::FrameSchedule,
+    scene: Vec<RenderCommand>,
+    movie_texture: Option<(String, CachedGraphTexture)>,
+}
+
+fn clear_frame() -> Vec<RenderCommand> {
+    vec![RenderCommand::Clear { color: [0.0, 0.0, 0.0, 1.0] }]
+}
+
+/// Keep the last submitted scene while global DirectShow samples own the
+/// presentation surface. Bitmap-backed samples remain ordinary scene inputs.
+pub(crate) fn prepare_frame(
+    renderer: &mut Renderer<'_>,
+    api: &mut RuntimeTraceApi,
+    textures: &mut BTreeMap<String, CachedGraphTexture>,
+    presenter: &mut GpuPresenter,
+) -> Result<Option<Vec<RenderCommand>>> {
+    let plan = presenter.schedule.plan(api);
+    if !plan.present {
+        return Ok(None);
+    }
+    if plan.refresh_scene {
+        presenter.scene = prepare_scene_frame(renderer, api, textures)?;
+    }
+    let commands = if plan.movie_active {
+        let mut commands = clear_frame();
+        if let Some(item) = api.directshow_movie_draw_item() {
+            let image = api.graph_images.get(&item.key).expect("movie draw image");
+            check_frame_budget(2, image_bytes(image)?, 0)?;
+            let revision = api.graph_image_revision(&item.key);
+            if presenter.movie_texture.as_ref().is_some_and(|(key, _)| *key != item.key)
+                && let Some((_, old)) = presenter.movie_texture.take()
+            {
+                renderer.remove_texture(old.handle.id);
+            }
+            match presenter.movie_texture.as_mut() {
+                Some((_, cached)) if cached.revision != revision => {
+                    cached.handle = renderer.update_rgba(&cached.handle, image)?;
+                    cached.revision = revision;
+                }
+                Some(_) => {}
+                None => {
+                    presenter.movie_texture = Some((item.key.clone(), CachedGraphTexture {
+                        handle: renderer.insert_rgba(image)?, revision,
+                    }));
+                }
+            }
+            let (_, cached) = presenter.movie_texture.as_ref().expect("movie texture");
+            commands.push(texture_command(&item, &cached.handle, graph_render_z(item.z)));
+        }
+        commands
+    } else {
+        if let Some((_, old)) = presenter.movie_texture.take() {
+            renderer.remove_texture(old.handle.id);
+        }
+        if presenter.scene.is_empty() { clear_frame() } else { presenter.scene.clone() }
+    };
+    presenter.schedule.commit(plan);
+    Ok(Some(commands))
+}
+
 fn check_frame_budget(count: usize, texture_bytes: usize, text_bytes: usize) -> Result<()> {
     if count > MAX_FRAME_ITEMS
         || texture_bytes > MAX_FRAME_TEXTURE_BYTES
@@ -44,7 +107,7 @@ fn validate_text(text: &str, size: f32) -> Result<()> {
 /// One compositor for the window and host-driven frontends. Texture revisions,
 /// flattened display priority, bitmap alpha/blending, clipped text and ruby all
 /// originate in the same native display tree.
-pub(crate) fn prepare_frame(
+fn prepare_scene_frame(
     renderer: &mut Renderer<'_>,
     api: &RuntimeTraceApi,
     textures: &mut BTreeMap<String, CachedGraphTexture>,
@@ -57,7 +120,7 @@ pub(crate) fn prepare_frame(
         0,
     )?;
     let mut items = api.graph_output_draw_items();
-    items.extend(api.directshow_movie_draw_item());
+    items.extend(api.native_control_draw_items());
     let used = items
         .iter()
         .map(|i| i.key.as_str())
@@ -147,25 +210,7 @@ fn compose_commands(
         // Preserve the recovered BackF exception for projected Sprite 5/6:
         // stable renderer z sorting must not undo native display-tree order.
         flattened_z = item.z.max(flattened_z);
-        commands.push(RenderCommand::DrawTexture {
-            texture: texture.id,
-            x: item.x,
-            y: item.y,
-            width: item.width,
-            height: item.height,
-            src_x: item.src_x / texture.width as f32,
-            src_y: item.src_y / texture.height as f32,
-            src_width: item.src_width / texture.width as f32,
-            src_height: item.src_height / texture.height as f32,
-            opacity: item.opacity,
-            ignore_source_alpha: item.ignore_source_alpha,
-            blend_mode: item.blend_mode,
-            rotation_degrees: item.rotation_degrees,
-            destination_quad: item.destination_quad,
-            linear_sampling: item.linear_sampling,
-            clip: item.clip.map(|c| [c.x, c.y, c.width, c.height]),
-            z: graph_render_z(flattened_z),
-        });
+        commands.push(texture_command(&item, texture, graph_render_z(flattened_z)));
     }
     for node in api
         .text_nodes
@@ -352,6 +397,32 @@ fn compose_commands(
     }
     check_frame_budget(commands.len(), 0, text_bytes)?;
     Ok(commands)
+}
+
+fn texture_command(
+    item: &crate::graph::RuntimeGraphDrawItem,
+    texture: &TextureHandle,
+    z: i32,
+) -> RenderCommand {
+    RenderCommand::DrawTexture {
+        texture: texture.id,
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height: item.height,
+        src_x: item.src_x / texture.width as f32,
+        src_y: item.src_y / texture.height as f32,
+        src_width: item.src_width / texture.width as f32,
+        src_height: item.src_height / texture.height as f32,
+        opacity: item.opacity,
+        ignore_source_alpha: item.ignore_source_alpha,
+        blend_mode: item.blend_mode,
+        rotation_degrees: item.rotation_degrees,
+        destination_quad: item.destination_quad,
+        linear_sampling: item.linear_sampling,
+        clip: item.clip.map(|c| [c.x, c.y, c.width, c.height]),
+        z,
+    }
 }
 
 /// Renderer depth of a graph object at native priority `z`; depths 0 and 1

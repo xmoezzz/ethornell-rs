@@ -19,6 +19,12 @@ impl Vm {
                 // image to the current CThread's module chain.
                 let file = self.pop_string_lossy()?;
                 let archive = self.pop_string_lossy()?;
+                if file.is_empty() {
+                    // Native sub_465AB0 rejects a missing module; do not let
+                    // the host's empty-program fallback create an endless
+                    // load/free loop with an invalid module name.
+                    return Err(VmError::Runtime("empty native module name".into()));
+                }
                 // sub_465AB0 failing to read/decode the module is fatal.
                 let Some(mut program) = api.load_program(&archive, &file) else {
                     return Err(VmError::Runtime(format!(
@@ -90,7 +96,7 @@ impl Vm {
                 self.set_newest_async_thread_regions(code_bytes, data_bytes, slots);
                 Value::Int(thread_id)
             }
-            opcodes::SYS_CURRENT_THREAD_ID => Value::Int(self.thread.thread_id()),
+            opcodes::SYS_CURRENT_THREAD_ID => Value::Int(self.parallel_worker_index.unwrap_or(self.thread.thread_id())),
             opcodes::SYS_THREAD_EXISTS => {
                 let thread_or_program = self.pop_value()?;
                 Value::Int(self.async_program_is_active(thread_or_program))
