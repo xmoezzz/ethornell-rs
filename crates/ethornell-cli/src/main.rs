@@ -107,7 +107,7 @@ enum Command {
     Run {
         #[arg(long)]
         game: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Trace every VM instruction while running the game")]
         trace: bool,
         #[arg(
             long,
@@ -220,6 +220,7 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    #[command(about = "Trace one BP program without the game event loop; use run --trace for gameplay")]
     VmTrace {
         #[arg(long)]
         game: PathBuf,

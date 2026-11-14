@@ -341,8 +341,10 @@ mod tests {
         let initial = api.prepare_projected_source(20, 10, -1, 0, 65536, true).unwrap();
         assert_eq!(initial.image.unwrap(), red);
         assert!(!api.native_projection_mips[&20].bindings[0].2.is_empty());
-        let key = api.graph_resources[&10].key.clone();
-        api.store_graph_image(key, blue.clone());
+        api.store_runtime_bitmap(11, blue.clone(), 2);
+        let generation = api.graph_resources[&10].generation;
+        api.composite_graph_bitmap(10, 11, 0, 0, 0x80, 0).unwrap();
+        assert_eq!(api.graph_resources[&10].generation, generation);
         let moved = api.prepare_projected_source(20, 10, -1, 0, 65536, true).unwrap();
         assert!(moved.image.is_none());
         assert_eq!(moved.level, 0);
