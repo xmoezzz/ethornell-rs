@@ -270,9 +270,10 @@ pub(crate) fn rasterize_text(
     styles: &[TextStyleSpan],
 ) -> DecodedImage {
     let lines: Vec<&str> = text.split('\n').collect();
-    let scale = PxScale::from(px_height.max(1.0));
+    let scale = FontProvider::pixel_em_scale(font, px_height);
     let scaled = font.as_scaled(scale);
-    let line_height = (scaled.ascent() - scaled.descent() + scaled.line_gap())
+    let cell_metrics = font.as_scaled(PxScale::from(px_height.max(1.0)));
+    let line_height = (cell_metrics.ascent() - cell_metrics.descent() + cell_metrics.line_gap())
         .ceil()
         .max(px_height.ceil()) as u32;
     let line_pitch = line_pitch
@@ -299,7 +300,8 @@ pub(crate) fn rasterize_text(
 
     let mut char_index = 0usize;
     for (line_index, line) in lines.iter().enumerate() {
-        let baseline_y = (line_index as f32 * line_pitch).round() + scaled.ascent();
+        let baseline_y =
+            (line_index as f32 * line_pitch).round() + FontProvider::cell_ascent(font, px_height);
         let mut cursor_x = 0.0f32;
         for ch in line.chars() {
             let style = text_style_at(styles, char_index);
@@ -436,13 +438,53 @@ fn text_style_at(styles: &[TextStyleSpan], char_index: usize) -> Option<TextStyl
 }
 
 fn measure_line(font: &FontArc, text: &str, px_height: f32) -> u32 {
-    let scale = PxScale::from(px_height.max(1.0));
+    let scale = FontProvider::pixel_em_scale(font, px_height);
     let scaled = font.as_scaled(scale);
     text.chars()
         .map(|c| scaled.h_advance(font.glyph_id(c)))
         .sum::<f32>()
         .ceil()
         .max(1.0) as u32
+}
+
+#[cfg(test)]
+mod font_size_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires ETHORNELL_FONT_TEST_SOURCE pointing to a runtime CJK font"]
+    fn full_width_text_keeps_script_size_and_line_pitch() {
+        let path = std::env::var_os("ETHORNELL_FONT_TEST_SOURCE").expect("runtime CJK font path");
+        let font = FontProvider::load_file(path, 0).unwrap();
+        FontProvider::require_coverage(&font, "日鬱語").unwrap();
+        let image = rasterize_text(&font, "日鬱語", 24.0, None, [1.0; 4], &[]);
+        // Full-width advances remain 24 logical pixels even with a face whose
+        // hhea ascender/descender box is substantially taller than its em.
+        assert!((72..=73).contains(&image.width), "width={}", image.width);
+        assert!(image.height >= 24);
+        for ch in "日鬱語".chars() {
+            let glyph = font.glyph_id(ch).with_scale_and_position(
+                FontProvider::pixel_em_scale(&font, 24.0),
+                ab_glyph::point(0.0, FontProvider::cell_ascent(&font, 24.0)),
+            );
+            let bounds = font.outline_glyph(glyph).unwrap().px_bounds();
+            assert!(
+                bounds.min.y >= 0.0 && bounds.max.y <= 24.0,
+                "clipped {ch}: {bounds:?}"
+            );
+        }
+        for cell in 0..3 {
+            let ink_rows = (0..image.height)
+                .filter(|&y| {
+                    (cell * 24..(cell + 1) * 24)
+                        .any(|x| image.rgba[((y * image.width + x) * 4 + 3) as usize] > 32)
+                })
+                .count();
+            assert!(ink_rows >= 18, "cell {cell}: only {ink_rows} ink rows");
+        }
+        let multiline = rasterize_text(&font, "日\n月", 24.0, Some(32.0), [1.0; 4], &[]);
+        assert_eq!(multiline.height, image.height + 32);
+    }
 }
 
 pub(crate) const SYSTEM_CJK_FONT_CANDIDATES: &[&str] = &[

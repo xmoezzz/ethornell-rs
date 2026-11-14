@@ -1,4 +1,4 @@
-use ab_glyph::{Font, FontArc, FontVec};
+use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
 use ethornell_core::{EthornellError, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -8,6 +8,31 @@ use std::path::Path;
 pub struct FontProvider;
 
 impl FontProvider {
+    /// BGI's logical font size measures a full-width em, not the substitute
+    /// face's ascent+descent. PxScale measures the latter: using the script
+    /// size directly shrinks Noto CJK (1448 height units per 1000-unit em).
+    /// Keep this conversion shared by rasterization and advance measurement.
+    pub fn pixel_em_scale(font: &FontArc, size: f32) -> PxScale {
+        let size = size.max(1.0);
+        let height = font.height_unscaled();
+        let factor = font
+            .units_per_em()
+            .filter(|em| em.is_finite() && *em > 0.0 && height.is_finite() && height > 0.0)
+            .map_or(1.0, |em| height / em);
+        PxScale::from(size * factor)
+    }
+
+    /// Align replacement outlines to BGI's logical cell rather than the face's
+    /// extra vertical headroom. The em-font path in sub_42DF40 subtracts
+    /// max(tmAscent - 7 * height / 8, 0) from the rasterized glyph origin.
+    /// Apply that same baseline limit before drawing into fixed-height cells.
+    pub fn cell_ascent(font: &FontArc, size: f32) -> f32 {
+        let size = size.max(1.0);
+        font.as_scaled(Self::pixel_em_scale(font, size))
+            .ascent()
+            .min(size * 7.0 / 8.0)
+    }
+
     /// Loads exactly the requested face (TTC/OTC indices are zero-based).
     /// Explicit selection never silently falls back to a different file/face.
     pub fn load_file(path: impl AsRef<Path>, face_index: u32) -> Result<FontArc> {
