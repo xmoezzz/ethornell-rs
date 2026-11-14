@@ -14,25 +14,59 @@ fn font_name(name: &str) -> bool {
         })
 }
 
+fn font_directory(name: &str) -> bool {
+    name.eq_ignore_ascii_case("font") || name.eq_ignore_ascii_case("fonts")
+}
+
 pub(super) fn load(root: &Path, required: &str) -> Option<FontArc> {
     let policy = file_policy::active();
     let mut names = if let Some(policy) = &policy {
-        policy
+        let mut names = policy
             .enumerate("bgi-resource/*", false, 0, false)
+            .unwrap_or_default();
+        for directory in policy
+            .enumerate("bgi-resource/*", false, 0, true)
             .unwrap_or_default()
+        {
+            if !font_directory(&directory) {
+                continue;
+            }
+            names.extend(
+                policy
+                    .enumerate(&format!("bgi-resource/{directory}/*"), false, 128, false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|name| format!("{directory}/{name}")),
+            );
+        }
+        names
     } else {
-        std::fs::read_dir(root)
-            .ok()?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                entry
-                    .file_type()
-                    .ok()?
-                    .is_file()
-                    .then(|| entry.file_name().into_string().ok())
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(root).ok()?.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if kind.is_file() {
+                names.push(name);
+            } else if kind.is_dir() && font_directory(&name) {
+                for child in std::fs::read_dir(entry.path())
+                    .into_iter()
                     .flatten()
-            })
-            .collect()
+                    .flatten()
+                    .take(128)
+                {
+                    if child.file_type().is_ok_and(|kind| kind.is_file()) {
+                        if let Ok(child) = child.file_name().into_string() {
+                            names.push(format!("{name}/{child}"));
+                        }
+                    }
+                }
+            }
+        }
+        names
     };
     names.retain(|name| font_name(name));
     names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
@@ -99,14 +133,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ethornell-game-font-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("00-broken.ttf"), b"not a font").unwrap();
-        std::fs::write(root.join("10-text.TTC"), bytes).unwrap();
+        std::fs::create_dir(root.join("Font")).unwrap();
+        std::fs::write(root.join("Font/10-text.TTC"), bytes).unwrap();
         let font = load(&root, "A日本語中文").unwrap();
         assert_eq!(font.glyph_id('A'), expected.glyph_id('A'));
         assert_eq!(
             font.h_advance_unscaled(font.glyph_id('A')),
             expected.h_advance_unscaled(expected.glyph_id('A'))
         );
-        std::fs::remove_file(root.join("10-text.TTC")).unwrap();
+        std::fs::remove_file(root.join("Font/10-text.TTC")).unwrap();
         assert!(load(&root, "A日本語中文").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -32,7 +32,7 @@ struct Cli {
     /// the program), a folder dialog asks for one; a folder dropped on the
     /// program arrives here.
     game: Option<PathBuf>,
-    /// Display text: auto, cp932 (Shift-JIS), or gbk. Overrides ETHORNELL_TEXT_ENCODING.
+    /// Display text: auto, cp932 (Shift-JIS), gbk, or utf8. Overrides ETHORNELL_TEXT_ENCODING.
     #[arg(long, global = true)]
     text_encoding: Option<ethornell_app::TextEncoding>,
 }
@@ -1788,6 +1788,9 @@ mod encoding_cli_tests {
         }
         let cli = Cli::try_parse_from(["ethornell", "run", "--game", "game"]).unwrap();
         assert_eq!(cli.text_encoding, None); // environment, then Auto
-        assert!(Cli::try_parse_from(["ethornell", "--text-encoding", "utf8", "game"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["ethornell", "--text-encoding", "utf8", "game"]).unwrap().text_encoding,
+            Some(TextEncoding::Utf8),
+        );
     }
 }

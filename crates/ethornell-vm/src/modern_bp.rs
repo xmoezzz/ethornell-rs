@@ -188,7 +188,8 @@ impl Vm {
                     None
                 };
                 let ptr = self.modern_frame_offset(packed & 0x3fff)?;
-                let field = self.read_value(ptr, width(packed >> 14))?.as_i32();
+                let field = self.read_value(ptr, width(packed >> 14))?;
+                let field = self.value_as_numeric_operand(field)?;
                 let value = if matches!(code, 0xe5 | 0xe7) {
                     addend.wrapping_add(factor.wrapping_mul(field))
                 } else {
@@ -292,6 +293,29 @@ mod tests {
         assert_eq!(vm.stack, vec![Value::Int(42)]);
         let vm = run(&[0, 10, 0x36, 6, 6, 0x17]);
         assert_eq!(vm.stack, vec![Value::Int(2)]);
+    }
+
+    #[test]
+    fn shadow_string_table_entries_are_non_null_in_numeric_branches() {
+        let mut vm = Vm::new();
+        vm.mem_ptr = 16;
+        vm.write_int(FRAME_SEGMENT | 12, 2, 0).unwrap();
+        for text in ["SGLogWnd000000", ""] {
+            vm.write_value(64, 2, &Value::Str(text.into())).unwrap();
+            vm.push_value(Value::Ptr(64));
+            exec(&mut vm, &[0xe5, 4, 0x80, 0x22]).unwrap();
+            // if (resource != NULL): skip the branch which omits the load.
+            assert_eq!(exec(&mut vm, &[0x37, 1, 5, 0, 0]).unwrap(), None);
+        }
+        vm.push_value(Value::Int(0));
+        assert_eq!(exec(&mut vm, &[0x37, 1, 5, 0, 0]).unwrap(), Some(5));
+        vm.system81_shared.lock().unwrap().native_utf8_override = Some(true);
+        vm.push_value(Value::Str("日本語é".into()));
+        let pointer = vm.pop_int().unwrap() as u32;
+        assert_eq!(vm.read_c_string_bytes(pointer).unwrap(), "日本語é".as_bytes());
+        vm.write_value(FRAME_SEGMENT | 12, 2, &Value::Str("AB".into())).unwrap();
+        exec(&mut vm, &[0xe4, 4, 0x80, 0x00]).unwrap();
+        assert_eq!(vm.pop_int().unwrap(), i32::from(b'A'));
     }
 
     #[test]

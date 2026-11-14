@@ -4023,7 +4023,7 @@ impl Vm {
             BpOpcode::Known { code: 0x6f, .. } => {
                 let fmt = self.pop_string_lossy()?;
                 let dst = self.pop_ptr()?;
-                let rendered = self.render_sprintf(&fmt);
+                let rendered = self.render_sprintf(&fmt)?;
                 self.write_c_string(dst, &rendered)?;
                 // EE7E0 performs its check after printf has written the bytes.
                 self.check_native_guarded_write(api,dst,self.encode_native_string(&rendered).len()+1);
@@ -6997,6 +6997,7 @@ impl Vm {
             && matches!((opcode.group, opcode.id), (0x81, 0x00..=0x03) | (0x91, 0x05 | 0x09..=0x0a) | (0x92, 0x0e | 0x95 | 0x99))
         { return true; }
         if matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) && (opcode.group, opcode.id) == (0x92, 0x0f) { return true; }
+        if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) && (opcode.group, opcode.id) == (0x81, 0x21) { return true; }
         native_call::is_strictly_supported(opcode)
     }
 
@@ -7565,7 +7566,11 @@ impl Vm {
     }
 
     fn pop_int(&mut self) -> VmResult<i32> {
-        Ok(self.pop_value()?.as_i32())
+        // A host String shadows a native char pointer, not the integer zero.
+        // In particular modern BP tests string-table entries against NULL
+        // before loading bitmaps. Use the same materialization as arithmetic.
+        let value = self.pop_value()?;
+        self.value_as_numeric_operand(value)
     }
 
     fn pop_ptr(&mut self) -> VmResult<u32> {
@@ -7586,11 +7591,7 @@ impl Vm {
                         return Ok(ptr as i32);
                     }
                 }
-                let byte_len = encoding_rs::SHIFT_JIS
-                    .encode(&text)
-                    .0
-                    .len()
-                    .saturating_add(1);
+                let byte_len = self.encode_native_string(&text).len().saturating_add(1);
                 let ptr = self.alloc_heap(byte_len.min(u32::MAX as usize) as u32);
                 if ptr == 0 {
                     return Err(VmError::Runtime(
@@ -9997,7 +9998,15 @@ impl Vm {
                         self.clear_shadow_values(destination, packed.len());
                     }
                     self.write_int(required_destination, 2, output)?;
-                    Value::Int(required_destination as i32)
+                    // Triple Pairing x64: 1400EBDF0 -> 1400BA1C0 returns
+                    // status 0 on both successful passes, not size_out.
+                    // anmdef._bp tests this before loading the definitions.
+                    // Preserve the older 1.610/1.622 return-register ABI.
+                    Value::Int(if self.native_abi_profile == NativeAbiProfile::ModernFused {
+                        0
+                    } else {
+                        required_destination as i32
+                    })
                 } else {
                     // Native failure returns before touching either output.
                     Value::Int(1)
@@ -12507,7 +12516,7 @@ impl Vm {
         Ok(self.encode_native_string(text).into_owned())
     }
 
-    fn render_sprintf(&mut self, fmt: &str) -> String {
+    fn render_sprintf(&mut self, fmt: &str) -> VmResult<String> {
         let mut output = String::new();
         let mut chars = fmt.chars().peekable();
         while let Some(ch) = chars.next() {
@@ -12538,16 +12547,23 @@ impl Vm {
                     chars.next();
                 }
             }
-            if chars.peek() == Some(&'.') {
+            let precision = if chars.peek() == Some(&'.') {
                 chars.next();
                 if chars.peek() == Some(&'*') {
-                    let _precision = self.pop_int().unwrap_or_default();
+                    let precision = self.pop_int()?;
                     chars.next();
+                    (precision >= 0).then_some(precision as usize)
                 } else {
-                    while chars.peek().and_then(|ch| ch.to_digit(10)).is_some() {
+                    let mut precision = 0usize;
+                    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
+                        precision = precision.saturating_mul(10).saturating_add(digit as usize);
                         chars.next();
                     }
+                    Some(precision)
                 }
+            } else { None };
+            if width > 65536 || precision.is_some_and(|precision| precision > 65536) {
+                return Err(VmError::Runtime("sprintf field limit".into()));
             }
             while matches!(chars.peek(), Some('h' | 'l' | 'j' | 'z' | 't' | 'L')) {
                 chars.next();
@@ -12556,18 +12572,35 @@ impl Vm {
             match spec {
                 'd' | 'i' | 'u' | 'x' | 'X' => {
                     let value = self.pop_int().unwrap_or_default();
-                    let rendered = if spec == 'x' {
-                        format!("{value:x}")
+                    let signed = matches!(spec, 'd' | 'i');
+                    let prefix = if signed && value < 0 { "-" } else { "" };
+                    let mut digits = if spec == 'x' {
+                        format!("{:x}", value as u32)
                     } else if spec == 'X' {
-                        format!("{value:X}")
+                        format!("{:X}", value as u32)
+                    } else if signed {
+                        value.unsigned_abs().to_string()
                     } else {
-                        value.to_string()
+                        (value as u32).to_string()
                     };
-                    if width > rendered.len() {
-                        let pad = if zero_pad { '0' } else { ' ' };
-                        output.extend(std::iter::repeat_n(pad, width - rendered.len()));
+                    // sub_474720 passes the original format to the C runtime.
+                    // Integer precision is a minimum digit count, excluding
+                    // the sign. H2O's mask%.3d must produce mask003, not mask3.
+                    if precision == Some(0) && value == 0 { digits.clear(); }
+                    if let Some(precision) = precision {
+                        if digits.len() < precision {
+                            digits = format!("{}{}", "0".repeat(precision - digits.len()), digits);
+                        }
                     }
-                    output.push_str(&rendered);
+                    let padding = width.saturating_sub(prefix.len() + digits.len());
+                    if zero_pad && precision.is_none() {
+                        output.push_str(prefix);
+                        output.extend(std::iter::repeat_n('0', padding));
+                    } else {
+                        output.extend(std::iter::repeat_n(' ', padding));
+                        output.push_str(prefix);
+                    }
+                    output.push_str(&digits);
                 }
                 'c' => {
                     // sub_474720 hands the values to the C runtime's sprintf:
@@ -12592,7 +12625,7 @@ impl Vm {
                 }
             }
         }
-        output
+        Ok(output)
     }
 
     fn jump_target(&self, program: &BpProgram, target: u32) -> VmResult<usize> {
@@ -14607,6 +14640,18 @@ mod tests {
             assert_eq!(vm.stack.pop(), Some(Value::Int(0x100)));
             assert_eq!(vm.read_int(0x100, 2).unwrap(), 0);
         }
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        for destination in [0, 0x200] {
+            vm.stack = vec![Value::Int(77), Value::Ptr(destination), Value::Ptr(0x100), Value::Str("animation.arc".into())];
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack, [Value::Int(77), Value::Int(0)]);
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), if destination == 0 { packed.len() as u32 } else { 2 });
+            assert_eq!(&vm.memory[0x200..0x200 + packed.len()], packed);
+            vm.stack = vec![Value::Ptr(destination), Value::Ptr(0x100), Value::Str("absent.arc".into())];
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack, [Value::Int(1)]);
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), if destination == 0 { packed.len() as u32 } else { 2 });
+        }
     }
 
     #[test]
@@ -15309,6 +15354,38 @@ mod tests {
     }
 
     #[test]
+    fn native_dialog_reads_the_declared_module_literal_pool() {
+        let message = "ゲームを終了しますか？";
+        for utf8 in [false, true] {
+            let bytes = if utf8 {
+                message.as_bytes().to_vec()
+            } else {
+                encoding_rs::SHIFT_JIS.encode(message).0.into_owned()
+            };
+            let size = 1 + bytes.len() + 1;
+            let mut image = vec![0; 16];
+            image[..4].copy_from_slice(&16u32.to_le_bytes());
+            image[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+            image.push(0x17);
+            image.extend_from_slice(&bytes);
+            image.push(0);
+            image.extend_from_slice(b"outside the declared module");
+            let program = ethornell_script::parse_bp_program(Some("yesnownd-pool".into()), &image);
+            assert_eq!(program.instructions.len(), 1);
+            assert_eq!(program.code.len(), size);
+            let mut vm = Vm::new();
+            vm.set_modern_pointer_tags(true);
+            vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+            vm.start(&program);
+            // An aggregate/indirect load returns a raw code pointer. It must
+            // work without the parser's synthetic String operand fallback.
+            vm.stack = vec![Value::Int(0x1000_0001), Value::Int(0), Value::Int(1)];
+            vm.normalize_user_string_args(0xb0, 0x82).unwrap();
+            assert_eq!(vm.stack, [Value::Str(message.into()), Value::Int(0), Value::Int(1)]);
+        }
+    }
+
+    #[test]
     fn string_pointer_arithmetic_exposes_shift_jis_bytes_to_load0() {
         let mut vm = Vm::new();
         let mut api = SchedulingApi::default();
@@ -15341,6 +15418,33 @@ mod tests {
 
         assert_eq!(vm.stack.last(), Some(&Value::Int(b'B' as i32)));
         assert_eq!(vm.script_records.len(), 1);
+    }
+
+    #[test]
+    fn sprintf_integer_precision_preserves_native_resource_names() {
+        let mut vm = Vm::new();
+        let sprintf = test_instruction(0, 0x6f, "sprintf", vec![0x6f], Vec::new());
+        for mask in 1..=18 {
+            vm.stack = vec![Value::Int(77), Value::Int(mask), Value::Ptr(0x2300), Value::Str("mask%.3d".into())];
+            vm.dispatch(&sprintf, &mut SchedulingApi::default()).unwrap();
+            assert_eq!(vm.read_c_string(0x2300).unwrap(), format!("mask{mask:03}"));
+            assert_eq!(vm.stack, [Value::Int(77)]);
+        }
+        for (format, value, expected) in [
+            ("%.3d", -3, "-003"), ("%5.3d", 3, "  003"),
+            ("%05d", -3, "-0003"), ("%05.3d", 3, "  003"),
+            ("%.3x", 11, "00b"), ("%.3X", 11, "00B"),
+            ("%.0d", 0, ""), ("%.1d", 123, "123"),
+            ("%.3d", i32::MIN, "-2147483648"),
+        ] {
+            vm.stack = vec![Value::Int(value)];
+            assert_eq!(vm.render_sprintf(format).unwrap(), expected);
+            assert!(vm.stack.is_empty());
+        }
+        vm.stack = vec![Value::Int(3), Value::Int(3)];
+        assert_eq!(vm.render_sprintf("mask%.*d").unwrap(), "mask003");
+        assert!(vm.stack.is_empty());
+        assert!(vm.render_sprintf("%.999999999d").is_err());
     }
 
     #[test]
@@ -17128,7 +17232,7 @@ mod tests {
         let formatted = 0x0800_3100;
         vm.stack.clear();
         vm.stack.push(Value::Ptr(text_pointer));
-        let rendered = vm.render_sprintf("%s");
+        let rendered = vm.render_sprintf("%s").unwrap();
         vm.write_c_string(formatted, &rendered).unwrap();
         assert_eq!(vm.read_c_string(formatted).unwrap(), expected);
     }
