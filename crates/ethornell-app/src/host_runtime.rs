@@ -770,7 +770,7 @@ impl HostRuntime {
                 text: title,
             });
         }
-        if self.runtime.api.quit_requested {
+        if self.runtime.api.quit_requested || self.runtime.normal_root_completion() {
             self.close();
             return Ok(());
         }
@@ -802,6 +802,7 @@ impl HostRuntime {
         self.sync_audio()
     }
     fn close(&mut self) {
+        if self.closed { return; }
         self.closed = true;
         self.runtime.vm.cancel_host_requests();
         self.runtime.api.host.pending.clear();
@@ -913,6 +914,17 @@ impl HostRuntime {
 }
 
 impl RuntimeEngine {
+    fn normal_root_completion(&self) -> bool {
+        self.vm.halted
+            && self.api.native_system.restart.is_none()
+            && self.api.native_system.bootstrap_request.is_none()
+            && self.last_report.as_ref().is_some_and(|report| matches!(
+                report.stop_reason,
+                ethornell_vm::VmStopReason::Completed
+                    | ethornell_vm::VmStopReason::InterpreterTerminated
+            ))
+    }
+
     fn new_explicit(
         script: &str,
         bytes: &[u8],
@@ -962,6 +974,40 @@ mod tests {
         api.host.enabled = true;
         api
     }
+    #[test]
+    fn normal_root_completion_respects_children_yields_and_restarts() {
+        let create = |bytes: &[u8]| RuntimeEngine::new_explicit(
+            "root", bytes, ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")), false, false, encoding_rs::SHIFT_JIS,
+        );
+        let advance = |runtime: &mut RuntimeEngine| {
+            runtime.last_report = Some(runtime.vm.run_loaded(&mut runtime.api, &runtime.options));
+        };
+        for bytes in [&[0x80, 0x6a][..], &[0x17][..]] {
+            let mut runtime = create(bytes);
+            advance(&mut runtime);
+            assert!(runtime.normal_root_completion());
+            runtime.api.native_system.restart = Some(("".into(), "".into(), None));
+            assert!(!runtime.normal_root_completion());
+            runtime.api.native_system.restart = None;
+            runtime.api.native_system.bootstrap_request = Some((None, "system.arc".into(), "ipl._bp".into()));
+            assert!(!runtime.normal_root_completion());
+        }
+        let mut yielding = create(&[0x80, 0x5f, 0x17]);
+        advance(&mut yielding);
+        assert!(!yielding.normal_root_completion());
+        // Child entry at 0x1a returns while the root keeps yielding at 0x14.
+        let mut parent = create(&[
+            0x02,4,0,0,0, 0x02,0,1,0,0, 0x02,0,1,0,0,
+            0x06,0x0b,0, 0x81,0x44, 0x80,0x5f, 0x06,0xfe,0xff, 0x14, 0x17,
+        ]);
+        for _ in 0..4 {
+            advance(&mut parent);
+            assert!(!parent.last_report.as_ref().unwrap().stop_reason.is_fatal());
+            assert!(!parent.normal_root_completion());
+        }
+    }
+
     #[test]
     fn user_dialog_requests_become_kind_five_events_with_json_payloads() {
         let mut api = api();
