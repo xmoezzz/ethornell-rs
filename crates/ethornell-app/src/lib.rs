@@ -8,6 +8,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// Host-private process identity, outside the native bitmap-slot range
+// 0..0x4000. Global movie selectors expose duration/state, never this handle.
+const GLOBAL_MOVIE_HANDLE: i32 = 0x4000;
+
 mod animation;
 mod audio_runtime;
 mod auto_input;
@@ -20,6 +25,7 @@ mod effects;
 mod file_policy;
 mod native_profile;
 mod frame_presenter;
+mod presentation;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
 pub use file_policy::hosted as hosted_files;
@@ -1841,6 +1847,12 @@ impl RuntimeTraceApi {
         let bitmap = update.bitmap;
         let width = update.image.width;
         let height = update.image.height;
+        if self.global_movie_handle == Some(bitmap) {
+            // DCTraditionalVR owns a video surface, not a bitmap-registry
+            // slot. Its host handle can numerically equal a script bitmap.
+            self.store_graph_image(format!("runtime:movie:{bitmap}"), update.image);
+            return;
+        }
         // A 92:F2 slot was created at the picture size when the graph
         // connected; sub_45C260 copies each sample into that same descriptor.
         // Keep its resource (and generation) so projected sprites bound to it
@@ -1886,6 +1898,8 @@ impl RuntimeTraceApi {
         resource: &str,
         size: (i32, i32),
     ) -> Option<(i32, i32)> {
+        // sub_48F270 releases the previous global graph before opening one.
+        self.close_global_movie();
         #[cfg(feature = "console")]
         let bytes = {
             self.sweep_unreferenced_archive_images();
@@ -1894,7 +1908,7 @@ impl RuntimeTraceApi {
         };
         #[cfg(not(feature = "console"))]
         let bytes = MovieBytes::from_vec(read_runtime_bytes(&self.manager, archive, resource)?);
-        let handle = self.alloc_object();
+        let handle = GLOBAL_MOVIE_HANDLE;
         if self.graph_effects.configure_media(
             handle,
             archive.to_string(),
@@ -1916,6 +1930,19 @@ impl RuntimeTraceApi {
         self.global_movie_handle = Some(handle);
         self.global_movie_size = size;
         Some((handle, invocation.duration_ms))
+    }
+
+    fn close_global_movie(&mut self) {
+        if let Some(handle) = self.global_movie_handle.take() {
+            // sub_48F0E0 releases the global DirectShow graph; bitmap-backed
+            // DCVideoImageSender graphs and their bindings remain independent.
+            self.graph_effects.release(handle);
+            self.graph_process_handles.remove(&handle);
+            let key = format!("runtime:movie:{handle}");
+            self.graph_images.remove(&key);
+            self.graph_image_revisions.remove(&key);
+            self.sync_movie_audio();
+        }
     }
 
     /// The DirectShow movie of Graph90:F0 / Graph92:F0 while it plays.
@@ -3117,6 +3144,9 @@ impl RuntimeTraceApi {
     }
 
     fn alloc_object(&mut self) -> i32 {
+        if self.next_object_handle == GLOBAL_MOVIE_HANDLE {
+            self.next_object_handle += 1;
+        }
         let handle = self.next_object_handle;
         self.next_object_handle += 1;
         self.display_tree
@@ -6600,11 +6630,13 @@ impl RuntimeTraceApi {
         let movie_elapsed_ms = elapsed_ms.min(i32::MAX as u64) as i32;
         for update in self.graph_effects.tick_movies(movie_elapsed_ms) {
             // sub_45C260 -> sub_408AA0 -> sub_497060(0x10000, slot, 0):
-            // every delivered sample is a native event; sysmsg._bp posts it
-            // to moviemngr._bp, which counts frames at record +52 and
-            // refreshes the sprite showing the slot.
-            self.queued_system_events
-                .push_back([0x10000, update.bitmap, 0]);
+            // Bitmap-backed samples notify moviemngr._bp, which refreshes
+            // their sprite. Global DCTraditionalVR samples present directly
+            // (sub_45B860), without a DCVideoImageSender bitmap event.
+            if self.global_movie_handle != Some(update.bitmap) {
+                self.queued_system_events
+                    .push_back([0x10000, update.bitmap, 0]);
+            }
             self.store_movie_frame(update);
         }
         self.sync_movie_audio();
@@ -10280,6 +10312,122 @@ mod directshow_movie_tests {
             center(&snapshot::compose_runtime_frame(&api, true)),
             [0, 0, 0]
         );
+    }
+
+    #[test]
+    fn global_samples_present_independently_and_restore_the_frozen_scene() {
+        use super::presentation::CpuPresenter;
+        use ethornell_vm::{GraphApi, NativeCallFrame, NativeOpcode, Value};
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        api.screen_width = 4;
+        api.screen_height = 3;
+        let solid = |rgb: [u8; 3]| DecodedImage {
+            width: 4,
+            height: 3,
+            rgba: [rgb[0], rgb[1], rgb[2], 255].repeat(12),
+        };
+        let pixel = |f: &snapshot::RuntimeFrameComposition| f.framebuffer.rgba[..3].to_vec();
+        api.store_runtime_bitmap(10, solid([0, 0, 200]), 2);
+        let mut create = NativeCallFrame::new(
+            NativeOpcode {
+                group: 0x90,
+                id: 0x50,
+            },
+            Vec::new(),
+        );
+        let Value::Int(sprite) = GraphApi::call_graph(&mut api, &mut create).unwrap() else {
+            panic!("sprite")
+        };
+        api.graph90_replace_sprite_primary(sprite, 10).unwrap();
+        api.set_graph_object_draw_enabled(sprite, true);
+        let mut presenter = CpuPresenter::default();
+        assert_eq!(pixel(presenter.frame(&mut api)), [0, 0, 200]);
+        api.graph_scheduler_enabled = false;
+        let deadline = api.graph_next_present_ms;
+        api.replace_graph_bitmap_pixels(10, solid([0, 200, 0]));
+
+        let handle = 10; // Deliberate collision with the scene bitmap slot.
+        assert_eq!(
+            api.graph_effects.configure_media(
+                handle,
+                String::new(),
+                "m".into(),
+                MovieBytes::from_vec(tiny_movie())
+            ),
+            0
+        );
+        assert_eq!(api.graph_effects.invoke(handle).status, 0);
+        assert_eq!(
+            api.graph_effects.configure_media(
+                20,
+                String::new(),
+                "bitmap".into(),
+                MovieBytes::from_vec(tiny_movie())
+            ),
+            0
+        );
+        assert_eq!(api.graph_effects.invoke(20).status, 0);
+        api.global_movie_handle = Some(handle);
+        api.global_movie_size = (4, 3);
+        assert_eq!(
+            pixel(presenter.frame(&mut api)),
+            [0, 0, 0],
+            "opening has no sample yet"
+        );
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: handle,
+            image: solid([200, 0, 0]),
+        });
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 0, 0]);
+        assert_eq!(&api.graph_bitmap_image(10).unwrap().rgba[..3], &[0, 200, 0]);
+        let retained = presenter.frame(&mut api).framebuffer.rgba.as_ptr();
+        api.engine_time_ms += 16;
+        assert_eq!(
+            presenter.frame(&mut api).framebuffer.rgba.as_ptr(),
+            retained,
+            "no duplicate composition without a new sample"
+        );
+        assert_eq!(api.graph_next_present_ms, deadline);
+
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: handle,
+            image: solid([200, 100, 0]),
+        });
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 100, 0]);
+        api.global_movie_size = (2, 3);
+        let frame = presenter.frame(&mut api);
+        assert_eq!(
+            &frame.framebuffer.rgba[12..15],
+            &[0, 0, 0],
+            "geometry changes repaint without a new sample"
+        );
+        api.close_global_movie();
+        assert_eq!(api.graph_effects.state(handle), 4);
+        assert_eq!(
+            api.graph_effects.state(20),
+            0,
+            "closing a global movie leaves bitmap video running"
+        );
+        assert_eq!(
+            pixel(presenter.frame(&mut api)),
+            [0, 0, 200],
+            "restore the submitted scene, not unpresented green pixels"
+        );
+
+        // A bitmap movie still follows the script's scene gate and keeps its
+        // existing binding generation, unlike a global video sample.
+        let generation = api.graph_resources[&10].generation;
+        api.store_movie_frame(graph_effect::MovieFrameUpdate {
+            bitmap: 10,
+            image: solid([200, 200, 0]),
+        });
+        assert_eq!(api.graph_resources[&10].generation, generation);
+        assert_eq!(pixel(presenter.frame(&mut api)), [0, 0, 200]);
+        api.graph_scheduler_enabled = true;
+        api.engine_time_ms += 1000;
+        assert_eq!(pixel(presenter.frame(&mut api)), [200, 200, 0]);
     }
 }
 
@@ -26041,8 +26189,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0xf1) => {
                 // sub_480260 releases the process owned by the global
                 // DirectShow movie slot.
-                self.graph_effects.stop_all_movies();
-                self.global_movie_handle = None;
+                self.close_global_movie();
                 tracing::info!("MovieStop");
             }
             (0x90, 0xf2) => {
@@ -30122,7 +30269,7 @@ fn run_headless(
         .map(|runtime| runtime.api.total_native_calls)
         .unwrap_or_default();
     let mut next_frame = Instant::now();
-    let mut last_composition: Option<snapshot::RuntimeFrameComposition> = None;
+    let mut presenter = presentation::CpuPresenter::default();
     let mut runtime_failure = None;
     for frame in 0..max_frames {
         if let Some(runtime) = runtime.as_mut() {
@@ -30150,21 +30297,9 @@ fn run_headless(
                 .total_native_calls
                 .wrapping_sub(previous_native_calls);
             previous_native_calls = runtime.api.total_native_calls;
-            // Headless differs from the window frontend only at final
-            // presentation: every logical frame still traverses the shared
-            // render tree and produces a complete offscreen framebuffer.
-            // sub_462100: a frame that is not due shows the last one again.
-            let frame_composition = if runtime.api.take_present_due() || last_composition.is_none()
-            {
-                runtime.api.performance_profile.begin();
-                let composition =
-                    snapshot::compose_runtime_frame_with_diagnostics(&runtime.api, true);
-                runtime.api.performance_profile.end(true);
-                last_composition = Some(composition.clone());
-                composition
-            } else {
-                last_composition.clone().expect("checked above")
-            };
+            // Use the same scene/sample scheduling as GPU frontends; a global
+            // movie never causes a traversal of the suspended display tree.
+            let frame_composition = presenter.frame(&mut runtime.api).clone();
             if snapshot_frames.contains(&frame)
                 && let Some(base_path) = snapshot_path.as_ref()
             {
