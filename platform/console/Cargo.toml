@@ -14,4 +14,4 @@ ethornell-archive = { path = "../../crates/ethornell-archive" }
 
 [target.'cfg(target_os="horizon")'.dependencies]
 # Must match the patched newlib ABI used by build-std.
-libc = "=0.2.178"
+libc = "=0.2.186"

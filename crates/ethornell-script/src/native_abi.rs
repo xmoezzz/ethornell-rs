@@ -31,8 +31,11 @@ pub enum NativeAbiProfile {
 }
 
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
-    if profile == NativeAbiProfile::Anipani && (group, id) == (0x91, 0x09) {
-        return Some(NativeCallAbi { argc: 1, stack_outputs: 1, installs_procedure: false, raw_descriptor_bit8: true });
+    if profile == NativeAbiProfile::Anipani && group == 0x91 && matches!(id, 0x09 | 0x0a) {
+        // Legacy extended table: 48A600 pops value then key, calls
+        // 401EC0 -> 408840, and pushes success. Both raster option keys are
+        // shared with the later FD/Modern tables; this is not a zero-arg slot.
+        return Some(NativeCallAbi { argc: if id == 0x09 { 1 } else { 2 }, stack_outputs: 1, installs_procedure: false, raw_descriptor_bit8: true });
     }
     if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
         let (argc, stack_outputs) = match (group, id) {

@@ -59,6 +59,28 @@ pub(crate) fn load_default_font() -> Result<FontArc> {
     )
 }
 
+/// Desktop selection: explicit fonts, then a usable game-folder font, then
+/// a system font. The chosen face is shared by GPU text, bitmap text and metrics.
+pub(crate) fn load_game_font(root: &Path, gbk: bool) -> Result<FontArc> {
+    if let Some(font) = SESSION_FONT.with(|session| session.borrow().clone()) {
+        return Ok(font);
+    }
+    if let Some(path) = std::env::var_os("ETHORNELL_SNAPSHOT_FONT") {
+        return ethornell_render::FontProvider::load_file(path, 0);
+    }
+    if let Some(path) = std::env::var_os("ETHORNELL_FONT") {
+        match ethornell_render::FontProvider::load_file(&path, 0) {
+            Ok(font) => return Ok(font),
+            Err(error) => tracing::warn!(?path, %error, "explicit text font unusable; trying game and system fonts"),
+        }
+    }
+    let required = if gbk { "A日本語中文简体繁體" } else { "A日本語中文" };
+    if let Some(font) = super::game_font::load(root, required) {
+        return Ok(font);
+    }
+    ethornell_render::FontProvider::load_system_for_text(required)
+}
+
 /// The snapshot font when one is named, else the text font: the file
 /// `ETHORNELL_FONT` names (a substitute for the font the game asks for), else
 /// a system font. The window's renderer draws with this session font too.

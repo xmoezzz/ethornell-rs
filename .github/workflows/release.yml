@@ -200,8 +200,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Prepare Android build tools
-        run: sdkmanager 'build-tools;36.0.0'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
       - name: Build APK
         env:
           VARIANT: ${{ env.SIGNED_RELEASE == 'true' && 'release' || 'debug' }}

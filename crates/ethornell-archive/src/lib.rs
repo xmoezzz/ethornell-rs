@@ -8,6 +8,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+mod localized;
+pub use localized::ArchiveLanguage;
+
 pub const MAGIC_PACK_FILE: &[u8] = b"PackFile";
 pub const MAGIC_PACK_FILE_FULL: &[u8] = b"PackFile    ";
 pub const MAGIC_BURIKO_ARC20: &[u8] = b"BURIKO ARC20";
@@ -228,6 +231,7 @@ struct RuntimeSearch {
 #[derive(Debug, Clone)]
 pub struct ResourceManager {
     inner: Arc<ResourceManagerInner>,
+    view: Option<Arc<localized::ArchiveView>>,
 }
 
 impl ResourceManager {
@@ -285,6 +289,7 @@ impl ResourceManager {
         let set = GameArchiveSet { root, archives };
         let (by_name, archive_by_name, archive_by_path) = build_resource_lookup(&set);
         Ok(Self {
+            view: None,
             inner: Arc::new(ResourceManagerInner {
                 limits,
                 set,
@@ -335,9 +340,11 @@ impl ResourceManager {
 
     pub fn list(&self) -> Vec<ResourceEntry> {
         let mut entries = Vec::new();
-        for archive in &self.inner.set.archives {
-            for entry in &archive.entries {
-                entries.push(resource_entry_from_archive(archive, entry));
+        for (archive_index, archive) in self.inner.set.archives.iter().enumerate() {
+            for (entry_index, entry) in archive.entries.iter().enumerate() {
+                if self.entry_visible(archive_index, entry_index) {
+                    entries.push(resource_entry_from_archive(archive, entry));
+                }
             }
         }
         entries
@@ -362,7 +369,7 @@ impl ResourceManager {
         let mut out = Vec::new();
         for (_, matches) in matching_keys {
             for &(archive, entry) in matches {
-                if let Some(entry) = self.entry_at(archive, entry) {
+                if self.entry_visible(archive, entry) && let Some(entry) = self.entry_at(archive, entry) {
                     out.push(entry);
                 }
             }
@@ -375,10 +382,20 @@ impl ResourceManager {
             .and_then(|(archive, entry)| self.entry_at(archive, entry))
     }
 
+    /// An exact already-indexed archive, without reopening a filesystem path
+    /// or confusing archives with equal basenames in different directories.
+    pub fn find_in_archive_path(&self, archive_path: &Path, entry_name: &str) -> Option<ResourceEntry> {
+        let archive = self.archive_index_for_path(archive_path).ok()?;
+        if entry_name.is_empty() { return self.entry_at(archive, 0); }
+        let key = normalize_resource_name(entry_name);
+        let (_, entry) = self.inner.by_name.get(&key)?.iter()
+            .find(|&&(candidate, _)| candidate == archive)?;
+        self.entry_at(archive, *entry)
+    }
+
     pub fn first_in_archive(&self, archive_name: &str) -> Option<ResourceEntry> {
         let first = |archive: &str| {
-            let archive_index = *self.inner.archive_by_name.get(&archive_name_key(archive))?;
-            self.entry_at(archive_index, 0)
+            self.in_archive_family(archive, |index| self.entry_at(index, 0))
         };
         match self.composite_members(archive_name) {
             Some(members) => members.iter().find_map(|member| first(member)),
@@ -641,7 +658,7 @@ impl ResourceManager {
     fn find_locator(&self, name: &str) -> Option<(usize, usize)> {
         let key = normalize_resource_name(name);
         if let Some(matches) = self.inner.by_name.get(&key) {
-            return matches.first().copied();
+            if let Some(locator) = self.preferred_locator(matches) { return Some(locator); }
         }
 
         // Compatibility fallback for the historical fuzzy lookup. Scan the
@@ -650,9 +667,9 @@ impl ResourceManager {
         self.inner
             .by_name
             .iter()
-            .filter(|(candidate, _)| candidate.ends_with(&key) || candidate.contains(&key))
+            .filter(|(candidate, locators)| (candidate.ends_with(&key) || candidate.contains(&key)) && self.preferred_locator(locators).is_some())
             .min_by(|(left, _), (right, _)| left.cmp(right))
-            .and_then(|(_, matches)| matches.first().copied())
+            .and_then(|(_, matches)| self.preferred_locator(matches))
     }
 
     fn find_locator_in_archive(
@@ -663,11 +680,9 @@ impl ResourceManager {
         let entry_key = normalize_resource_name(entry_name);
         let locators = self.inner.by_name.get(&entry_key)?;
         let find = |archive: &str| {
-            let archive_index = *self.inner.archive_by_name.get(&archive_name_key(archive))?;
-            locators
-                .iter()
-                .copied()
-                .find(|&(candidate_archive, _)| candidate_archive == archive_index)
+            self.in_archive_family(archive, |archive_index| {
+                locators.iter().copied().find(|&(candidate_archive, _)| candidate_archive == archive_index)
+            })
         };
         match self.composite_members(archive_name) {
             Some(members) => members.iter().find_map(|member| find(member)),
@@ -2147,6 +2162,7 @@ mod tests {
         };
         let (by_name, archive_by_name, archive_by_path) = build_resource_lookup(&set);
         let manager = ResourceManager {
+            view: None,
             inner: Arc::new(ResourceManagerInner {
                 limits: ResourceBudget::default(),
                 set,
@@ -2192,6 +2208,7 @@ mod tests {
         };
         let (by_name, archive_by_name, archive_by_path) = build_resource_lookup(&set);
         ResourceManager {
+            view: None,
             inner: Arc::new(ResourceManagerInner {
                 limits: ResourceBudget::default(),
                 set,
@@ -2202,6 +2219,53 @@ mod tests {
                 search: RwLock::default(),
             }),
         }
+    }
+
+    #[test]
+    fn localized_families_share_one_language_and_preserve_physical_names() {
+        for (en, cn, tc) in [("en", "cn", "tc"), ("eng", "chs", "cht")] {
+            let en_system = format!("system.{en}.arc");
+            let cn_system = format!("system.{cn}.arc");
+            let tc_system = format!("system.{tc}.arc");
+            let en_program = format!("Archive/sysprg.{en}.arc");
+            let cn_program = format!("Archive/sysprg.{cn}.arc");
+            let base = manager_over(&[
+                ("system.arc", &["shared"]),
+                (&cn_system, &["ipl._bp", "cn_only"]),
+                (&tc_system, &["ipl._bp", "tc_only"]),
+                (&en_system, &["ipl._bp"]),
+                ("sysprg.arc", &["title._bp", "common"]),
+                (&cn_program, &["title._bp"]),
+                (&en_program, &["title._bp"]),
+            ]);
+            let selected = base.for_native_bootstrap(None).unwrap();
+            assert_eq!(selected.archive_language(), Some(ArchiveLanguage::English));
+            assert_eq!(selected.find_in_archive("system.arc", "ipl._bp").unwrap().archive_path,
+                PathBuf::from(format!("game/{en_system}")));
+            assert_eq!(selected.find_in_archive("sysprg.arc", "title._bp").unwrap().archive_path,
+                PathBuf::from(format!("game/{en_program}")));
+            assert!(selected.find_in_archive("system.arc", "shared").is_some());
+            assert!(selected.find_in_archive("sysprg.arc", "common").is_some());
+            assert!(selected.find_in_archive(&cn_system, "ipl._bp").is_some());
+            assert!(selected.find("cn_only").is_none());
+            assert!(selected.find("tc_only").is_none());
+            assert_eq!(selected.find_all("title._bp").len(), 1);
+            assert_eq!(base.archive_language(), None);
+            assert!(base.find("cn_only").is_some());
+            let chinese = selected.for_native_bootstrap(Some(ArchiveLanguage::SimplifiedChinese)).unwrap();
+            assert!(chinese.find("cn_only").is_some());
+            assert!(selected.find("cn_only").is_none());
+            assert!(base.for_native_bootstrap(Some(ArchiveLanguage::Korean)).is_err());
+        }
+    }
+
+    #[test]
+    fn localized_selection_keeps_ordinary_bootstrap_and_rejects_missing_entry() {
+        let ordinary = manager_over(&[("system.arc", &["ipl._bp"]),
+            ("system.en.arc", &["ipl._bp"])]);
+        assert_eq!(ordinary.for_native_bootstrap(None).unwrap().archive_language(), None);
+        assert!(manager_over(&[("system.en.arc", &["title._bp"])])
+            .for_native_bootstrap(None).is_err());
     }
 
     #[test]
