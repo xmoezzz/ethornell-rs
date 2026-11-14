@@ -30541,34 +30541,6 @@ fn run_headless(
                 );
             }
             if runtime.api.debug_graph || runtime.api.trace_render_tree || frame % 60 == 0 {
-                let graph_image_bytes = runtime
-                    .api
-                    .graph_images
-                    .values()
-                    .map(|image| image.rgba.len())
-                    .sum::<usize>();
-                let runtime_graph_image_bytes = runtime
-                    .api
-                    .graph_images
-                    .iter()
-                    .filter(|(key, _)| key.starts_with("runtime:"))
-                    .map(|(_, image)| image.rgba.len())
-                    .sum::<usize>();
-                let vm_usage = runtime.vm.resource_usage();
-                let graph_blob_bytes = runtime
-                    .api
-                    .graph_blob_cache
-                    .values()
-                    .map(Vec::len)
-                    .sum::<usize>();
-                let cached_program_instructions = runtime
-                    .api
-                    .program_cache
-                    .values()
-                    .map(|program| program.instructions.len())
-                    .sum::<usize>();
-                let archive_count = runtime.api.manager.archives().archives.len();
-                let resource_count = runtime.api.manager.resource_count();
                 let report = last_report.as_ref();
                 tracing::info!(
                     frame,
@@ -30592,17 +30564,6 @@ fn run_headless(
                     ),
                     text_nodes = runtime.api.text_nodes.len(),
                     graph_images = runtime.api.graph_images.len(),
-                    graph_image_bytes,
-                    runtime_graph_image_bytes,
-                    graph_resources = runtime.api.graph_resources.len(),
-                    graph_layers = runtime.api.graph_layers.len(),
-                    vm_count = vm_usage.vm_count,
-                    vm_memory_bytes = vm_usage.memory_bytes,
-                    vm_memory_capacity_bytes = vm_usage.memory_capacity_bytes,
-                    graph_blob_bytes,
-                    cached_program_instructions,
-                    archive_count,
-                    resource_count,
                     animations = runtime.api.layer_animations.active_count(),
                     audio_pending = runtime.api.audio_requests.len(),
                     scenario_code_base = format_args!(
