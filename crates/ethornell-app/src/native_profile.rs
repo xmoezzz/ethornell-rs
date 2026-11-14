@@ -7,6 +7,7 @@ struct Capabilities {
     regions: Option<(u32, u32)>,
     sound: Option<usize>,
     modern_tags: bool,
+    legacy_graph_extensions: bool,
 }
 
 struct Executable<'a> {
@@ -101,6 +102,65 @@ impl<'a> Executable<'a> {
         });
         let bound = bounds.next()?;
         bounds.all(|other| other == bound).then_some(bound)
+    }
+
+    fn follow_thunks(&self, mut address: u64) -> Option<&'a [u8]> {
+        for _ in 0..4 {
+            let bytes = self.code(address)?;
+            if bytes.first() != Some(&0xe9) {
+                return Some(bytes);
+            }
+            let displacement = i32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?);
+            address = address
+                .checked_add(5)?
+                .checked_add_signed(i64::from(displacement))?;
+        }
+        None
+    }
+
+    fn legacy_graph_extensions(&self) -> bool {
+        if self.width != 4 {
+            return false;
+        }
+        // Confirm the old extended Graph91 table's two actual algorithms,
+        // independently of IPL/title bytes (translations can change those).
+        self.tables(&[0, 3, 6, 9, 10, 11, 12, 13, 14, 15], &[1, 2, 4, 5, 7, 8])
+            .iter()
+            .any(|table| {
+                let mode = self.calls(table[9]);
+                let option = self.calls(table[10]);
+                if mode.len() < 3
+                    || option.len() < 4
+                    || option[0] != option[1]
+                    || option[0] != mode[0]
+                {
+                    return false;
+                }
+                let (Some(mode), Some(option)) =
+                    (self.follow_thunks(mode[1]), self.follow_thunks(option[2]))
+                else {
+                    return false;
+                };
+                let mode = &mode[..mode.len().min(32)];
+                let option = &option[..option.len().min(80)];
+                // 464000 and 4631B0 implement the same unsigned mode<=1
+                // policy with separate-return and shared-return codegen.
+                // 408840 / 407F30 accept exactly these two keys, return 25
+                // otherwise, and store both supplied values unchanged.
+                let mode_guard = (mode.starts_with(&[0x83, 0xf9, 1, 0x77])
+                    && mode.windows(3).any(|s| s == [0x33, 0xc0, 0xc3]))
+                    || mode.starts_with(&[0x33, 0xc0, 0x83, 0xf9, 1, 0x77]);
+                mode_guard
+                    && mode.windows(2).any(|s| s == [0x89, 0x0d])
+                    && mode.windows(6).any(|s| s == [0xb8, 1, 0, 0, 0, 0xc3])
+                    && option.windows(6).any(|s| s == [0x81, 0xf9, 0, 0, 0x22, 1])
+                    && option
+                        .windows(6)
+                        .any(|s| s == [0x81, 0xf9, 0, 0x16, 0x11, 0x80])
+                    && option.windows(5).any(|s| s == [0xb8, 25, 0, 0, 0])
+                    && option.windows(3).any(|s| s == [0x33, 0xc0, 0xc3])
+                    && option.windows(2).filter(|s| *s == [0x89, 0x15]).count() >= 2
+            })
     }
 
     fn regions(&self) -> Option<(u32, u32)> {
@@ -221,6 +281,7 @@ fn inspect(bytes: &[u8]) -> Option<Capabilities> {
         regions: exe.regions(),
         sound: bound,
         modern_tags,
+        legacy_graph_extensions: exe.legacy_graph_extensions(),
     })
 }
 
@@ -293,6 +354,9 @@ pub(super) fn apply(manager: &ResourceManager, profile: &mut NativeRuntimeProfil
         profile.se_channels = channels;
     }
     profile.modern_pointer_tags = caps.modern_tags;
+    if caps.legacy_graph_extensions && profile.abi == ethornell_vm::NativeAbiProfile::Tayutama {
+        profile.abi = ethornell_vm::NativeAbiProfile::Anipani;
+    }
     if caps.modern_tags {
         profile.abi = ethornell_vm::NativeAbiProfile::Modern;
         profile.modern_gradient_blur = true;
