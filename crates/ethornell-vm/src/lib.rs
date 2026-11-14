@@ -2732,7 +2732,7 @@ impl Vm {
             trace_id: NEXT_VM_TRACE_ID.fetch_add(1, Ordering::Relaxed),
             operand_slots: vec![Value::Int(0); OPERAND_STACK_CAPACITY],
             native_abi_profile: NativeAbiProfile::default(),
-            memory: memory.into(),
+            memory: VmMemory::from_zeroed(memory),
             parked_local: None,
             heap_ptr: HEAP_OFFSET_BASE,
             rng_seed: 1,

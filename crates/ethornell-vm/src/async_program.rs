@@ -643,10 +643,10 @@ fn hand_over_memory(source: &mut Vm, destination: &mut Vm) {
     }
     let mut scratch = std::mem::take(&mut source.local_window_scratch);
     let mut window = take_local_window(destination);
-    let bounds = live.local_bounds();
-    let incoming_bounds = window.prefix_lengths();
-    window.exchange_bounded(&mut live[local], &mut scratch, bounds);
-    live.set_local_bounds(incoming_bounds);
+    let bounds = live.local_spans();
+    let incoming_bounds = window.spans();
+    window.exchange_spanned(&mut live[local], &mut scratch, bounds);
+    live.set_local_spans(incoming_bounds);
     source.parked_local = Some(window);
     destination.memory = live;
     destination.local_window_scratch = scratch;
@@ -703,13 +703,14 @@ pub(crate) fn exchange_saved_local(vm: &mut Vm, window: &mut LocalWindow) {
     if vm.memory.len() < HEAP_MEMORY_BASE {
         vm.memory.resize(HEAP_MEMORY_BASE, 0);
     }
-    let bounds = vm.memory.local_bounds();
-    let incoming_bounds = window.prefix_lengths();
-    window.exchange_bounded(
+    let bounds = vm.memory.local_spans();
+    let incoming_bounds = window.spans();
+    window.exchange_spanned(
         &mut vm.memory[LOCAL_MEMORY_BASE as usize..HEAP_MEMORY_BASE],
-        &mut vm.local_window_scratch, bounds,
+        &mut vm.local_window_scratch,
+        bounds,
     );
-    vm.memory.set_local_bounds(incoming_bounds);
+    vm.memory.set_local_spans(incoming_bounds);
 }
 
 /// A thread's local region wherever it is: parked, or in its buffer.
