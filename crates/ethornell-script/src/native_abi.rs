@@ -28,16 +28,50 @@ pub enum NativeAbiProfile {
     Anipani,
     HoukagoFd,
     Modern,
+    /// 1.687 fused BP / Media Foundation generation.
+    ModernFused,
 }
 
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
+    let common = match (group,id) {
+        (0x90,0xc1) => Some((3,1)),
+        (0x90,0xcf) => Some((4,0)),
+        (0x92,0x31) | (0x92,0x3d) => Some((1,1)),
+        _ => None,
+    };
+    if let Some((argc,stack_outputs)) = common {
+        return Some(NativeCallAbi { argc,stack_outputs,installs_procedure:false,raw_descriptor_bit8:stack_outputs!=0 });
+    }
+    // 1.653 48A560 / 1.687 1400E3200 set the forced-present flag.
+    if profile != NativeAbiProfile::Tayutama && (group,id) == (0x91,0x00) {
+        return Some(NativeCallAbi { argc:1, stack_outputs:0, installs_procedure:false, raw_descriptor_bit8:false });
+    }
+    if profile == NativeAbiProfile::Anipani && (group,id) == (0x92,0x99) {
+        return Some(NativeCallAbi { argc:7, stack_outputs:1, installs_procedure:false, raw_descriptor_bit8:true });
+    }
+    if profile == NativeAbiProfile::ModernFused {
+        let (argc, outputs, procedure) = match (group,id) {
+            (0x91,0x04) => (6,0,true),
+            (0x91,0xbc) => (1,1,false),
+            (0x91,0xbd) => (11,1,false),
+            (0x91,0xf8) => (3,0,true),
+            (0x91,0xf9) | (0x91,0xfa) => (0,1,false),
+            (0x91,0xfb) => (1,1,false),
+            (0x92,0x94) => (2,1,false),
+            _ => (0,0,false),
+        };
+        if argc != 0 || outputs != 0 || procedure {
+            return Some(NativeCallAbi { argc, stack_outputs:outputs, installs_procedure:procedure, raw_descriptor_bit8:outputs!=0 || procedure });
+        }
+    }
+
     if profile == NativeAbiProfile::Anipani && group == 0x91 && matches!(id, 0x09 | 0x0a) {
         // Legacy extended table: 48A600 pops value then key, calls
         // 401EC0 -> 408840, and pushes success. Both raster option keys are
         // shared with the later FD/Modern tables; this is not a zero-arg slot.
         return Some(NativeCallAbi { argc: if id == 0x09 { 1 } else { 2 }, stack_outputs: 1, installs_procedure: false, raw_descriptor_bit8: true });
     }
-    if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) {
+    if matches!(profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) {
         let (argc, stack_outputs) = match (group, id) {
             // FD native 49F1E0 / 4956F0 and the matching later tables.
             (0x81, 0x00) | (0x81, 0x02) | (0x91, 0x09) => (1, 1),
@@ -45,7 +79,7 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
             (0x91, 0x05) => (4, 1),
             (0x91, 0x0a) => (2, 1),
             (0x92, 0x0e) => (3, 0),
-            (0x92, 0x0f) if profile == NativeAbiProfile::Modern => (2, 0),
+            (0x92, 0x0f) if matches!(profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) => (2, 0),
             (0x92, 0x95) => (1, 1),
             (0x92, 0x99) => (7, 1),
             _ => return lookup(group, id),

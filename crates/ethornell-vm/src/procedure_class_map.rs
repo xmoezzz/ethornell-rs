@@ -12,6 +12,11 @@ pub(crate) struct TargetProcedureClassEvidence {
 
 pub(crate) fn target_procedure_class(opcode: NativeOpcode) -> Option<TargetProcedureClassEvidence> {
     match (opcode.group, opcode.id) {
+        (0x91, 0xf8) => Some(TargetProcedureClassEvidence {
+            class_name: "DCProcPlayMovieByMF", alternative_class_name: None,
+            class_condition: None, path_kind: "abi_procedure", confidence: "target_path",
+        }),
+
         (0x80, 0x54) => Some(TargetProcedureClassEvidence {
             class_name: "CProcWaitWndMsg",
             alternative_class_name: None,

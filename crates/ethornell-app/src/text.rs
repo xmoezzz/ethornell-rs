@@ -442,7 +442,13 @@ impl RuntimeTraceApi {
             return None;
         }
         self.clear_bitmap_text(bitmap);
-        Some((layout.lines, (layout.end_x.round() as i32, layout.end_y.round() as i32)))
+        // 1.687 140074BC0 / 140077950: optional line-height capture
+        // returns a token instead of the line count. 92:94 can query its
+        // size without consuming it, then copy and remove the DWORDs.
+        let result = if self.graph_config.text_global_properties.get(&0x8000_0009).copied().unwrap_or(0)!=0 {
+            self.store_line_height_record(vec![size as i32;layout.lines.max(1) as usize])
+        } else {layout.lines};
+        Some((result, (layout.end_x.round() as i32, layout.end_y.round() as i32)))
     }
 
     /// `Graph91:9C` / `Graph91:9D` (`sub_484A30`, `sub_484C40`): draw markup text
