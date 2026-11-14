@@ -1119,32 +1119,29 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
 /// Header `instr_size` of a BP image (`a2[1]` in sub_465AB0); zero for images
 /// without a consistent header.
 fn declared_module_size(buf: &[u8]) -> u32 {
-    if buf.len() >= 8 {
-        let header_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let instr_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        if header_size >= 8 && header_size + instr_size == buf.len() {
-            return instr_size as u32;
-        }
-    }
-    0
+    declared_code_range(buf)
+        .map(|range| (range.end - range.start) as u32)
+        .unwrap_or(0)
+}
+
+fn declared_code_range(buf: &[u8]) -> Option<CodeRange> {
+    let header = buf.get(..8)?;
+    let start = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
+    let size = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let end = start.checked_add(size)?;
+    // Lovepical sub_498490 copies a2[1] bytes from a2 + a2[0], then
+    // advances the module chain by a2[1]. Bytes after that declared image
+    // are not BP instructions. Requiring exact file length instead made
+    // such images fall back to executing their header at offset zero.
+    (start >= 8 && end <= buf.len()).then_some(CodeRange { start, end })
 }
 
 fn detect_code_range(buf: &[u8]) -> CodeRange {
-    if buf.len() >= 8 {
-        let header_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let instr_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        if header_size >= 8
-            && header_size <= buf.len()
-            && instr_size <= buf.len()
-            && header_size + instr_size == buf.len()
-        {
-            let nominal_end = header_size + instr_size;
-            let end = detect_bp_code_end(buf, header_size, nominal_end);
-            return CodeRange {
-                start: header_size,
-                end,
-            };
-        }
+    if let Some(range) = declared_code_range(buf) {
+        return CodeRange {
+            start: range.start,
+            end: detect_bp_code_end(buf, range.start, range.end),
+        };
     }
     CodeRange {
         start: 0,
@@ -1462,6 +1459,28 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].opcode.name(), "ret");
         assert_eq!(instructions[0].offset, 0x10);
+    }
+
+    #[test]
+    fn bp_declared_image_excludes_trailing_file_data() {
+        let mut bytes = vec![0; 16];
+        bytes[..4].copy_from_slice(&16_u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&5_u32.to_le_bytes());
+        bytes.extend([0x17, 0, 0, 0, 0]);
+        // Include another return in the trailer: code-end detection must
+        // stay inside the declared image, and module allocation keeps padding.
+        bytes.extend([0x79, 0x80, 0x6a, 0x17]);
+        let program = parse_bp_program(None, &bytes);
+        assert_eq!(program.module_size, 5);
+        assert_eq!(program.instructions.len(), 1);
+        assert_eq!(program.instructions[0].offset, 16);
+        assert_eq!(&*program.code, &[0x17]);
+
+        bytes[4..8].copy_from_slice(&100_u32.to_le_bytes());
+        assert!(declared_code_range(&bytes).is_none());
+        bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(declared_code_range(&bytes).is_none());
     }
 
     #[test]
