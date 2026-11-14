@@ -209,8 +209,8 @@ pub const NATIVE_REGISTERED_OPCODES: &[u8] = &[
     0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
     0x59, 0x5a, 0x5b, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
     0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x73, 0x74, 0x75, 0x77, 0x78, 0x79, 0x7a, 0x7b,
-    0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x90, 0x91, 0x92, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xe3, 0xe4,
-    0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef, 0xff,
+    0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x90, 0x91, 0x92, 0xa0, 0xb0, 0xc0, 0xd0, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xe0, 0xe2, 0xe3, 0xe4,
+    0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xec, 0xed, 0xee, 0xef, 0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xff,
 ];
 
 /// Return a diagnostic candidate label for a native selector.
@@ -220,6 +220,20 @@ pub const NATIVE_REGISTERED_OPCODES: &[u8] = &[
 /// implementation classifications before treating a label as target semantics.
 pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
     match (group, id) {
+        (0x90,0xc1) => Some("GraphValidateImageResources"),
+        (0x90,0xcf) => Some("GraphProjectPoint"),
+        (0x91,0x00) => Some("GraphSetForcedPresentation"),
+        (0x91,0x04) => Some("GraphRegisterDecodedBitmap"),
+        (0x91,0xbc) => Some("GraphCreateExtraExtendedIconInput"),
+        (0x91,0xbd) => Some("GraphConfigureIconPath"),
+        (0x91,0xf8) => Some("MovieOpenMF"),
+        (0x91,0xf9) => Some("MovieCloseMF"),
+        (0x91,0xfa) => Some("MovieIsPlayingMF"),
+        (0x91,0xfb) => Some("MovieSetVolumeMF"),
+        (0x92,0x31) => Some("GraphReleaseDisplayObject"),
+        (0x92,0x3d) => Some("GraphGetPointerDisplayObject"),
+        (0x92,0x94) => Some("GraphReadLineHeights"),
+
         (0x80, 0x00) => Some("Srand"),
         (0x80, 0x01) => Some("Rand"),
         (0x80, 0x02) => Some("RandMax"),
@@ -871,6 +885,12 @@ pub fn disassemble_bp(buf: &[u8]) -> Vec<BpInstruction> {
 }
 
 pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
+    parse_bp_program_profile(script_name,buf,native_abi::NativeAbiProfile::Tayutama)
+}
+
+/// Runtime-specific instruction grammar. In 1.687, 7F gained a secondary
+/// byte; older tables retain their one-byte 7F operation.
+pub fn parse_bp_program_profile(script_name: Option<String>, buf: &[u8], profile:native_abi::NativeAbiProfile) -> BpProgram {
     let range = detect_code_range(buf);
     let module_size = declared_module_size(buf);
     let code = Arc::new(buf[range.start..range.end].to_vec());
@@ -894,6 +914,57 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
         let mut opcode_name_override = None;
 
         match opcode_byte {
+            0x7f if profile==native_abi::NativeAbiProfile::ModernFused => {
+                opcode_name_override=Some("native_buffer");
+                if let Some(id)=read_u8_operand(&mut cursor,&mut raw_len,&mut warning) {operands.push(BpOperand::U8(id));}
+            }
+            // Triple Pairing 1.687: fused frame operations. H is a raw
+            // u16, P is the existing width-tagged signed LEB encoding, and
+            // R is a signed target relative to this opcode, not its end.
+            0xd4..=0xd8 | 0xda..=0xdf | 0xe2 | 0xe8..=0xea |
+            0xf0..=0xf2 | 0xf4..=0xf5 | 0xf7..=0xfb => {
+                let layout = match opcode_byte {
+                    0xd4 | 0xe8 => "H",
+                    0xd5 | 0xd8 => "HL",
+                    0xd6 => "HP",
+                    0xd7 => "HHP",
+                    0xda => "BHL",
+                    0xdb => "BHPL",
+                    0xdc => "BRHL",
+                    0xdd => "BRHPL",
+                    0xde => "RH",
+                    0xdf => "RHP",
+                    0xe2 => "N",
+                    0xe9 => "HH",
+                    0xea | 0xf1 => "HHL",
+                    0xf0 => "WHL",
+                    0xf2 => "HHHL",
+                    0xf4 => "HWHH",
+                    0xf5 => "HHHHH",
+                    0xf7 | 0xfb => "HHH",
+                    0xf8 | 0xfa => "WHH",
+                    0xf9 => "HHHH",
+                    _ => unreachable!(),
+                };
+                for kind in layout.bytes() {
+                    match kind {
+                        b'B' => if let Some(v) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U8(v)); },
+                        b'H' => if let Some(v) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U16(v)); },
+                        b'W' => if let Some(v) = read_u32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U32(v)); },
+                        b'L' => if let Some(v) = read_sleb32_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::I32(v)); },
+                        b'P' => read_packed_immediate(&mut cursor, &mut raw_len, &mut warning, &mut operands),
+                        b'R' => if let Some(v) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::Offset((offset as i64 + i64::from(v as i16)) as u32)); },
+                        b'N' => if let Some(count) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
+                            operands.push(BpOperand::U8(count));
+                            for _ in 0..=count {
+                                if let Some(v) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) { operands.push(BpOperand::U16(v)); } else { break; }
+                            }
+                        },
+                        _ => unreachable!(),
+                    }
+                    if warning.is_some() { break; }
+                }
+            }
             0x03 => {
                 if let Some(mode) = read_u8_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U8(mode));

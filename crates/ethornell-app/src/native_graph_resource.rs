@@ -10,7 +10,7 @@ impl RuntimeTraceApi {
         if group != 0x92 {
             return None;
         }
-        if id <= 0x1f {
+        if id <= 0x1f || id == 0x31 {
             return self.dispatch_system92_00_1f(call);
         }
         let stack = call.args_mut();

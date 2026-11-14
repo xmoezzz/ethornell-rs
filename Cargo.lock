@@ -1573,6 +1573,7 @@ dependencies = [
  "ethornell-script",
  "ethornell-vm",
  "game-network",
+ "getrandom 0.3.4",
  "image",
  "libc",
  "na_mpeg2_decoder",

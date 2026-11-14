@@ -13,6 +13,7 @@ pub(crate) struct RuntimeGraphInputObject {
     pub(crate) queued_events: VecDeque<[i32; 3]>,
     pub(crate) indirect_messages: VecDeque<Vec<i32>>,
     pub(crate) extended: bool,
+    pub(crate) extra_extended: bool,
     pub(crate) item_states: BTreeMap<(i32, i32), i32>,
     /// Runtime per-group current/selected item.  This is the native group's
     /// mutable +0x08 field (base) / +0x0C field (extended), kept separate from
@@ -57,6 +58,10 @@ impl RuntimeGraphInputObject {
         Self::new_with_variant(layer, true)
     }
 
+    pub(crate) fn new_extra_extended(layer:i32) -> Self {
+        let mut input=Self::new_extended(layer);input.extra_extended=true;input
+    }
+
     fn new_with_variant(layer: i32, extended: bool) -> Self {
         Self {
             layer,
@@ -67,6 +72,7 @@ impl RuntimeGraphInputObject {
             queued_events: VecDeque::new(),
             indirect_messages: VecDeque::new(),
             extended,
+            extra_extended: false,
             item_states: BTreeMap::new(),
             current_selections: BTreeMap::new(),
             active: false,

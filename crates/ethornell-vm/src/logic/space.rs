@@ -27,6 +27,8 @@ struct Body {
     probe: f32,
     mask: i32,
     priority: i32,
+    /// 1.653 45CA90 / 1.687 A4200 expose two further scalar cells.
+    extended_scalars: [f32; 2],
     parent: [i32; 2],
     /// Slot lists; -1 is a free slot.
     children: [Vec<i32>; 2],
@@ -224,6 +226,7 @@ impl SpaceManager {
             probe,
             mask,
             priority,
+            extended_scalars: [0.0; 2],
             parent: [-1, -1],
             children: [Vec::new(), Vec::new()],
             pos: [snap(pos[0]), snap(pos[1]), snap(pos[2]), 0.0],
@@ -232,6 +235,43 @@ impl SpaceManager {
         };
         self.set_dir(index, dir);
         0
+    }
+
+    /// 1.653 45CA90 / 1.687 1400A4200: no radius/mask validation and
+    /// no derived-velocity update on a property write, unlike body_add.
+    pub(crate) fn set_property(&mut self, index: u32, property: i32, value: i32) -> u32 {
+        let body = match self.body_mut(index) {
+            Ok(body) => body,
+            Err(status) => return status,
+        };
+        let fixed = value as f32 * (1.0 / 65536.0);
+        match property {
+            0 => body.radius = fixed,
+            1 => body.speed = fixed,
+            2 => body.probe = fixed,
+            3 => body.mask = value,
+            4 => body.priority = value,
+            5 | 6 => body.extended_scalars[(property - 5) as usize] = fixed,
+            _ => return BAD_OTHER,
+        }
+        0
+    }
+
+    /// 1.653 45CB30 / 1.687 1400A40E0: scalar cells return 16.16;
+    /// integer mask/priority cells are copied without conversion.
+    pub(crate) fn property(&self, index: u32, property: i32) -> Result<i32, u32> {
+        let body = self.body(index)?;
+        Ok(match property {
+            0 => super::super::extended_opcodes::float_to_fixed(body.radius),
+            1 => super::super::extended_opcodes::float_to_fixed(body.speed),
+            2 => super::super::extended_opcodes::float_to_fixed(body.probe),
+            3 => body.mask,
+            4 => body.priority,
+            5 | 6 => super::super::extended_opcodes::float_to_fixed(
+                body.extended_scalars[(property - 5) as usize],
+            ),
+            _ => return Err(BAD_OTHER),
+        })
     }
 
     /// D0:61 sub_455C30.
@@ -772,6 +812,24 @@ mod tests {
             );
         }
         space
+    }
+
+    #[test]
+    fn native_body_properties_preserve_raw_integers_and_fixed_scalars() {
+        let mut space = space_with(&[([0.0; 3], 1.0)]);
+        for property in 0..=6 {
+            let value = if matches!(property, 3 | 4) {
+                i32::MIN + 31
+            } else {
+                -0x18000
+            };
+            assert_eq!(space.set_property(0, property, value), 0);
+            assert_eq!(space.property(0, property), Ok(value));
+        }
+        assert_eq!(space.set_property(0, 7, 1), BAD_OTHER);
+        assert_eq!(space.property(0, 7), Err(BAD_OTHER));
+        assert_eq!(space.set_property(1, 0, 1), BAD_BODY);
+        assert_eq!(space.property(1, 0), Err(BAD_BODY));
     }
 
     #[test]
