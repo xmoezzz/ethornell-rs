@@ -499,7 +499,7 @@ mod tests {
         }
         api.global_movie_handle = Some(DS_MOVIE_HANDLE);
         api.version_graph.mf_handle = Some(MF_MOVIE_HANDLE);
-        api.close_directshow_movie();
+        api.close_global_movie();
         assert!(
             api.graph_images
                 .contains_key(&format!("runtime:movie:{MF_MOVIE_HANDLE}"))
