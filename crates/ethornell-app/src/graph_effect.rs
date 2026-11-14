@@ -120,7 +120,7 @@ pub(crate) fn movie_audio_commands(
 
 #[derive(Debug)]
 struct MovieDecoder {
-    source: MovieBytes,
+    source: Option<MovieBytes>,
     packets: Vec<MoviePacket>,
     /// The MPEG audio elementary stream (Layer II in BGI movies), played as
     /// one stream by the audio frontend.
@@ -166,7 +166,7 @@ impl MovieDecoder {
             let size = container.size();
             let audio = container.take_audio();
             return Some(Self {
-                source,
+                source: None,
                 packets: Vec::new(),
                 audio,
                 decoder: Decoder::new(),
@@ -251,7 +251,7 @@ impl MovieDecoder {
             .iter()
             .find_map(|packet| sequence_frame_size(&es_bytes[packet.range.clone()]));
         Some(Self {
-            source: video_es,
+            source: Some(video_es),
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
             decoder,
@@ -343,7 +343,7 @@ impl MovieDecoder {
             }
             if let Some(packet) = self.packets.get(self.packet_index) {
                 self.packet_index += 1;
-                let data = &self.source.as_slice()[packet.range.clone()];
+                let data = &self.source.as_ref()?.as_slice()[packet.range.clone()];
                 match self.decoder.decode_shared(data, packet.pts_90k) {
                     Ok(frames) => self.pending_frames.extend(frames),
                     Err(_) => self.failed = true,
@@ -998,6 +998,26 @@ mod tests {
         assert!(sought.active);
         assert!(sought.generation > started);
         assert_eq!(sought.position_ms, 0);
+    }
+
+    #[test]
+    fn container_movie_releases_original_input_buffer_after_demux() {
+        let mut bytes = vec![0; 45];
+        bytes[..4].copy_from_slice(b"DKIF");
+        bytes[6..8].copy_from_slice(&32_u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(b"AV01");
+        bytes[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&30_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[44] = 0;
+
+        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes), "memory-test.ivf")
+            .expect("open IVF container");
+        assert!(movie.container.is_some());
+        assert!(movie.source.is_none());
     }
 
     #[test]
