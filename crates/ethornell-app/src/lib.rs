@@ -7629,13 +7629,25 @@ impl RuntimeTraceApi {
             }
         }
         self.store_graph_image(composite_key.clone(), destination_image);
-        self.graph_resources.insert(
-            destination,
-            RuntimeGraphResource::whole(composite_key.clone()),
-        );
+        // sub_40A9E0 writes the existing bitmap's pixels; it does not allocate
+        // another descriptor. Keep the binding generation, just as 90:15
+        // does, so eye/mouth blits do not invalidate live projected sprites.
+        // SugarStyle's 484020 -> 402980 likewise resolves the existing
+        // descriptors via 4085F0 before 40AC60, without allocating a slot.
+        // Keep the writable copy separate from shared decoded archive images.
+        if let Some(binding) = self.graph_resources.get_mut(&destination) {
+            binding.key = composite_key.clone();
+            binding.source_rect = None;
+        } else {
+            self.graph_resources.insert(
+                destination,
+                RuntimeGraphResource::whole(composite_key.clone()),
+            );
+        }
         if let Some(surface) = self.graph_surfaces.get_mut(&destination) {
             surface.resource_id = Some(destination);
         }
+        self.refresh_bitmap_nodes(destination);
         Some(composite_key)
     }
 
