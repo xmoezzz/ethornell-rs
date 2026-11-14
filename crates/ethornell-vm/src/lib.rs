@@ -4023,7 +4023,7 @@ impl Vm {
             BpOpcode::Known { code: 0x6f, .. } => {
                 let fmt = self.pop_string_lossy()?;
                 let dst = self.pop_ptr()?;
-                let rendered = self.render_sprintf(&fmt);
+                let rendered = self.render_sprintf(&fmt)?;
                 self.write_c_string(dst, &rendered)?;
                 // EE7E0 performs its check after printf has written the bytes.
                 self.check_native_guarded_write(api,dst,self.encode_native_string(&rendered).len()+1);
@@ -12507,7 +12507,7 @@ impl Vm {
         Ok(self.encode_native_string(text).into_owned())
     }
 
-    fn render_sprintf(&mut self, fmt: &str) -> String {
+    fn render_sprintf(&mut self, fmt: &str) -> VmResult<String> {
         let mut output = String::new();
         let mut chars = fmt.chars().peekable();
         while let Some(ch) = chars.next() {
@@ -12538,16 +12538,23 @@ impl Vm {
                     chars.next();
                 }
             }
-            if chars.peek() == Some(&'.') {
+            let precision = if chars.peek() == Some(&'.') {
                 chars.next();
                 if chars.peek() == Some(&'*') {
-                    let _precision = self.pop_int().unwrap_or_default();
+                    let precision = self.pop_int()?;
                     chars.next();
+                    (precision >= 0).then_some(precision as usize)
                 } else {
-                    while chars.peek().and_then(|ch| ch.to_digit(10)).is_some() {
+                    let mut precision = 0usize;
+                    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
+                        precision = precision.saturating_mul(10).saturating_add(digit as usize);
                         chars.next();
                     }
+                    Some(precision)
                 }
+            } else { None };
+            if width > 65536 || precision.is_some_and(|precision| precision > 65536) {
+                return Err(VmError::Runtime("sprintf field limit".into()));
             }
             while matches!(chars.peek(), Some('h' | 'l' | 'j' | 'z' | 't' | 'L')) {
                 chars.next();
@@ -12556,18 +12563,35 @@ impl Vm {
             match spec {
                 'd' | 'i' | 'u' | 'x' | 'X' => {
                     let value = self.pop_int().unwrap_or_default();
-                    let rendered = if spec == 'x' {
-                        format!("{value:x}")
+                    let signed = matches!(spec, 'd' | 'i');
+                    let prefix = if signed && value < 0 { "-" } else { "" };
+                    let mut digits = if spec == 'x' {
+                        format!("{:x}", value as u32)
                     } else if spec == 'X' {
-                        format!("{value:X}")
+                        format!("{:X}", value as u32)
+                    } else if signed {
+                        value.unsigned_abs().to_string()
                     } else {
-                        value.to_string()
+                        (value as u32).to_string()
                     };
-                    if width > rendered.len() {
-                        let pad = if zero_pad { '0' } else { ' ' };
-                        output.extend(std::iter::repeat_n(pad, width - rendered.len()));
+                    // sub_474720 passes the original format to the C runtime.
+                    // Integer precision is a minimum digit count, excluding
+                    // the sign. H2O's mask%.3d must produce mask003, not mask3.
+                    if precision == Some(0) && value == 0 { digits.clear(); }
+                    if let Some(precision) = precision {
+                        if digits.len() < precision {
+                            digits = format!("{}{}", "0".repeat(precision - digits.len()), digits);
+                        }
                     }
-                    output.push_str(&rendered);
+                    let padding = width.saturating_sub(prefix.len() + digits.len());
+                    if zero_pad && precision.is_none() {
+                        output.push_str(prefix);
+                        output.extend(std::iter::repeat_n('0', padding));
+                    } else {
+                        output.extend(std::iter::repeat_n(' ', padding));
+                        output.push_str(prefix);
+                    }
+                    output.push_str(&digits);
                 }
                 'c' => {
                     // sub_474720 hands the values to the C runtime's sprintf:
@@ -12592,7 +12616,7 @@ impl Vm {
                 }
             }
         }
-        output
+        Ok(output)
     }
 
     fn jump_target(&self, program: &BpProgram, target: u32) -> VmResult<usize> {
@@ -15344,6 +15368,33 @@ mod tests {
     }
 
     #[test]
+    fn sprintf_integer_precision_preserves_native_resource_names() {
+        let mut vm = Vm::new();
+        let sprintf = test_instruction(0, 0x6f, "sprintf", vec![0x6f], Vec::new());
+        for mask in 1..=18 {
+            vm.stack = vec![Value::Int(77), Value::Int(mask), Value::Ptr(0x2300), Value::Str("mask%.3d".into())];
+            vm.dispatch(&sprintf, &mut SchedulingApi::default()).unwrap();
+            assert_eq!(vm.read_c_string(0x2300).unwrap(), format!("mask{mask:03}"));
+            assert_eq!(vm.stack, [Value::Int(77)]);
+        }
+        for (format, value, expected) in [
+            ("%.3d", -3, "-003"), ("%5.3d", 3, "  003"),
+            ("%05d", -3, "-0003"), ("%05.3d", 3, "  003"),
+            ("%.3x", 11, "00b"), ("%.3X", 11, "00B"),
+            ("%.0d", 0, ""), ("%.1d", 123, "123"),
+            ("%.3d", i32::MIN, "-2147483648"),
+        ] {
+            vm.stack = vec![Value::Int(value)];
+            assert_eq!(vm.render_sprintf(format).unwrap(), expected);
+            assert!(vm.stack.is_empty());
+        }
+        vm.stack = vec![Value::Int(3), Value::Int(3)];
+        assert_eq!(vm.render_sprintf("mask%.*d").unwrap(), "mask003");
+        assert!(vm.stack.is_empty());
+        assert!(vm.render_sprintf("%.999999999d").is_err());
+    }
+
+    #[test]
     fn sprintf_c_writes_the_low_byte_of_its_value() {
         // Wonderful Everyday's scrmsg._bp prefixes a line that opens with a
         // bracket with an indent code: sprintf(buffer, "%c%s", code, text).
@@ -17128,7 +17179,7 @@ mod tests {
         let formatted = 0x0800_3100;
         vm.stack.clear();
         vm.stack.push(Value::Ptr(text_pointer));
-        let rendered = vm.render_sprintf("%s");
+        let rendered = vm.render_sprintf("%s").unwrap();
         vm.write_c_string(formatted, &rendered).unwrap();
         assert_eq!(vm.read_c_string(formatted).unwrap(), expected);
     }
