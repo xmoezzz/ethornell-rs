@@ -105,18 +105,22 @@ impl Vm {
                 let packed = immediate(ins, 0)? as u32;
                 let ptr = self.compact_frame_address(packed)?;
                 let value = self.read_value(ptr, width(packed >> 14))?;
+                if code == 0x19 {
+                    self.push_value(value);
+                    return Ok(None);
+                }
+                let value = self.value_as_numeric_operand(value)?;
                 let result = match code {
-                    0x19 => value,
-                    0x1a => Value::Int(value.as_i32().wrapping_add(immediate(ins, 1)?)),
+                    0x1a => Value::Int(value.wrapping_add(immediate(ins, 1)?)),
                     0x1b => {
                         let addend = self.pop_int()?;
                         Value::Int(
-                            addend.wrapping_add(immediate(ins, 1)?.wrapping_mul(value.as_i32())),
+                            addend.wrapping_add(immediate(ins, 1)?.wrapping_mul(value)),
                         )
                     }
-                    0x1c => Value::Int(shift(value.as_i32(), immediate(ins, 1)? as i8)),
-                    0x1d => Value::Int(self.pop_int()?.wrapping_mul(value.as_i32())),
-                    0x1e => Value::Int(divide(self.pop_int()?, value.as_i32(), false)?),
+                    0x1c => Value::Int(shift(value, immediate(ins, 1)? as i8)),
+                    0x1d => Value::Int(self.pop_int()?.wrapping_mul(value)),
+                    0x1e => Value::Int(divide(self.pop_int()?, value, false)?),
                     _ => unreachable!(),
                 };
                 self.push_value(result);

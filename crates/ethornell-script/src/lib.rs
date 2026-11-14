@@ -893,8 +893,12 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
 pub fn parse_bp_program_profile(script_name: Option<String>, buf: &[u8], profile:native_abi::NativeAbiProfile) -> BpProgram {
     let range = detect_code_range(buf);
     let module_size = declared_module_size(buf);
-    let code = Arc::new(buf[range.start..range.end].to_vec());
-    let mut cursor = Cursor::new(code.as_slice());
+    // The disassembly boundary excludes the literal pool after the last ret.
+    // CThread copies the full declared image, including that pool: raw guest
+    // pointers (e.g. yesnownd's native confirmation text) still address it.
+    let image_end = declared_code_range(buf).map_or(range.end, |image| image.end);
+    let code = Arc::new(buf[range.start..image_end].to_vec());
+    let mut cursor = Cursor::new(&code[..range.end - range.start]);
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
     let mut strings = Vec::new();
@@ -1545,7 +1549,7 @@ mod tests {
         assert_eq!(program.module_size, 5);
         assert_eq!(program.instructions.len(), 1);
         assert_eq!(program.instructions[0].offset, 16);
-        assert_eq!(&*program.code, &[0x17]);
+        assert_eq!(&*program.code, &[0x17, 0, 0, 0, 0]);
 
         bytes[4..8].copy_from_slice(&100_u32.to_le_bytes());
         assert!(declared_code_range(&bytes).is_none());

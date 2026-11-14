@@ -6997,6 +6997,7 @@ impl Vm {
             && matches!((opcode.group, opcode.id), (0x81, 0x00..=0x03) | (0x91, 0x05 | 0x09..=0x0a) | (0x92, 0x0e | 0x95 | 0x99))
         { return true; }
         if matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) && (opcode.group, opcode.id) == (0x92, 0x0f) { return true; }
+        if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern) && (opcode.group, opcode.id) == (0x81, 0x21) { return true; }
         native_call::is_strictly_supported(opcode)
     }
 
@@ -7565,7 +7566,11 @@ impl Vm {
     }
 
     fn pop_int(&mut self) -> VmResult<i32> {
-        Ok(self.pop_value()?.as_i32())
+        // A host String shadows a native char pointer, not the integer zero.
+        // In particular modern BP tests string-table entries against NULL
+        // before loading bitmaps. Use the same materialization as arithmetic.
+        let value = self.pop_value()?;
+        self.value_as_numeric_operand(value)
     }
 
     fn pop_ptr(&mut self) -> VmResult<u32> {
@@ -7586,11 +7591,7 @@ impl Vm {
                         return Ok(ptr as i32);
                     }
                 }
-                let byte_len = encoding_rs::SHIFT_JIS
-                    .encode(&text)
-                    .0
-                    .len()
-                    .saturating_add(1);
+                let byte_len = self.encode_native_string(&text).len().saturating_add(1);
                 let ptr = self.alloc_heap(byte_len.min(u32::MAX as usize) as u32);
                 if ptr == 0 {
                     return Err(VmError::Runtime(
@@ -9997,7 +9998,15 @@ impl Vm {
                         self.clear_shadow_values(destination, packed.len());
                     }
                     self.write_int(required_destination, 2, output)?;
-                    Value::Int(required_destination as i32)
+                    // Triple Pairing x64: 1400EBDF0 -> 1400BA1C0 returns
+                    // status 0 on both successful passes, not size_out.
+                    // anmdef._bp tests this before loading the definitions.
+                    // Preserve the older 1.610/1.622 return-register ABI.
+                    Value::Int(if self.native_abi_profile == NativeAbiProfile::ModernFused {
+                        0
+                    } else {
+                        required_destination as i32
+                    })
                 } else {
                     // Native failure returns before touching either output.
                     Value::Int(1)
@@ -14631,6 +14640,18 @@ mod tests {
             assert_eq!(vm.stack.pop(), Some(Value::Int(0x100)));
             assert_eq!(vm.read_int(0x100, 2).unwrap(), 0);
         }
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        for destination in [0, 0x200] {
+            vm.stack = vec![Value::Int(77), Value::Ptr(destination), Value::Ptr(0x100), Value::Str("animation.arc".into())];
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack, [Value::Int(77), Value::Int(0)]);
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), if destination == 0 { packed.len() as u32 } else { 2 });
+            assert_eq!(&vm.memory[0x200..0x200 + packed.len()], packed);
+            vm.stack = vec![Value::Ptr(destination), Value::Ptr(0x100), Value::Str("absent.arc".into())];
+            vm.dispatch(&op, &mut api).unwrap();
+            assert_eq!(vm.stack, [Value::Int(1)]);
+            assert_eq!(vm.read_int(0x100, 2).unwrap(), if destination == 0 { packed.len() as u32 } else { 2 });
+        }
     }
 
     #[test]
@@ -15330,6 +15351,38 @@ mod tests {
         // on a signed index. For -1 the target bitmap expression is
         // 0x1000 + 0x2C6 + 0x2D - 1 == 0x12F2, not 0x112F2.
         assert_eq!(0x1000_i32 + 0x2c6 + 0x2d - 1, 0x12f2);
+    }
+
+    #[test]
+    fn native_dialog_reads_the_declared_module_literal_pool() {
+        let message = "ゲームを終了しますか？";
+        for utf8 in [false, true] {
+            let bytes = if utf8 {
+                message.as_bytes().to_vec()
+            } else {
+                encoding_rs::SHIFT_JIS.encode(message).0.into_owned()
+            };
+            let size = 1 + bytes.len() + 1;
+            let mut image = vec![0; 16];
+            image[..4].copy_from_slice(&16u32.to_le_bytes());
+            image[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+            image.push(0x17);
+            image.extend_from_slice(&bytes);
+            image.push(0);
+            image.extend_from_slice(b"outside the declared module");
+            let program = ethornell_script::parse_bp_program(Some("yesnownd-pool".into()), &image);
+            assert_eq!(program.instructions.len(), 1);
+            assert_eq!(program.code.len(), size);
+            let mut vm = Vm::new();
+            vm.set_modern_pointer_tags(true);
+            vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+            vm.start(&program);
+            // An aggregate/indirect load returns a raw code pointer. It must
+            // work without the parser's synthetic String operand fallback.
+            vm.stack = vec![Value::Int(0x1000_0001), Value::Int(0), Value::Int(1)];
+            vm.normalize_user_string_args(0xb0, 0x82).unwrap();
+            assert_eq!(vm.stack, [Value::Str(message.into()), Value::Int(0), Value::Int(1)]);
+        }
     }
 
     #[test]

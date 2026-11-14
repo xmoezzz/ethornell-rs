@@ -65,7 +65,9 @@ impl Vm {
         group: u8,
         id: u16,
     ) -> VmResult<Option<Value>> {
-        if !matches!(
+        let legacy_conversion = group == 0x81 && id == 0x21
+            && matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern);
+        if !legacy_conversion && !matches!(
             self.native_abi_profile,
             NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused
         ) {
@@ -321,6 +323,25 @@ mod tests {
         vm.try_builtin_sys_with_api(&mut Host, 0x81, id)
             .unwrap()
             .unwrap()
+    }
+    #[test]
+    fn pre_fused_conversion_has_a_two_argument_zero_result_contract() {
+        for profile in [NativeAbiProfile::HoukagoFd, NativeAbiProfile::Modern] {
+            let mut vm = Vm::new();
+            vm.set_native_abi_profile(profile);
+            let opcode = NativeOpcode { group: 0x81, id: 0x21 };
+            assert!(vm.effective_strict_support(opcode));
+            assert_eq!(vm.effective_arg_count(0x81, 0x21), Some(2));
+            assert_eq!(vm.effective_output_count(0x81, 0x21), 0);
+            let bytes = encoding_rs::SHIFT_JIS.encode("ＭＳ ゴシック").0.into_owned();
+            for (offset, byte) in bytes.into_iter().chain([0]).enumerate() {
+                vm.write_int(256 + offset as u32, 0, u32::from(byte)).unwrap();
+            }
+            vm.stack = vec![Value::Int(77), Value::Ptr(512), Value::Ptr(256)];
+            assert_eq!(vm.try_builtin_sys_with_api(&mut Host, 0x81, 0x21).unwrap(), Some(Value::None));
+            assert_eq!(vm.stack, [Value::Int(77)]);
+            assert_eq!(vm.read_c_string_bytes(512).unwrap(), "ＭＳ ゴシック".as_bytes());
+        }
     }
     #[test]
     fn version_system_encoding_probe_conversion_and_versioned_results() {
