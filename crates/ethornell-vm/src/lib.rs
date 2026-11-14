@@ -19,6 +19,9 @@ mod child_thread;
 mod compact_bp;
 mod modern_bp;
 mod native_version;
+mod version_system;
+mod native_buffers;
+mod native_buffer_format;
 mod fused_bp;
 pub mod cpu_record;
 mod debug;
@@ -443,6 +446,16 @@ pub trait SysApi {
     fn next_native_crt_rand(&mut self) -> Option<i32> {
         None
     }
+
+    /// Main-loop wall-clock deltas, newest first, padded to the native ring's
+    /// 600 entries. Independent of the pause-adjusted engine clock.
+    fn native_frame_history(&self, _count: usize) -> Option<Vec<i32>> { None }
+
+    /// rand_s equivalent; must not consume the deterministic CRT rand stream.
+    fn secure_random_u32(&mut self) -> VmResult<u32> {
+        Err(VmError::Runtime("secure random source is unavailable".into()))
+    }
+
 
     fn observe_dispatch(&mut self, _opcode: NativeOpcode) {}
 
@@ -4062,14 +4075,13 @@ impl Vm {
                 self.push_value(Value::Int(result));
             }
             BpOpcode::Known { code: 0x7f, .. } => {
-                // BGI 1.687 1400CB5E0 dispatches a secondary byte, with
-                // 12 registered 7F selectors. It is not the five-argument
-                // 1.622 bitmap operation; stop before consuming its stack
-                // or treating its selector byte as another BP instruction.
                 if self.native_abi_profile == NativeAbiProfile::ModernFused {
-                    return Err(VmError::UnsupportedInstruction(0x7f));
-                }
-                self.execute_resource_blend()?;
+                    let id=instruction.raw.get(1).copied().ok_or_else(||VmError::Runtime("missing native buffer selector".into()))?;
+                    self.note_call("buffer",0x7f,id as u16);
+                    api.observe_dispatch(NativeOpcode {group:0x7f,id:id as u16});
+                    let result=self.execute_buffer_extension(id)?;
+                    self.push_value(Value::Int(result));
+                } else {self.execute_resource_blend()?;}
             }
             BpOpcode::Known { code: 0x80 | 0x81, .. } => {
                 let id = instruction.raw.get(1).copied().unwrap_or_default() as u16;
@@ -6877,6 +6889,10 @@ impl Vm {
         native_abi::lookup_profile(self.native_abi_profile,group,id).map(|a|a.installs_procedure).unwrap_or_else(||native_abi::installs_procedure(group,id))
     }
     fn effective_strict_support(&self,opcode:NativeOpcode)->bool {
+        if matches!(self.native_abi_profile, NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused)
+            && matches!((opcode.group,opcode.id), (0x80,0x03) | (0x81,0x00|0x20|0x21|0x27|0xd8|0xda)) {return true;}
+        if self.native_abi_profile == NativeAbiProfile::ModernFused && (opcode.group,opcode.id)==(0x81,0x06) {return true;}
+
         if matches!((opcode.group,opcode.id),(0x90,0xc1 | 0xcf) | (0x92,0x31 | 0x3d)) { return true; }
 
         if self.native_abi_profile == NativeAbiProfile::ModernFused && opcode.group==0x91 && matches!(opcode.id,0x04 | 0xbc | 0xbd | 0xf8..=0xfb) { return true; }
@@ -7509,6 +7525,11 @@ impl Vm {
     /// Validate the complete local span, not only its first byte. A store
     /// crossing the data/code seam must not touch another native region.
     fn check_local_span(&self, ptr: u32, size: usize) -> VmResult<()> {
+        if self.native_abi_profile==NativeAbiProfile::ModernFused && ptr<0x1000_0000 && ptr&0x0fff_0000==0x0fff_0000 {
+            let buffer=self.native_buffer(ptr).ok_or_else(||Self::invalid_pointer(ptr))?;
+            if size>buffer.size as usize {return Err(Self::invalid_pointer(ptr));}
+        }
+
         let region = if self.modern_pointer_tags && matches!(ptr >> 28, 1 | 2) {
             Some((ptr >> 28, ptr & 0x0fff_ffff))
         } else if matches!(ptr >> 26, 1 | 2) {
@@ -9396,8 +9417,9 @@ impl Vm {
         group: u8,
         id: u16,
     ) -> VmResult<Option<Value>> {
+        if let Some(result) = self.try_version_system(api, group, id)? { return Ok(Some(result)); }
         let result = match (group, id) {
-            (0x81, 0x00) if matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) => {
+            (0x81, 0x00) if matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::Anipani | NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern | NativeAbiProfile::ModernFused) => {
                 // sub_494EF0 -> sub_49EA60: 0 selects CP932, 1 selects UTF-8.
                 let mode = self.pop_int()?;
                 let valid = (0..=1).contains(&mode);
@@ -12543,6 +12565,11 @@ impl Vm {
     /// Segment 0 is the global window, 2 the thread's frames, 0x10..0x3F
     /// heap blocks; an unmapped address returns `u32::MAX` (out of range).
     pub(crate) fn memory_addr(&self, ptr: u32) -> u32 {
+        if self.native_abi_profile==NativeAbiProfile::ModernFused && ptr<0x1000_0000 && ptr&0x0fff_0000==0x0fff_0000 {
+            return self.native_buffer(ptr).filter(|buffer|buffer.pointer!=0)
+                .map_or(u32::MAX,|buffer|self.memory_addr(buffer.pointer));
+        }
+
         if self.modern_pointer_tags && matches!(ptr >> 28, 1 | 2) {
             let offset = ptr & 0x0fff_ffff;
             return match ptr >> 28 {

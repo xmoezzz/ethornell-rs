@@ -33,6 +33,21 @@ pub enum NativeAbiProfile {
 }
 
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
+    if matches!(profile, NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused) {
+        let extension = match (group,id) {
+            (0x80,0x03) | (0x81,0xd8) => Some((2,1)),
+            (0x81,0x00|0x27) => Some((1,1)),
+            (0x81,0x06) if profile==NativeAbiProfile::ModernFused => Some((1,1)),
+            (0x81,0x20|0xda) => Some((3,1)),
+            (0x81,0x21) => Some((2,0)),
+            (0xd0,0x62|0x63) => Some((4,1)),
+            _ => None,
+        };
+        if let Some((argc,stack_outputs))=extension {
+            return Some(NativeCallAbi {argc,stack_outputs,installs_procedure:false,raw_descriptor_bit8:stack_outputs!=0});
+        }
+    }
+
     let common = match (group,id) {
         (0x90,0xc1) => Some((3,1)),
         (0x90,0xcf) => Some((4,0)),
@@ -48,6 +63,11 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
     }
     if profile == NativeAbiProfile::Anipani && (group,id) == (0x92,0x99) {
         return Some(NativeCallAbi { argc:7, stack_outputs:1, installs_procedure:false, raw_descriptor_bit8:true });
+    }
+    if profile == NativeAbiProfile::ModernFused && group==0x7f {
+        // 8A/8B additionally consume the arguments named by their format.
+        let argc=match id {0=>5,0x80|0x82|0x88|0x8b=>2,0x81|0x83|0x89=>1,0x84..=0x86=>4,0x8a=>3,_=>return None};
+        return Some(NativeCallAbi {argc,stack_outputs:1,installs_procedure:false,raw_descriptor_bit8:true});
     }
     if profile == NativeAbiProfile::ModernFused {
         let (argc, outputs, procedure) = match (group,id) {

@@ -3,7 +3,7 @@
 //! and `src/engine/logic_grid_field.c` for the cleaned target code.
 
 mod grid;
-mod msvc_qsort;
+pub(super) mod msvc_qsort;
 mod slg;
 mod space;
 mod spline;
@@ -506,6 +506,12 @@ impl Vm {
                     .space(int(0))
                     .map(|space| space.remove(int(1) as u32)),
             ),
+            0x62 => done(self.logic.space(int(0)).map(|space|space.set_property(int(1) as u32,int(2),int(3)))),
+            // (out*, handle, body, property), output untouched on error.
+            0x63 => match self.logic.space(int(1)).and_then(|space|space.property(int(2) as u32,int(3))) {
+                Ok(value)=>{self.logic_write_i32(ptr(0),value)?;0},
+                Err(status)=>status,
+            },
             0x64 => done(
                 self.logic
                     .space(int(0))

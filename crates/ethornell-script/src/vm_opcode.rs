@@ -1250,6 +1250,9 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         confidence: "high",
         evidence: "sub_4754E0 -> sub_4301E0",
     },
+    // Legacy 0x7F. ModernFused instead reads a secondary byte and runs the
+    // versioned native_buffer table (see parse_bp_program_profile).
+    // 1.653 has another two-string diagnostic form, still unresolved here.
     // 0x7F resource_blend: Native resource blend operation.
     BpOpcodeSpec {
         code: 0x7F,

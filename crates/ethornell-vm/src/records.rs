@@ -41,7 +41,6 @@ impl Vm {
         if size == 0 {
             return;
         }
-        self.clear_shadow_values(dst, size);
         let src_start = self.value_key(src);
         let dst_start = self.value_key(dst);
         let end = src_start.saturating_add(size as u32);
@@ -50,6 +49,9 @@ impl Vm {
             .range(src_start..end)
             .map(|(addr, value)| (dst_start.saturating_add(*addr - src_start), value.clone()))
             .collect();
+        // Capture first: memcpy to the same address (or an overlapping
+        // destination) must not erase its own typed BP source values.
+        self.clear_shadow_values(dst, size);
         self.mem_values.extend(copied);
     }
 

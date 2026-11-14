@@ -68,6 +68,7 @@ pub(crate) struct System81SharedState {
     pub(crate) ui_language: Option<i32>,
     pub(crate) graph91_resource_mode: i32,
     pub(crate) sentence_table: crate::sentence_table::SentenceTable,
+    pub(crate) native_buffers: crate::native_buffers::NativeBuffers,
     pub(crate) clock_jump_threshold_ms: i32,
     pub(crate) input_binding_values: [i32; 256],
     pub(crate) keyboard_polling_override: i32,
@@ -100,6 +101,7 @@ impl Default for System81SharedState {
             ui_language: None,
             graph91_resource_mode: 0,
             sentence_table: crate::sentence_table::SentenceTable::default(),
+            native_buffers: Default::default(),
             // dword_503DE8
             clock_jump_threshold_ms: 500,
             input_binding_values: [0; 256],

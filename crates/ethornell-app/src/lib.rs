@@ -1333,6 +1333,7 @@ struct RuntimeTraceApi {
     system_config_input_mode: i32,
     shader_effect_enabled: bool,
     native_system: native_system::NativeSystemState,
+    bp_profile: ethornell_vm::NativeAbiProfile,
     native_user: native_user::NativeUserState,
     native_effect: native_effect::NativeEffectState,
     /// Portable backend for Windows-only registry/installer metadata. Native
@@ -1724,6 +1725,7 @@ impl RuntimeTraceApi {
             system_config_input_mode: 0,
             shader_effect_enabled: false,
             native_system: native_system::NativeSystemState::default(),
+            bp_profile: ethornell_vm::NativeAbiProfile::Tayutama,
             native_user: native_user::NativeUserState::default(),
             native_effect: native_effect::NativeEffectState::default(),
             platform_store: platform::PortablePlatformStore::from_environment(),
@@ -2441,7 +2443,7 @@ impl RuntimeTraceApi {
             return program.clone();
         }
         let program = match self.manager.read_decoded_from_archive(archive, file) {
-            Ok(bytes) => ethornell_script::parse_bp_program(Some(key.clone()), &bytes),
+            Ok(bytes) => ethornell_script::parse_bp_program_profile(Some(key.clone()), &bytes,self.bp_profile),
             Err(err) => {
                 if file_policy::restricted() {
                     self.host
@@ -9703,8 +9705,8 @@ impl RuntimeEngine {
         native_dialog_presentation: bool,
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
-        let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
         let profile = confirmed_native_profile(&manager, bytes);
+        let program = ethornell_script::parse_bp_program_profile(Some(script.to_string()), bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
             profile.main_data_bytes,
@@ -9719,6 +9721,7 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.bp_profile=profile.abi;
                 api.modern_gradient_blur = profile.modern_gradient_blur;
                 if let Some(sizes)=profile.display_modes {api.display_mode_sizes=sizes.map(Some);api.display_mode_limit=16;}
                 api.native_dialog_presentation = native_dialog_presentation;
@@ -9909,6 +9912,10 @@ impl RuntimeEngine {
             };
         }
 
+        // Performance history samples the host loop's elapsed time, before
+        // engine pause/jump filtering. Modal-host waits do not add records.
+        self.api.native_system.frame_history.push_front(audio_elapsed_ms as u32 as i32);
+        self.api.native_system.frame_history.truncate(600);
         let mut changes = self.api.display_changes;
         let mut report = self.run_native_pass(pacing, elapsed_ms);
         // Input edges are visible for one cooperative main-loop pass.
@@ -24179,6 +24186,23 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn take_frame_yield(&mut self) -> bool {
         std::mem::take(&mut self.frame_yield_requested)
+    }
+
+    fn native_frame_history(&self, count: usize) -> Option<Vec<i32>> {
+        (count <= 600).then(|| self.native_system.frame_history.iter().copied()
+            .chain(std::iter::repeat(0)).take(count).collect())
+    }
+
+    fn secure_random_u32(&mut self) -> ethornell_vm::VmResult<u32> {
+        #[cfg(not(any(target_os="vita",target_os="horizon")))]
+        {
+            let mut bytes = [0;4];
+            getrandom::fill(&mut bytes).map_err(|error|
+                ethornell_vm::VmError::Runtime(format!("OS random source: {error}")))?;
+            return Ok(u32::from_ne_bytes(bytes));
+        }
+        #[cfg(any(target_os="vita",target_os="horizon"))]
+        Err(ethornell_vm::VmError::Runtime("secure random source is unavailable on this host".into()))
     }
 
     fn call_sys(

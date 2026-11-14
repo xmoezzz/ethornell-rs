@@ -885,6 +885,12 @@ pub fn disassemble_bp(buf: &[u8]) -> Vec<BpInstruction> {
 }
 
 pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
+    parse_bp_program_profile(script_name,buf,native_abi::NativeAbiProfile::Tayutama)
+}
+
+/// Runtime-specific instruction grammar. In 1.687, 7F gained a secondary
+/// byte; older tables retain their one-byte 7F operation.
+pub fn parse_bp_program_profile(script_name: Option<String>, buf: &[u8], profile:native_abi::NativeAbiProfile) -> BpProgram {
     let range = detect_code_range(buf);
     let module_size = declared_module_size(buf);
     let code = Arc::new(buf[range.start..range.end].to_vec());
@@ -908,6 +914,10 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
         let mut opcode_name_override = None;
 
         match opcode_byte {
+            0x7f if profile==native_abi::NativeAbiProfile::ModernFused => {
+                opcode_name_override=Some("native_buffer");
+                if let Some(id)=read_u8_operand(&mut cursor,&mut raw_len,&mut warning) {operands.push(BpOperand::U8(id));}
+            }
             // Triple Pairing 1.687: fused frame operations. H is a raw
             // u16, P is the existing width-tagged signed LEB encoding, and
             // R is a signed target relative to this opcode, not its end.
