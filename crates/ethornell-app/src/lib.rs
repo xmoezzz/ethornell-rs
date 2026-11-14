@@ -2470,7 +2470,7 @@ impl RuntimeTraceApi {
                 return -1;
             };
             let explicit = name.replace('\\', "/").starts_with("bgi-");
-            let metadata = policy.metadata(&name).or_else(|| {
+            let metadata = policy.user_metadata(&name).or_else(|| {
                 if explicit {
                     None
                 } else {
@@ -22229,7 +22229,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn read_disk_file(&mut self, path: &str) -> Option<Vec<u8>> {
         if let Some(policy) = file_policy::active() {
-            return policy.read_loose(path).ok();
+            return policy.read_loose(&file_policy::user_data_alias(path)).ok();
         }
         let host = find_runtime_file_from_root(&self.manager, &self.native_root, "", path)?;
         host.is_file().then(|| std::fs::read(&host).ok()).flatten()
@@ -22237,7 +22237,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn disk_file_exists(&mut self, path: &str) -> bool {
         if let Some(policy) = file_policy::active() {
-            return policy.metadata(path).is_some_and(|meta| !meta.is_dir());
+            return policy.user_metadata(path).is_some_and(|meta| !meta.is_dir());
         }
         find_runtime_file_from_root(&self.manager, &self.native_root, "", path)
             .is_some_and(|host| host.is_file())
@@ -22248,13 +22248,20 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             return None;
         }
         if file_policy::active().is_some() {
-            return read_runtime_bytes(&self.manager, archive, entry);
+            // The VM owns DSC/SDC decoding and native archive status codes.
+            // Return packed bytes from an indexed descriptor, including for
+            // composite members named Archive\\data01000.arc.
+            let found = user_files::indexed_archive_entry(&self.manager, archive, entry)?;
+            return self.manager.read_by_entry_raw(&found).ok();
         }
         let found = find_runtime_resource(&self.manager, archive, entry)?;
         self.manager.read_by_entry_raw(&found).ok()
     }
 
     fn archive_entry_exists(&mut self, archive: &str, entry: &str) -> bool {
+        if file_policy::restricted() {
+            return user_files::indexed_archive_entry(&self.manager, archive, entry).is_some();
+        }
         !is_empty_archive_arg(archive)
             && find_runtime_resource(&self.manager, archive, entry).is_some()
     }
