@@ -433,30 +433,22 @@ pub fn run(config: AppConfig) -> Result<()> {
         manager.read_decoded_from_archive("system.arc", "ipl._bp")
     };
     tracing::info!(script = startup_script, "selected runtime bootstrap script");
-    let runtime = match Some(startup_script) {
-        Some(script) => match startup_bytes {
-            Ok(bytes) => Some(RuntimeEngine::new(
-                script,
-                &bytes,
-                manager.clone(),
-                native_root,
-                config.trace,
-                config.fail_on_stub,
-                !headless,
-                encoding,
-            )),
-            Err(err) => {
-                tracing::warn!(script, %err, "startup script unavailable");
-                None
-            }
-        },
-        None => None,
-    };
-    let image = if runtime.is_some() {
-        None
-    } else {
-        Some(load_runtime_image(&manager)?)
-    };
+    // A title bitmap cannot substitute for a running interpreter: it has no
+    // native button objects, input handlers or title script state.
+    let bytes = startup_bytes.map_err(|error| EthornellError::Other(format!(
+        "native bootstrap {startup_script} could not be loaded: {error}"
+    )))?;
+    let runtime = Some(RuntimeEngine::new(
+        startup_script,
+        &bytes,
+        manager.clone(),
+        native_root,
+        config.trace,
+        config.fail_on_stub,
+        !headless,
+        encoding,
+    ));
+    let image: Option<DecodedImage> = None;
     if config.trace
         && let Some(image) = image.as_ref()
     {
