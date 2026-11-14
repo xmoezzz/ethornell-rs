@@ -3,6 +3,41 @@ use crate::native_landscape::{
     LANDSCAPE_HANDLE, LANDSCAPE_NO_COLUMNS, LANDSCAPE_NO_MAP, landscape_error,
 };
 
+#[cfg(test)]
+mod raster_option_abi_tests {
+    use super::*;
+    use ethornell_vm::{NativeAbiProfile, Value, Vm, VmRunOptions, VmStopReason};
+
+    #[test]
+    fn raster_option_native_abis_preserve_operand_order_and_result_contract() {
+        let manager = ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let program = ethornell_script::parse_bp_program(Some("raster-options".into()), &[0x91, 0x0a, 0x17]);
+        for profile in [NativeAbiProfile::Anipani, NativeAbiProfile::HoukagoFd, NativeAbiProfile::Modern] {
+            let mut api = RuntimeTraceApi::new(manager.clone());
+            for (key, value, accepted) in [
+                (0x0122_0000u32, 1, true), (0x0122_0000, 2, true),
+                (0x8011_1600, 1, true), (0x8011_1600, -1, true),
+                (0xdead_beef, 1, false),
+            ] {
+                let mut vm = Vm::new();
+                vm.set_native_abi_profile(profile);
+                vm.start(&program);
+                vm.stack = vec![Value::Int(73), Value::Int(key as i32), Value::Int(value)];
+                let before = (api.native_additive_coverage, api.effects.clip_vectors_xy);
+                let report = vm.run_loaded(&mut api, &VmRunOptions { fail_on_stub: true, ..Default::default() });
+                assert_eq!(report.stop_reason, VmStopReason::Completed, "{profile:?}: {report:?}");
+                assert_eq!(vm.stack, vec![Value::Int(73), Value::Int(i32::from(accepted))]);
+                let after = (api.native_additive_coverage, api.effects.clip_vectors_xy);
+                match key {
+                    0x0122_0000 => assert_eq!(after, (value == 1, before.1)),
+                    0x8011_1600 => assert_eq!(after, (before.0, value == 1)),
+                    _ => assert_eq!(after, before),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Graph91FontTransform {
     pub scale_x: i32,
@@ -314,7 +349,8 @@ impl RuntimeTraceApi {
             }
             0x0a => {
                 if stack.len() != 2 { return Some(Err(ethornell_vm::VmError::UnknownDispatch { group:0x91, id })); }
-                // FD 495740 -> 402150 -> 408D10. Unknown keys return false;
+                // Legacy 48A600 -> 401EC0 -> 408840 and FD
+                // 495740 -> 402150 -> 408D10. Unknown keys return false;
                 // only value == 1 selects the alternate native pixel path.
                 let value = pop_int_value(stack).unwrap_or_default();
                 let key = pop_int_value(stack).unwrap_or_default() as u32;

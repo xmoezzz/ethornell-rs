@@ -18,6 +18,7 @@ mod debug_trace;
 mod display_tree;
 mod effects;
 mod file_policy;
+mod native_profile;
 mod frame_presenter;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
@@ -250,6 +251,12 @@ impl Default for NativeRuntimeProfile {
 }
 
 fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
+    let mut profile = resource_native_profile(manager, bootstrap);
+    native_profile::apply(manager, &mut profile);
+    profile
+}
+
+fn resource_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
     // Session version detection uses confirmed code-resource pairs,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
@@ -392,6 +399,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         );
     }
     let manager = ResourceManager::open_game(config.game_root.path())?;
+    let manager = if config.script.is_none() { manager.for_native_bootstrap(None)? } else { manager };
     tracing::info!(
         archives = manager.archives().archives.len(),
         resources = manager.resource_count(),
@@ -9695,7 +9703,8 @@ impl RuntimeEngine {
             }
             None => self.api.native_root.clone(),
         };
-        let manager = match ResourceManager::open_game(&native_root) {
+        let manager = match ResourceManager::open_game(&native_root).and_then(|manager|
+            manager.for_native_bootstrap(self.api.manager.archive_language())) {
             Ok(manager) => manager,
             Err(err) => {
                 tracing::warn!(%err, root = %native_root.display(), "bootstrap root unusable");
@@ -22451,6 +22460,16 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn user_ui_language(&mut self) -> i32 {
+        use ethornell_archive::ArchiveLanguage;
+        if let Some(language) = self.manager.archive_language() {
+            return match language {
+                ArchiveLanguage::Japanese => 0x0411,
+                ArchiveLanguage::English => 0x0409,
+                ArchiveLanguage::SimplifiedChinese => 0x0804,
+                ArchiveLanguage::TraditionalChinese => 0x0404,
+                ArchiveLanguage::Korean => 0x0412,
+            };
+        }
         let locale = std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES"))
             .or_else(|_| std::env::var("LANG")).unwrap_or_default().to_ascii_lowercase();
         if locale.starts_with("ja") { 0x0411 }

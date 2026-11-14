@@ -232,7 +232,7 @@ impl HostRuntime {
                 "A日本語中文"
             })?,
         };
-        let manager = policy.open_manager()?;
+        let manager = policy.open_manager()?.for_native_bootstrap(None)?;
         let bytes = manager.read_decoded_from_archive("system.arc", "ipl._bp")?;
         let mut runtime = file_policy::scope(&policy, || {
             snapshot::with_font(&font, || {
@@ -930,6 +930,7 @@ impl RuntimeEngine {
             4096,
         );
         vm.set_native_abi_profile(profile.abi);
+        vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
@@ -937,6 +938,7 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.modern_gradient_blur = profile.modern_gradient_blur;
                 api
             },
             options: ethornell_vm::VmRunOptions {
