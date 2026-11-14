@@ -3,6 +3,34 @@
 use crate::*;
 
 impl Vm {
+    /// FE1B0/BCA40 recognize self-describing compressed inputs before
+    /// consulting the caller's byte count. In particular count=0 is valid
+    /// for DSC/CBG. Bound parsing to the owning guest allocation rather than
+    /// reproducing the native worker's unchecked pointer reads.
+    fn native_bitmap_source_range(&self,source:u32,size:i32)->VmResult<std::ops::Range<usize>> {
+        let prefix=self.resolve_range(source,16)?;
+        let compressed=self.memory[prefix.clone()].starts_with(b"DSC FORMAT 1.00")
+            || self.memory[prefix.clone()].starts_with(b"CompressedBG___");
+        if !compressed && size>0 {return self.resolve_range(source,size as usize)}
+        let available=if let Some(buffer)=self.native_buffer(source) {Some(buffer.size as usize)}
+            else if let Some((base,offset))=self.target_heap.translate(source) {
+                self.heap_allocations.get(&base).and_then(|size|size.checked_sub(offset)).map(|n|n as usize)
+            } else {None};
+        if let Some(available)=available {
+            if available>0x04000000 {return Err(VmError::Runtime("native bitmap source allocation limit".into()))}
+            return self.resolve_range(source,available);
+        }
+        if size>0 {return self.resolve_range(source,size as usize)}
+        // A static/unallocated input still has a checked code/data region.
+        // Locate its readable extent without crossing a segment or exposing
+        // the next heap allocation. Failed decoders retain native failure.
+        let mut low=16usize;let mut high=(self.memory.len()-prefix.start).min(0x04000000);
+        while low<high {
+            let mid=low+(high-low).div_ceil(2);
+            if self.resolve_range(source,mid).is_ok() {low=mid} else {high=mid-1}
+        }
+        self.resolve_range(source,low)
+    }
     pub(super) fn try_version_graph<A: SysApi + GraphApi>(
         &mut self,
         api: &mut A,
@@ -32,10 +60,10 @@ impl Vm {
                 let size = self.pop_int()?;
                 let source = self.pop_ptr()?;
                 let bitmap = self.pop_int()?;
-                let status = if size <= 0 || source == 0 {
+                let status = if source == 0 {
                     -1
                 } else {
-                    let range = self.resolve_range(source, size as usize)?;
+                    let range = self.native_bitmap_source_range(source,size)?;
                     match crate::resource_io::target_decode_resource(&self.memory[range], 0, 0) {
                         Ok(bytes) => api.register_decoded_graph_bitmap(
                             bitmap,

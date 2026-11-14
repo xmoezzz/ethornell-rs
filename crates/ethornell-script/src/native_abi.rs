@@ -35,12 +35,22 @@ pub enum NativeAbiProfile {
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
     if matches!(profile, NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused) {
         let extension = match (group,id) {
-            (0x80,0x03) | (0x81,0xd8) => Some((2,1)),
-            (0x81,0x00|0x27) => Some((1,1)),
+            (0x80,0x03|0x9f|0xec) | (0x81,0xd8) => Some((2,1)),
+            (0x80,0xed) | (0x81,0x00|0x27) => Some((1,1)),
+            (0x80,0xee) => Some((6,1)),
             (0x81,0x06) if profile==NativeAbiProfile::ModernFused => Some((1,1)),
             (0x81,0x20|0xda) => Some((3,1)),
             (0x81,0x21) => Some((2,0)),
+            (0xb0,0xc5) => Some((2,1)),
+            (0x81,0x48) => Some((4,0)),
+            (0xb0,0x2a) => Some((1,1)),
+            (0x81,0x80) => Some((5,1)),
+            (0x81,0xb8) => Some((6,1)),
+            (0x81,0xb9) => Some((7,1)),
+            (0x81,0x8c..=0x8f) if profile==NativeAbiProfile::ModernFused => Some((2,1)),
             (0xd0,0x62|0x63) => Some((4,1)),
+            (0xd0,0x71) => Some((9,1)),
+            (0xd0,0x7b) => Some((13,1)),
             _ => None,
         };
         if let Some((argc,stack_outputs))=extension {
@@ -64,6 +74,7 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
     if profile == NativeAbiProfile::Anipani && (group,id) == (0x92,0x99) {
         return Some(NativeCallAbi { argc:7, stack_outputs:1, installs_procedure:false, raw_descriptor_bit8:true });
     }
+    if profile==NativeAbiProfile::ModernFused && (group,id)==(0xb0,0xcf) {return Some(NativeCallAbi {argc:0,stack_outputs:0,installs_procedure:false,raw_descriptor_bit8:false});}
     if profile == NativeAbiProfile::ModernFused && group==0x7f {
         // 8A/8B additionally consume the arguments named by their format.
         let argc=match id {0=>5,0x80|0x82|0x88|0x8b=>2,0x81|0x83|0x89=>1,0x84..=0x86=>4,0x8a=>3,_=>return None};
@@ -71,6 +82,24 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
     }
     if profile == NativeAbiProfile::ModernFused {
         let (argc, outputs, procedure) = match (group,id) {
+            (0x81,0x34) => (2,1,true),
+            (0xb0,0x12) => (6,1,false),
+            (0xb0,0x1b) => (8,0,false),
+            (0xb0,0x1e|0x1f) => (3,1,false),
+            (0xb0,0x60|0x6d) => (7,1,false),
+            (0xb0,0x61|0x66) => (1,1,false),
+            (0xb0,0x62|0x68|0x6a) => (3,1,false),
+            (0xb0,0x63|0x67) => (2,1,false),
+            (0xb0,0x6c) => (6,1,false),
+            (0xb0,0x6f) => (5,1,false),
+            (0x81,0x66|0x67) => (1,0,false),
+            (0x81,0x6c) => (2,1,false),
+            (0xb0,0xc8) => (2,0,false),
+            (0xb0,0xcf) => (0,0,false),
+            (0xd0,0xc0|0xc4|0xc7) => (3,1,false),
+            (0xd0,0xc1|0xc2) => (1,1,false),
+            (0xd0,0xc5) => (2,1,false),
+            (0xd0,0xc6|0xc8) => (6,1,false),
             (0x91,0x04) => (6,0,true),
             (0x91,0xbc) => (1,1,false),
             (0x91,0xbd) => (11,1,false),

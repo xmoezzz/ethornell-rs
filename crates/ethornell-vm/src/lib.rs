@@ -21,6 +21,13 @@ mod modern_bp;
 mod native_version;
 mod version_system;
 mod native_buffers;
+mod native_diagnostics;
+mod native_extension;
+mod native_inspector;
+mod native_memory_guard;
+mod parallel_call;
+pub use native_inspector::{NativeInspectorView,NativeInspectorRow,NativeInspectorTab,NativeInspectorEvent,NativeObjectInspector,NativeObjectInspectorProperty};
+pub use native_extension::{NativeExtension,NativeExtensionArgument};
 mod native_buffer_format;
 mod fused_bp;
 pub mod cpu_record;
@@ -399,6 +406,24 @@ pub struct ShortcutInstallerWorkflowRequest {
 }
 
 pub trait SysApi {
+    fn inspect_native_display_object(&self,_object:i32)->Result<NativeObjectInspector,i32> {Err(7)}
+    fn edit_native_display_object(&mut self,_object:i32,_key:u8,_value:i32)->VmResult<()> {
+        Err(VmError::Runtime("native object inspector edits are unavailable".into()))
+    }
+    fn native_worker_count(&self)->usize {std::thread::available_parallelism().map(|n|n.get()).unwrap_or(1)}
+    fn publish_native_inspector(&mut self,_view:&NativeInspectorView)->VmResult<bool> {Ok(false)}
+    fn close_native_inspector(&mut self,_handle:u32)->VmResult<()> {Ok(())}
+    fn take_native_inspector_events(&mut self,_handle:u32)->VmResult<Vec<NativeInspectorEvent>> {Ok(Vec::new())}
+
+    /// Load a maintained portable extension, not the game's executable DLL.
+    /// Native failure statuses are 1 (not found) and 2 (missing entry point).
+    /// An existing library without a portable implementation fails visibly.
+    fn load_native_extension(&mut self,path:&str) -> VmResult<Result<Box<dyn NativeExtension>,i32>> {
+        if self.path_exists(path) || self.path_exists(&format!("{path}.dll")) {
+            Err(VmError::Runtime(format!("native extension {path:?} has no portable host implementation")))
+        } else {Ok(Err(1))}
+    }
+
     /// Legacy desktop System81 helpers may use std::fs as a fallback. Sandboxed
     /// hosts MUST return false so denied reads cannot bypass their IO policy.
     /// This does not replace checks in all host filesystem/installer methods.
@@ -761,6 +786,14 @@ pub trait SysApi {
     }
 
     fn configure_screen_size(&mut self, _width: i32, _height: i32) {}
+
+    /// Logical host-owned window identity. Never an HWND or GPU pointer;
+    /// windowless/embedded hosts return zero.
+    fn portable_window_identity(&self) -> u64 {0}
+    fn configure_window_resizable(&mut self,_enabled:bool) {}
+    /// Presentation client dimensions, independent of the native game canvas.
+    fn configure_presentation_size(&mut self,_width:i32,_height:i32) -> bool {false}
+
 
     fn register_display_mode(&mut self, _index: usize, _width: i32, _height: i32) {}
     fn display_mode_capacity(&self) -> usize {8}
@@ -1181,6 +1214,9 @@ pub trait GraphApi {
 
     /// 1.687 91:04 receives an already decoded guest-memory image, optionally
     /// binds a bitmap and stores it in the native two-key resource/cache registry.
+    fn blend_native_bitmap_sources(&mut self,_destination:i32,_first:i32,_second:i32,_mix:i32,_transparency:i32)->VmResult<()> {
+        Err(VmError::Runtime("native two-source bitmap blending is unavailable".into()))
+    }
     fn register_decoded_graph_bitmap(&mut self,_bitmap:i32,_bytes:&[u8],_namespace:Option<&str>,_name:Option<&str>,_bg_store:bool) -> i32 {1}
 
     /// 1.687 Graph92:94: peek/drain line-height DWORDs by layout token.
@@ -1962,6 +1998,8 @@ pub trait SoundApi {
         Ok(None)
     }
 
+    fn native_child_window_property(&self,_handle:i32,_property:i32)->Result<i32,i32> {Err(-1)}
+
     fn current_user_text(&self) -> String {
         String::new()
     }
@@ -1971,6 +2009,13 @@ pub trait SoundApi {
     fn user_font_families(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// B0:C5: GDI charset-filtered enumeration. Portable hosts may expose
+    /// their substituted stock CJK faces for DEFAULT/SHIFTJIS charsets only.
+    fn user_font_families_for_charset(&self, charset: u8) -> Vec<String> {
+        if matches!(charset, 1|128) { self.user_font_families() } else { Vec::new() }
+    }
+
 
     fn show_user_dialog(&mut self, _request: UserDialogRequest) -> Option<UserDialogResponse> {
         None
@@ -2393,6 +2438,7 @@ fn placeholder_loaded_program(
 
 #[derive(Debug, Default)]
 pub struct Vm {
+    parallel_worker_index:Option<i32>,
     native_abi_profile: NativeAbiProfile,
     modern_pointer_tags: bool,
     trace_id: u64,
@@ -3390,6 +3436,7 @@ impl Vm {
                 let width = read_op_u8(instruction);
                 let value = self.pop_value()?;
                 let ptr = self.pop_ptr()?;
+                self.check_native_guarded_write(api,ptr,1<<width.min(2));
                 self.write_value(ptr, width, &value)?;
                 // sub_473710 writes through the pointer and calls sub_4450D0
                 // to return the assigned value on the operand ring.
@@ -3422,6 +3469,7 @@ impl Vm {
                         "TRACE_SCRMAIN_DISPATCH result"
                     );
                 }
+                self.check_native_guarded_write(api,ptr,1<<width.min(2));
                 self.write_value(ptr, width, &value)?;
             }
             BpOpcode::Known { code: 0x0b, .. } => {
@@ -3459,7 +3507,9 @@ impl Vm {
                 }
                 let stride = 1u32 << width.min(2);
                 for (idx, value) in values.into_iter().rev().enumerate() {
-                    self.write_value(dst.wrapping_add(stride * idx as u32), width, &value)?;
+                    let destination=dst.wrapping_add(stride*idx as u32);
+                    self.check_native_guarded_write(api,destination,stride as usize);
+                    self.write_value(destination, width, &value)?;
                 }
             }
             BpOpcode::Known { code: 0x14, .. } => {
@@ -3819,6 +3869,7 @@ impl Vm {
                 let dst = self.pop_ptr()?;
                 let src = self.normalize_scenario_descriptor_src(src, size);
                 let src_range = self.resolve_range(src, size)?;
+                self.check_native_guarded_write(api,dst,size);
                 let dst_range = self.resolve_write_range(dst, size)?;
                 let tmp = self.memory[src_range].to_vec();
                 self.memory[dst_range].copy_from_slice(&tmp);
@@ -3828,6 +3879,7 @@ impl Vm {
             BpOpcode::Known { code: 0x61, .. } => {
                 let size = self.pop_int()?.max(0) as usize;
                 let ptr = self.pop_ptr()?;
+                self.check_native_guarded_write(api,ptr,size);
                 let range = self.resolve_write_range(ptr, size)?;
                 self.memory[range].fill(0);
                 self.trace_watch_write(ptr, size, 0, "memclr");
@@ -3838,6 +3890,7 @@ impl Vm {
                 let value = self.pop_int()? as u8;
                 let size = self.pop_int()?.max(0) as usize;
                 let ptr = self.pop_ptr()?;
+                self.check_native_guarded_write(api,ptr,size);
                 let range = self.resolve_write_range(ptr, size)?;
                 self.memory[range].fill(value);
                 self.trace_watch_write(ptr, size, value as u32, "memset");
@@ -3931,6 +3984,8 @@ impl Vm {
             BpOpcode::Known { code: 0x6a, .. } => {
                 let right = self.pop_value()?;
                 let left = self.pop_ptr()?;
+                let text=self.value_as_string_lossy(right.clone())?;
+                self.check_native_guarded_write(api,left,self.encode_native_string(&text).len()+1);
                 self.copy_c_string_value(left, right)?;
             }
             BpOpcode::Known { code: 0x6b, .. } => {
@@ -3970,6 +4025,8 @@ impl Vm {
                 let dst = self.pop_ptr()?;
                 let rendered = self.render_sprintf(&fmt);
                 self.write_c_string(dst, &rendered)?;
+                // EE7E0 performs its check after printf has written the bytes.
+                self.check_native_guarded_write(api,dst,self.encode_native_string(&rendered).len()+1);
             }
             BpOpcode::Known { code: 0x70, .. } => {
                 let size = self.pop_int()?.max(0) as u32;
@@ -3992,10 +4049,8 @@ impl Vm {
                 self.execute_set_memory_mode()?;
             }
             BpOpcode::Known { code: 0x75, .. } => {
-                let _name = self.pop_string_lossy()?;
-                let _size = self.pop_int()?;
-                let _start = self.pop_int()?;
-                self.push_value(Value::Int(1));
+                let result=self.register_native_memory_guard()?;
+                self.push_value(Value::Int(result));
             }
             BpOpcode::Known { code: 0x77, .. } => {
                 let selector = self.pop_int()?;
@@ -4068,7 +4123,7 @@ impl Vm {
                 self.push_value(Value::Int(result));
             }
             BpOpcode::Known { code: 0x7d, .. } => {
-                self.execute_resource_transform()?;
+                self.execute_resource_transform(api)?;
             }
             BpOpcode::Known { code: 0x7e, .. } => {
                 let result = self.execute_clipboard_set()?;
@@ -4081,7 +4136,23 @@ impl Vm {
                     api.observe_dispatch(NativeOpcode {group:0x7f,id:id as u16});
                     let result=self.execute_buffer_extension(id)?;
                     self.push_value(Value::Int(result));
-                } else {self.execute_resource_blend()?;}
+                } else if self.native_abi_profile==NativeAbiProfile::Anipani {
+                    // 47F9E0 is a formatted message box in 1.653, not the
+                    // older five-argument resource-blend operation.
+                    let argument=self.pop_string_lossy()?;
+                    let format=self.pop_string_lossy()?;
+                    // printf receives one C argument, not arbitrary values
+                    // below it on the BP operand stack. Preserve that boundary.
+                    let saved_stack=std::mem::replace(&mut self.stack,vec![Value::Str(argument)]);
+                    let formatted=self.render_buffer_format(&format);
+                    self.stack=saved_stack;
+                    let bytes=formatted?;
+                    let message=self.decode_native_string_lossy(&bytes);
+                    if self.begin_host_continuation(api,HostRequest::Message {text:message.clone()},0)? {
+                        self.pc=next_pc;return Ok(());
+                    }
+                    api.message_box("",&message);
+                } else {self.execute_resource_blend(api)?;}
             }
             BpOpcode::Known { code: 0x80 | 0x81, .. } => {
                 let id = instruction.raw.get(1).copied().unwrap_or_default() as u16;
@@ -4229,6 +4300,8 @@ impl Vm {
                             .system_mode_flag = mode as u32;
                     }
                     Value::Int(i32::from(valid))
+                } else if (code,id)==(0x81,0x48) && matches!(self.native_abi_profile,NativeAbiProfile::Anipani|NativeAbiProfile::ModernFused) {
+                    self.execute_parallel_call(api)?;Value::None
                 } else if let Some(result) = self.try_builtin_sys_with_api(api, code, id)? {
                     if trace_events
                         && matches!(id, 0x47 | 0x48 | 0x9d | 0xac | 0xd0 | 0xd2 | 0xd4 | 0xdd)
@@ -5611,7 +5684,7 @@ impl Vm {
                     );
                 }
                 if fail_on_stub
-                    && !native_call::is_strictly_supported(NativeOpcode { group: code, id })
+                    && !self.effective_strict_support(NativeOpcode { group: code, id })
                 {
                     self.note_stub("snd", code, id);
                     return Err(VmError::UnknownDispatch { group: code, id });
@@ -5757,7 +5830,7 @@ impl Vm {
                 self.note_call("user", code, id);
                 api.observe_dispatch(NativeOpcode { group: code, id });
                 if fail_on_stub
-                    && !native_call::is_strictly_supported(NativeOpcode { group: code, id })
+                    && !self.effective_strict_support(NativeOpcode { group: code, id })
                 {
                     self.note_stub("user", code, id);
                     return Err(VmError::UnknownDispatch { group: code, id });
@@ -5769,13 +5842,21 @@ impl Vm {
                     return Ok(());
                 }
                 self.normalize_user_string_args(code, id)?;
-                let direct_result = if (code, id) == (0xb0, 0xc4) {
+                let inspector_result=if code==0xb0 {self.try_native_inspector(api,id)?} else {None};
+                let direct_result = if inspector_result.is_some() {inspector_result} else if (code,id)==(0xb0,0x1f) && self.native_abi_profile==NativeAbiProfile::ModernFused {
+                    let property=self.pop_int()?;let handle=self.pop_int()?;let output=self.pop_ptr()?;
+                    match api.native_child_window_property(handle,property) {
+                        Ok(value)=>{self.write_int(output,2,value as u32)?;Some(Value::Int(0))},
+                        Err(status)=>return Err(VmError::Runtime(format!("native child-window property {property} for {handle:#x}: status {status:#x}"))),
+                    }
+                } else if code == 0xb0 && matches!(id,0xc4|0xc5) {
                     // sub_479D60 -> sub_4694B0 -> sub_42DEB0/sub_42F030:
                     // null queries the byte count, including each terminator.
                     // A buffer receives consecutive C strings and returns
                     // the family count, without an extra list terminator.
+                    let charset=if id==0xc5 {Some(self.pop_int()? as u8)} else {None};
                     let destination = self.pop_ptr()?;
-                    let families = api.user_font_families();
+                    let families=charset.map(|c|api.user_font_families_for_charset(c)).unwrap_or_else(||api.user_font_families());
                     let mut bytes = Vec::new();
                     for family in &families {
                         bytes.extend_from_slice(&encoding_rs::SHIFT_JIS.encode(family).0);
@@ -6112,7 +6193,9 @@ impl Vm {
             BpOpcode::Known { code: 0xe0, .. } => {
                 let id = instruction.raw.get(1).copied().unwrap_or_default();
                 self.note_call("debug", code, u16::from(id));
-                self.execute_debug_inspect(id)?;
+                if id==0x20 && self.native_abi_profile==NativeAbiProfile::ModernFused {
+                    self.execute_native_object_inspector(api)?;
+                } else if !self.execute_version_diagnostic(api,id)? {self.execute_debug_inspect(id)?;}
             }
             BpOpcode::Unknown(code) => {
                 self.note_stub("opcode", code, 0);
@@ -6889,9 +6972,13 @@ impl Vm {
         native_abi::lookup_profile(self.native_abi_profile,group,id).map(|a|a.installs_procedure).unwrap_or_else(||native_abi::installs_procedure(group,id))
     }
     fn effective_strict_support(&self,opcode:NativeOpcode)->bool {
+        if matches!(self.native_abi_profile,NativeAbiProfile::Anipani|NativeAbiProfile::ModernFused)
+            && opcode.group==0xb0&&matches!(opcode.id,0x2a|0xc5) {return true;}
+        if self.native_abi_profile==NativeAbiProfile::ModernFused && opcode.group==0xb0 && matches!(opcode.id,0x12|0x1b|0x1e|0x1f|0x60..=0x63|0x66..=0x68|0x6a|0x6c|0x6d|0x6f|0xc8|0xcf) {return true;}
+
         if matches!(self.native_abi_profile, NativeAbiProfile::Anipani | NativeAbiProfile::ModernFused)
-            && matches!((opcode.group,opcode.id), (0x80,0x03) | (0x81,0x00|0x20|0x21|0x27|0xd8|0xda)) {return true;}
-        if self.native_abi_profile == NativeAbiProfile::ModernFused && (opcode.group,opcode.id)==(0x81,0x06) {return true;}
+            && matches!((opcode.group,opcode.id), (0x80,0x03|0x9f|0xec|0xed|0xee) | (0x81,0x00|0x20|0x21|0x27|0x48|0x80|0xb8|0xb9|0xd8|0xda)) {return true;}
+        if self.native_abi_profile == NativeAbiProfile::ModernFused && opcode.group==0x81 && matches!(opcode.id,0x06|0x34|0x66|0x67|0x6c|0x8c..=0x8f) {return true;}
 
         if matches!((opcode.group,opcode.id),(0x90,0xc1 | 0xcf) | (0x92,0x31 | 0x3d)) { return true; }
 
@@ -10967,6 +11054,7 @@ impl Vm {
                 if ptr == 0 {
                     return Err(VmError::Runtime("グローバル領域に空きがありません".into()));
                 }
+                self.record_native_allocation(ptr,size);
                 Value::Int(ptr as i32)
             }
             (0x80, 0x21) => {
@@ -10978,6 +11066,7 @@ impl Vm {
                         "グローバルメモリの解放の対象に不正なアドレス [ ${ptr:08X} ] が指定されました"
                     )));
                 }
+                self.forget_native_allocation(ptr);
                 Value::Int(1)
             }
             (0x80, 0x33) => self.sys80_33_delete_file(api)?,
@@ -12521,6 +12610,7 @@ impl Vm {
     }
 
     fn note_call(&mut self, kind: &str, group: u8, id: u16) {
+        self.system81_shared.lock().expect("system81 state poisoned").diagnostics.count(self.native_abi_profile,group,id);
         if !self.collect_diagnostics {
             return;
         }

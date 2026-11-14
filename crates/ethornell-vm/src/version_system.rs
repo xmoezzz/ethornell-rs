@@ -74,6 +74,72 @@ impl Vm {
         let modern = self.native_abi_profile == NativeAbiProfile::ModernFused;
         let probe_limit = if modern { 6 } else { 3 };
         Ok(Some(match (group, id) {
+            (0x80, 0xec..=0xee) => self.execute_native_extension(api,id)?,
+            (0x81, 0xb8|0xb9) => Value::Int(self.search_native_records(id == 0xb9)?),
+            (0x81, 0x34) if modern => {
+                // EC050 -> DCProcExamineHealthOfFile. The null archive is 9;
+                // an absent file is 1, before installing the native procedure.
+                let file=self.pop_string_lossy()?;
+                let archive=self.pop_value()?;
+                if matches!(archive,Value::None|Value::Int(0)|Value::Ptr(0)) {Value::Int(9)} else {
+                    let archive=self.value_as_string_lossy(archive)?;
+                    if !api.file_exists(&archive,&file) {Value::Int(1)} else {
+                        let bytes=api.read_archive_entry_raw(&archive,&file)
+                            .or_else(||api.read_disk_file(&crate::join_native_path(&archive,&file)))
+                            .or_else(||api.load_file_bytes(&archive,&file));
+                        let expected=self.system81_shared.lock().expect("system81 state poisoned").resource_checksums
+                            .get(&(native_checksum_key(&archive),native_checksum_key(&file))).copied();
+                        let status=match (bytes,expected) {
+                            (None,_)=>3,(_,None)=>10,
+                            (Some(bytes),Some(expected))=>if crate::native_file_hash(&bytes)==expected {0} else {11},
+                        };
+                        self.install_host_completed_procedure(crate::NativeOpcode {group,id},crate::native_call::NativeProcedureCompletion {
+                            class:crate::native_call::NativeProcedureClass::ExamineHealthOfFile,status,outputs:[status,0],output_count:1,
+                        },false);
+                        Value::None
+                    }
+                }
+            }
+            (0x81, 0x66) if modern => {
+                // B6880 / B68F0: WS_SIZEBOX is the only differing style bit.
+                let enabled=self.pop_int()?!=0;api.configure_window_resizable(enabled);Value::None
+            }
+            (0x81, 0x67) if modern => {
+                let output=self.pop_ptr()?;
+                let token=api.portable_window_identity();
+                self.resolve_write_range(output,8)?;
+                self.write_int(output,2,token as u32)?;
+                self.write_int(output.wrapping_add(4),2,(token>>32) as u32)?;Value::None
+            }
+            (0x81, 0x6c) if modern => {
+                // FFF60 validates the ratio, then updates the output client size.
+                let height=self.pop_int()?;let width=self.pop_int()?;
+                let (native_width,native_height)=api.runtime_screen_dimensions();
+                let (width,height)=if width<=0||height<=0 {(native_width,native_height)} else {(width,height)};
+                let valid=width>0&&height>0&&native_width>0&&native_height>0
+                    && ((native_height as f32/native_width as f32)-(height as f32/width as f32)).abs()<=0.001;
+                Value::Int(i32::from(valid&&api.configure_presentation_size(width,height)))
+            }
+            (0x81, 0x80) => {
+                let path = self.pop_string_lossy()?;
+                let user_size = self.pop_ptr()?;
+                let user = self.pop_ptr()?;
+                let config_size = self.pop_ptr()?;
+                let config = self.pop_ptr()?;
+                Value::Int(i32::from(self.restore_gdb_buffers(api, config, config_size, user, user_size, &path)?))
+            }
+            (0x81, 0x8c..=0x8f) if modern => {
+                // 1400F7080..F70B0 are original unconditional 80000004
+                // failure routines. EB480..EB600 map that status to 1.
+                if matches!(id,0x8c|0x8e) { self.pop_int()?; } else { self.pop_ptr()?; }
+                self.pop_ptr()?;
+                Value::Int(1)
+            }
+            (0x80, 0x9f) => {
+                let mode = self.pop_int()? as u32;
+                let handle = self.pop_int()? as u32;
+                Value::Int(self.sys_indexed_record_mode(handle, mode))
+            }
             (0x80, 0x03) => {
                 // 496B40 / 1400ED920, latest frame first, up to 600 DWORDs.
                 let count = self.pop_int()? as u32;
@@ -395,5 +461,17 @@ mod tests {
             ),
             Value::Int(0)
         );
+    }
+}
+
+fn native_checksum_key(path:&str)->String {path.replace('\\',"/").to_lowercase()}
+impl Vm {
+    /// Installs the owned counterpart of CArchive entry+104. Native archives
+    /// may have no integrity record (81:34 returns 10), which is distinct from
+    /// a matching checksum. No on-disk value is treated as a process pointer.
+    pub fn register_native_resource_checksum(&mut self,archive:&str,file:&str,checksum:Option<[u32;2]>) {
+        let key=(native_checksum_key(archive),native_checksum_key(file));
+        let mut state=self.system81_shared.lock().expect("system81 state poisoned");
+        if let Some(checksum)=checksum {state.resource_checksums.insert(key,checksum);} else {state.resource_checksums.remove(&key);}
     }
 }

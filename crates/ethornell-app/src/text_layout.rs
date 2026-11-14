@@ -72,13 +72,23 @@ pub(crate) fn layout_text(
     params: &LayoutParams,
     advance_of: &dyn Fn(char) -> f32,
 ) -> TextLayout {
+    layout_text_variable(text,params,&|_,ch|advance_of(ch),&|_|params.size,&[],false).0
+}
+
+/// The modern renderer measures per-character font sizes and records the
+/// maximum height at every wrap/newline. `mxfs` can replace that maximum;
+/// ordinary `fs` only raises it. Capture changes line pitch in 074C20.
+pub(crate) fn layout_text_variable(
+    text:&str,params:&LayoutParams,advance_of:&dyn Fn(usize,char)->f32,
+    size_of:&dyn Fn(usize)->f32,metrics:&[(usize,bool,i32)],capture:bool,
+)->(TextLayout,Vec<i32>) {
     let chars = text.chars().collect::<Vec<_>>();
     let pitch = line_pitch(params.size, params.pitch_percent);
-    let step = |ch: char| advance_of(ch) + params.spacing;
+    let step = |index:usize,ch: char| advance_of(index,ch) + params.spacing;
     let right = params.bitmap_width;
 
     let indent = if params.kinsoku && params.indent_brackets && chars.first().is_some_and(|c| INDENT_OPENERS.contains(*c)) {
-        step(chars[0])
+        step(0,chars[0])
     } else {
         0.0
     };
@@ -92,17 +102,31 @@ pub(crate) fn layout_text(
     // Characters carried along with a hanging run keep the hanging bound, so
     // `町。` is placed (or wrapped) as a unit instead of leaving a lone `。`.
     let mut hang_through = 0usize;
+    let mut maximum=params.size;
+    let mut heights=Vec::new();
+    let mut metric=0usize;
+    let mut line_glyph_start=0;
+    let finish_line=|glyphs:&mut Vec<PlacedGlyph>,start:usize,maximum:f32| {
+        for glyph in &mut glyphs[start..] {glyph.y+=(maximum-size_of(glyph.index)).max(0.);}
+    };
+    let height_of=|maximum:f32|pitch+if capture {(maximum-params.size).max(0.)} else {0.};
     for (index, &ch) in chars.iter().enumerate() {
+        while metric<metrics.len()&&metrics[metric].0<=index {
+            let (_,set,size)=metrics[metric];
+            maximum=if set {size as f32} else {maximum.max(size as f32)};metric+=1;
+        }
         if (ch as u32) < 0x20 {
             if ch == '\n' {
                 x = line_start;
-                y += pitch;
+                finish_line(&mut glyphs,line_glyph_start,maximum);
+                let height=height_of(maximum);heights.push(height as i32);y+=height;
+                line_glyph_start=glyphs.len();maximum=size_of(index);
                 lines += 1;
                 at_line_start = true;
             }
             continue;
         }
-        let mut needed = step(ch);
+        let mut needed = step(index,ch);
         let mut hang = index < hang_through;
         if params.kinsoku {
             let run = chars[index + 1..]
@@ -113,11 +137,11 @@ pub(crate) fn layout_text(
             if run.is_empty() {
                 if LINE_END_PROHIBITED.contains(ch) {
                     if let Some(next) = chars.get(index + 1).filter(|c| (**c as u32) >= 0x20) {
-                        needed += step(*next);
+                        needed += step(index+1,*next);
                     }
                 }
             } else {
-                needed += run.iter().map(|c| step(*c)).sum::<f32>();
+                needed += run.iter().enumerate().map(|(n,c)| step(index+1+n,*c)).sum::<f32>();
                 hang = run.last().is_some_and(|c| HANGING.contains(*c));
                 if hang {
                     hang_through = index + 1 + run.len();
@@ -127,19 +151,21 @@ pub(crate) fn layout_text(
         let bound = right - if params.kinsoku && !hang { params.size } else { 0.0 };
         if !at_line_start && x + needed > bound {
             x = line_start;
-            y += pitch;
+            finish_line(&mut glyphs,line_glyph_start,maximum);
+            let height=height_of(maximum);heights.push(height as i32);y+=height;
+            line_glyph_start=glyphs.len();maximum=size_of(index);
             lines += 1;
         }
         glyphs.push(PlacedGlyph { ch, index, x, y });
-        x += step(ch);
+        x += step(index,ch);
         at_line_start = false;
     }
-    TextLayout {
-        glyphs,
-        lines,
-        end_x: x,
-        end_y: y,
+    while metric<metrics.len() {
+        let (_,set,size)=metrics[metric];maximum=if set {size as f32} else {maximum.max(size as f32)};metric+=1;
     }
+    finish_line(&mut glyphs,line_glyph_start,maximum);
+    heights.push(height_of(maximum) as i32);
+    (TextLayout {glyphs,lines,end_x:x,end_y:y},heights)
 }
 
 #[cfg(test)]
@@ -176,6 +202,21 @@ mod tests {
         out
     }
 
+    #[test]
+    fn version_text_font_commands_capture_actual_line_pitch() {
+        use crate::{text_anim::parse_message_markup_with_version,ruby_registry::RubyRegistry};
+        let input="a<fs 40>b</fs>\nc<mxfs 60>d<2x>e</2x>";
+        let parsed=parse_message_markup_with_version(input,&mut RubyRegistry::default(),None,true);
+        let style=|i:usize|parsed.style_spans.iter().find(|s|s.start_char<=i&&i<s.end_char).map(|s|s.style).unwrap_or_default();
+        let size=|i:usize|style(i).font_size.unwrap_or(20) as f32;
+        let mut p=params(1000.,false);p.size=20.;p.pitch_percent=20;
+        let (layout,heights)=layout_text_variable(&parsed.text,&p,&|i,_|size(i)*0.5*(1<<style(i).width_power) as f32,&size,&parsed.line_metrics,true);
+        assert_eq!(heights,[44,64]);assert_eq!(layout.lines,2);
+        assert_eq!(layout.glyphs[0].y,20.);assert_eq!(layout.glyphs[1].y,0.);
+        assert_eq!(style(5).width_power,1);assert!(style(5).bold);
+        let legacy=parse_message_markup_with_version(input,&mut RubyRegistry::default(),None,false);
+        assert!(legacy.style_spans.is_empty());assert!(legacy.line_metrics.is_empty());
+    }
     #[test]
     fn empty_text_is_one_line() {
         assert_eq!(layout_text("", &params(100.0, false), &full).lines, 1);

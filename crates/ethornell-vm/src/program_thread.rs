@@ -96,7 +96,7 @@ impl Vm {
                 self.set_newest_async_thread_regions(code_bytes, data_bytes, slots);
                 Value::Int(thread_id)
             }
-            opcodes::SYS_CURRENT_THREAD_ID => Value::Int(self.thread.thread_id()),
+            opcodes::SYS_CURRENT_THREAD_ID => Value::Int(self.parallel_worker_index.unwrap_or(self.thread.thread_id())),
             opcodes::SYS_THREAD_EXISTS => {
                 let thread_or_program = self.pop_value()?;
                 Value::Int(self.async_program_is_active(thread_or_program))

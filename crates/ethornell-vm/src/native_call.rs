@@ -39407,6 +39407,7 @@ pub struct NativeProcedureCompletion {
 pub enum NativeProcedureClass {
     RegisterBitmap,
     PlayMovieMf,
+    ExamineHealthOfFile,
     LoadSound,
     RegisterSound,
     EncodeData,
@@ -39428,6 +39429,7 @@ impl NativeProcedureClass {
         match self {
             Self::RegisterBitmap => "DCProcRegisterBmp",
             Self::PlayMovieMf => "DCProcPlayMovieByMF",
+            Self::ExamineHealthOfFile => "DCProcExamineHealthOfFile",
             Self::LoadSound => "CProcLoadSound",
             Self::RegisterSound => "DCProcRgstrSound",
             Self::EncodeData => "CProcEncodeData",

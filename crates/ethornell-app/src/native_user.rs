@@ -2,6 +2,10 @@ use super::*;
 
 const DEBUG_WINDOW_HANDLE_PREFIX: u32 = 0xFF00_0000;
 const MAX_DEBUG_WINDOWS: usize = 8;
+const CHILD_BITMAP_BASE:i32=0x5100;
+const EDIT_BITMAP:i32=0x5200;
+const SCROLL_TRACK:i32=0x5300;
+const SCROLL_THUMB:i32=0x5301;
 const MAX_EDIT_TEXT_BYTES: usize = 255;
 const MAX_MODELESS_DIALOGS: usize = 16;
 const MODELESS_DIALOG_X: f32 = 48.0;
@@ -46,9 +50,18 @@ struct NativeDebugWindow {
     height: i32,
     visible: bool,
     clear_color: i32,
+    scroll_flags:u32,
+    scroll_range:[i32;2],
+    scroll_position:[i32;2],
+    // Win32 SCROLLINFO is independent of the cached WM_SCROLL positions
+    // returned by B0:1F. SetScrollInfo does not update those cached fields.
+    scroll_widget_position:[i32;2],
+    scroll_page:[i32;2],
+    scroll_enabled:[bool;2],
+    redraw_policy:i32,
     bitmap_draws: Vec<NativeDebugBitmapDraw>,
     text_draws: Vec<NativeDebugTextDraw>,
-    close_message: String,
+    clipboard_text: String,
 }
 
 impl NativeDebugWindow {
@@ -61,9 +74,14 @@ impl NativeDebugWindow {
             height,
             visible: true,
             clear_color: 0,
+            scroll_flags:0,
+            scroll_range:[0;2],
+            scroll_position:[0;2],
+            scroll_widget_position:[0;2],scroll_page:[0;2],scroll_enabled:[false;2],
+            redraw_policy:1,
             bitmap_draws: Vec::new(),
             text_draws: Vec::new(),
-            close_message: String::new(),
+            clipboard_text: String::new(),
         }
     }
 }
@@ -378,7 +396,10 @@ impl NativeScreenShakeState {
 
 #[derive(Debug)]
 pub(super) struct NativeUserState {
+    pub(super) inspectors: crate::property_inspector::InspectorWindows,
     pub(super) text: String,
+    edit_alignment:u32,
+    last_edit_image:Option<(String,[i32;6])>,
     /// dword_5666E4 (UserB0:83); `None` uses the built-in caption.
     message_box_title: Option<String>,
     pub(super) cursor_object: Option<(i32, i32, i32)>,
@@ -402,6 +423,9 @@ pub(super) struct NativeUserState {
 impl Default for NativeUserState {
     fn default() -> Self {
         Self {
+            edit_alignment:0,
+            last_edit_image:None,
+            inspectors: Default::default(),
             text: String::new(),
             message_box_title: None,
             cursor_object: None,
@@ -467,7 +491,7 @@ impl NativeUserState {
 
     fn debug_slot(handle: i32) -> Option<usize> {
         let raw = handle as u32;
-        if raw & 0xFFFF_FF00 != DEBUG_WINDOW_HANDLE_PREFIX {
+        if !matches!(raw&0xffff_ff00,DEBUG_WINDOW_HANDLE_PREFIX|0xf8000000) {
             return None;
         }
         let slot = (raw & 0xFF) as usize;
@@ -502,7 +526,7 @@ impl NativeUserState {
         self.fonts
             .iter()
             .find(|(_, record)| record.id == id)
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _)| self.font_aliases.get(name).map(String::as_str).unwrap_or(name.as_str()))
     }
 
     /// sub_469110: whether a face id was interned.
@@ -728,6 +752,82 @@ impl NativeUserState {
 const CHILD_WINDOW_HANDLE: &str = "無効なチャイルドウィンドウハンドルが指定されました";
 
 impl RuntimeTraceApi {
+    fn paint_native_child_bitmap(&mut self,handle:i32,bitmap:i32,x:i32,y:i32,rect:Option<[i32;4]>,mode:i32,level:i32)->ethornell_vm::VmResult<()> {
+        let Some(mut source)=self.graph_bitmap_image(bitmap) else {return Err(ethornell_vm::VmError::Runtime("native child-window source bitmap missing".into()))};
+        if let Some([sx,sy,width,height])=rect {
+            if sx<0||sy<0||width<=0||height<=0||sx as i64+width as i64>source.width as i64||sy as i64+height as i64>source.height as i64 {
+                return Err(ethornell_vm::VmError::Runtime("native child-window source rectangle outside bitmap".into()));
+            }
+            source=crop_decoded_image(&source,RuntimeClipRect {x:sx as f32,y:sy as f32,width:width as f32,height:height as f32});
+        }
+        let format=self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+        self.paint_native_child_image(handle,&source,format,x,y,mode,level)
+    }
+    fn paint_native_child_image(&mut self,handle:i32,source:&DecodedImage,format:i32,x:i32,y:i32,mode:i32,level:i32)->ethornell_vm::VmResult<()> {
+        let Some(slot)=NativeUserState::debug_slot(handle).filter(|&slot|self.native_user.debug_windows[slot].is_some()) else {return Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into()))};
+        let destination=CHILD_BITMAP_BASE+slot as i32;
+        let Some(mut image)=self.graph_bitmap_image(destination) else {return Err(ethornell_vm::VmError::Runtime("native child-window backing bitmap missing".into()))};
+        if !bitmap_blend::blit_mode_with_options(&mut image,1,&source,format,x,y,mode,level,self.native_additive_coverage) {
+            return Err(ethornell_vm::VmError::Runtime("unsupported native child-window bitmap blend".into()));
+        }
+        self.replace_graph_bitmap_pixels(destination,image);Ok(())
+    }
+
+    pub(super) fn native_child_property(&self,handle:i32,property:i32)->std::result::Result<i32,i32> {
+        let Some(w)=self.native_user.debug_window(handle) else {return Err(-1)};
+        match property {0|1=>Ok(w.scroll_range[property as usize]),2|3=>Ok(w.scroll_position[(property-2) as usize]),_=>Err(i32::MIN+12)}
+    }
+
+    pub(super) fn native_control_draw_items(&self)->Vec<RuntimeGraphDrawItem> {
+        let mut items=Vec::new();
+        let mut append=|bitmap:i32,x:i32,y:i32,width:i32,height:i32,z:i32| {
+            let Some((key,region))=self.resource_image_region(bitmap) else {return};
+            items.push(RuntimeGraphDrawItem {owner_object:None,key:key.into(),x:x as f32,y:y as f32,width:width as f32,height:height as f32,
+                src_x:region.x,src_y:region.y,src_width:region.width,src_height:region.height,opacity:1.,ignore_source_alpha:true,
+                rotation_degrees:0.,destination_quad:None,linear_sampling:false,clip:Some(RuntimeClipRect {x:x as f32,y:y as f32,width:width as f32,height:height as f32}),
+                z,blend_mode:0,order_serial:0,hit_id:0});
+        };
+        for (slot,window) in self.native_user.debug_windows.iter().enumerate() {
+            if let Some(w)=window.as_ref().filter(|w|w.visible) {
+                let z=25000+slot as i32*3;
+                append(CHILD_BITMAP_BASE+slot as i32,w.x,w.y,w.width,w.height,z);
+                for axis in 0..2 {
+                    if w.scroll_flags&(1<<axis)==0 {continue}
+                    let length=if axis==0 {w.width} else {w.height};
+                    let range=if w.scroll_enabled[axis] {w.scroll_range[axis]} else {0};
+                    let page=w.scroll_page[axis].max(0);
+                    let thumb=if range>0 {((length as i64*page as i64)/(range as i64+page as i64).max(1)) as i32} else {length};
+                    let thumb=thumb.clamp(14,length);
+                    let offset=if range>0 {((length-thumb) as i64*w.scroll_widget_position[axis] as i64/range as i64) as i32} else {0};
+                    let (x,y,width,height)=if axis==0 {(w.x,w.y+w.height-14,length,14)} else {(w.x+w.width-14,w.y,14,length)};
+                    append(SCROLL_TRACK,x,y,width,height,z+1);
+                    let (x,y,width,height)=if axis==0 {(x+offset,y,thumb,14)} else {(x,y+offset,14,thumb)};
+                    append(SCROLL_THUMB,x,y,width,height,z+2);
+                }
+            }
+        }
+        let edit=&self.native_user.edit;
+        if edit.active&&edit.visible {append(EDIT_BITMAP,edit.x,edit.y,edit.width,edit.height,25030);}
+        for [x,y,width,height] in self.native_user.inspectors.panels() {append(property_inspector::PANEL_BITMAP,x as i32,y as i32,width as i32,height as i32,29990);}
+        items
+    }
+
+    fn refresh_native_edit_surface(&mut self) {
+        let edit=&self.native_user.edit;
+        if !edit.active||!edit.visible||edit.width<=0||edit.height<=0 {return}
+        let signature=(self.native_user.text.clone(),[edit.width,edit.height,edit.font_id,edit.font_size,edit.font_scale,edit.color]);
+        let signature_text=format!("{}|{}",self.native_user.edit_alignment,signature.0);
+        let signature=(signature_text,signature.1);
+        if self.native_user.last_edit_image.as_ref()==Some(&signature) {return}
+        let (width,height,size,scale,color)=(edit.width,edit.height,edit.font_size,edit.font_scale,edit.color as u32);
+        let advance=(snapshot::measure_text_advance(&self.native_user.text,size as f32,0.) as f32*scale as f32/100.) as i32;
+        let x=match self.native_user.edit_alignment {1=>(width-advance)/2,2=>width-advance,_=>0}.max(0);
+        let mut image=DecodedImage {width:width as u32,height:height as u32,rgba:vec![255;(width*height*4) as usize]};
+        snapshot::rasterize_bitmap_text(&mut image,&self.native_user.text,x,0,size as f32,0.,scale as f32,
+            [((color>>16)&255) as f32/255.,((color>>8)&255) as f32/255.,(color&255) as f32/255.,1.]);
+        self.store_runtime_bitmap(EDIT_BITMAP,image,1);self.native_user.last_edit_image=Some(signature);
+    }
+
     pub(super) fn has_active_native_screen_shake(&self) -> bool {
         self.native_user.screen_shake.active
     }
@@ -746,6 +846,11 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn tick_native_user_state(&mut self, elapsed_ms: u64) {
+        self.refresh_native_edit_surface();
+        if self.native_user.debug_windows.iter().flatten().any(|w|w.scroll_flags!=0)&&!self.graph_resources.contains_key(&SCROLL_TRACK) {
+            self.store_runtime_bitmap(SCROLL_TRACK,DecodedImage {width:1,height:1,rgba:vec![80,80,80,255]},1);
+            self.store_runtime_bitmap(SCROLL_THUMB,DecodedImage {width:1,height:1,rgba:vec![190,190,190,255]},1);
+        }
         let native_user = &mut self.native_user;
         self.screen_shake_offset = native_user
             .screen_shake
@@ -764,6 +869,7 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn handle_native_edit_key(&mut self, code: KeyCode) -> bool {
+        if self.native_user.inspectors.key(code) {return true;}
         let edit = &mut self.native_user.edit;
         if !edit.active || !edit.visible || !edit.focused {
             return false;
@@ -790,6 +896,7 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn append_native_edit_text(&mut self, text: &str) -> bool {
+        if self.native_user.inspectors.text(text) {return true;}
         let edit = &self.native_user.edit;
         if !edit.active || !edit.visible || !edit.focused || !edit.printable_input_enabled {
             return false;
@@ -811,15 +918,63 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn has_visible_user_modeless_dialog(&self) -> bool {
-        self.native_user.has_visible_modeless_dialog()
+        self.native_user.has_visible_modeless_dialog() || self.native_user.inspectors.focused()
     }
 
     pub(super) fn user_modeless_dialog_text_lines(&self) -> Vec<(String, f32, f32, f32)> {
-        self.native_user.modeless_dialog_text_lines()
+        let mut lines=self.native_user.modeless_dialog_text_lines();
+        lines.extend(self.native_user.inspectors.text_lines());lines
+    }
+
+    /// 06CB40: wheel increments use the cached Y position, whereas a
+    /// scrollbar gesture starts with SCROLLINFO. Both update the cached
+    /// query result only after actual input. Rendering is never auto-scrolled:
+    /// the native BP program reads the position and redraws its own contents.
+    pub(super) fn handle_native_child_wheel(&mut self,delta:f32)->bool {
+        let Some((x,y))=self.mouse_pos else {return false};
+        let Some(w)=self.native_user.debug_windows.iter_mut().rev().flatten().find(|w|w.visible&&x>=w.x as f32&&y>=w.y as f32&&x<(w.x+w.width) as f32&&y<(w.y+w.height) as f32) else {return false};
+        if w.scroll_flags&2!=0&&delta!=0. {
+            // The original modulo is undefined for step=0. Keep the control
+            // stationary for nonpositive steps instead of dividing by zero.
+            let step=w.redraw_policy;
+            if step>0 {
+                let value=w.scroll_position[1].saturating_add(if delta>0. {-step} else {step});
+                let value=value-value%step;
+                let value=value.clamp(0,w.scroll_range[1]);
+                w.scroll_position[1]=value;w.scroll_widget_position[1]=value;
+            }
+        }
+        true
+    }
+    fn handle_native_child_pointer(&mut self,x:f32,y:f32,pressed:bool)->bool {
+        let Some(w)=self.native_user.debug_windows.iter_mut().rev().flatten().find(|w|w.visible&&x>=w.x as f32&&y>=w.y as f32&&x<(w.x+w.width) as f32&&y<(w.y+w.height) as f32) else {return false};
+        if pressed {
+            let local=[x-w.x as f32,y-w.y as f32];
+            for axis in 0..2 {
+                if w.scroll_flags&(1<<axis)==0||!w.scroll_enabled[axis] {continue}
+                let in_bar=if axis==0 {local[1]>=w.height as f32-14.} else {local[0]>=w.width as f32-14.};
+                if in_bar {
+                    let length=if axis==0 {w.width} else {w.height};
+                    let range=w.scroll_range[axis];let page=w.scroll_page[axis].max(0);
+                    let thumb=((length as i64*page as i64)/(range as i64+page as i64).max(1)) as i32;
+                    let thumb=thumb.clamp(14,length);
+                    let value=if length==thumb {0} else {((local[axis]-thumb as f32*0.5)/(length-thumb) as f32*range as f32).round() as i32};
+                    let value=value.clamp(0,range);w.scroll_widget_position[axis]=value;w.scroll_position[axis]=value;
+                }
+            }
+        }
+        true
     }
 
     pub(super) fn handle_user_modeless_pointer(&mut self, x: f32, y: f32, pressed: bool) -> bool {
-        self.native_user.handle_modeless_pointer(x, y, pressed)
+        let edit=&mut self.native_user.edit;
+        if edit.active&&edit.visible {
+            let inside=x>=edit.x as f32&&y>=edit.y as f32&&x<(edit.x+edit.width) as f32&&y<(edit.y+edit.height) as f32;
+            if pressed {edit.focused=inside;}
+            if inside {return true;}
+        }
+
+        self.native_user.inspectors.pointer(x,y,pressed) || self.handle_native_child_pointer(x,y,pressed) || self.native_user.handle_modeless_pointer(x, y, pressed)
     }
 
     pub(super) fn create_user_modeless_dialog(&mut self, initial: [i32; 9]) -> Option<i32> {
@@ -993,7 +1148,8 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             // Eight target auxiliary windows, tagged 0xFF000000 | slot.
-            0x10 => {
+            0x10 | 0x12 => {
+                let flags=if id==0x12 {pop_int_value(stack).unwrap_or_default() as u32} else {0};
                 let height = pop_int_value(stack).unwrap_or_default();
                 let width = pop_int_value(stack).unwrap_or_default();
                 let y = pop_int_value(stack).unwrap_or_default();
@@ -1011,6 +1167,10 @@ impl RuntimeTraceApi {
                         "これ以上、チャイルドウィンドウを生成することはできません".into(),
                     )));
                 };
+                let slot=NativeUserState::debug_slot(handle).unwrap();
+                self.native_user.debug_windows[slot].as_mut().unwrap().scroll_flags=flags;
+                self.store_runtime_bitmap(CHILD_BITMAP_BASE+slot as i32,DecodedImage {width:width as u32,height:height as u32,rgba:vec![0;(width*height*4) as usize]},1);
+                let handle=if self.bp_profile==ethornell_script::native_abi::NativeAbiProfile::ModernFused {(0xf8000000|slot as u32) as i32} else {handle};
                 ethornell_vm::Value::Int(handle)
             }
             0x11 => {
@@ -1022,6 +1182,9 @@ impl RuntimeTraceApi {
                     )));
                 };
                 self.native_user.debug_windows[slot] = None;
+                let bitmap=CHILD_BITMAP_BASE+slot as i32;
+                if let Some(resource)=self.graph_resources.remove(&bitmap) {self.graph_images.remove(&resource.key);self.graph_image_revisions.remove(&resource.key);}
+                self.bitmap_dimensions.remove(&bitmap);self.bitmap_formats.remove(&bitmap);self.graph_surfaces.remove(&bitmap);
                 ethornell_vm::Value::None
             }
             0x14 => {
@@ -1070,6 +1233,10 @@ impl RuntimeTraceApi {
                 window.clear_color = color;
                 window.bitmap_draws.clear();
                 window.text_draws.clear();
+                let (width,height)=(window.width as u32,window.height as u32);
+                let pixel=native_bitmap_clear_color(color);
+                self.store_runtime_bitmap(CHILD_BITMAP_BASE+NativeUserState::debug_slot(handle).unwrap() as i32,
+                    DecodedImage {width,height,rgba:pixel.repeat((width*height) as usize)},1);
                 ethornell_vm::Value::None
             }
             0x19 => {
@@ -1121,6 +1288,7 @@ impl RuntimeTraceApi {
                     blend_mode,
                     alpha,
                 });
+                if let Err(e)=self.paint_native_child_bitmap(handle,bitmap,x,y,None,blend_mode,alpha) {return Some(Err(e));}
                 ethornell_vm::Value::None
             }
             0x1A => {
@@ -1155,18 +1323,14 @@ impl RuntimeTraceApi {
                         "指定されたフォント幅 [ {style} ] は無効です"
                     ))));
                 }
-                let glyph_count = text.chars().count() as i32;
-                let extent = glyph_count
-                    .saturating_mul(font_size.max(1))
-                    .saturating_add(1)
-                    / 2;
+                let extent=(snapshot::measure_text_advance(&text,font_size as f32,0.) as f32*style as f32/100.).round() as i32;
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
                     return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
                 window.text_draws.push(NativeDebugTextDraw {
                     x,
                     y,
-                    text,
+                    text:text.clone(),
                     font_id,
                     font_size,
                     style,
@@ -1175,7 +1339,22 @@ impl RuntimeTraceApi {
                     alpha,
                     extent,
                 });
+                let color=[((color as u32>>16)&255) as f32/255.,((color as u32>>8)&255) as f32/255.,(color as u32&255) as f32/255.,1.];
+                let width=(extent.max(1) as u32).min(8192);let height=font_size as u32*2;
+                let mut glyphs=DecodedImage {width,height,rgba:vec![0;width as usize*height as usize*4]};
+                snapshot::rasterize_bitmap_text(&mut glyphs,&text,0,0,font_size as f32,0.,style as f32,color);
+                if let Err(error)=self.paint_native_child_image(handle,&glyphs,2,x,y,blend_mode,alpha) {return Some(Err(error));}
                 ethornell_vm::Value::Int(extent)
+            }
+            0x1B => {
+                let height=pop_int_value(stack).unwrap_or_default();let width=pop_int_value(stack).unwrap_or_default();
+                let sy=pop_int_value(stack).unwrap_or_default();let sx=pop_int_value(stack).unwrap_or_default();
+                let bitmap=pop_int_value(stack).unwrap_or_default();let y=pop_int_value(stack).unwrap_or_default();
+                let x=pop_int_value(stack).unwrap_or_default();let handle=pop_int_value(stack).unwrap_or_default();
+                if let Err(e)=target_checks::bitmap(bitmap) {return Some(Err(e));}
+                if sx<0||sy<0||width<=0||height<=0 {return Some(Err(ethornell_vm::VmError::Runtime("invalid native child-window bitmap rectangle".into())))}
+                if let Err(e)=self.paint_native_child_bitmap(handle,bitmap,x,y,Some([sx,sy,width,height]),0x80,0) {return Some(Err(e));}
+                ethornell_vm::Value::None
             }
             0x1C => {
                 let close_message = pop_string_value(stack).unwrap_or_default();
@@ -1183,8 +1362,41 @@ impl RuntimeTraceApi {
                 let Some(window) = self.native_user.debug_window_mut(handle) else {
                     return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())));
                 };
-                window.close_message = close_message;
+                window.clipboard_text = close_message;
                 ethornell_vm::Value::None
+            }
+            0x1E => {
+                let value=pop_int_value(stack).unwrap_or_default();let property=pop_int_value(stack).unwrap_or_default();let handle=pop_int_value(stack).unwrap_or_default();
+                let Some(window)=self.native_user.debug_window_mut(handle) else {return Some(Err(ethornell_vm::VmError::Runtime(CHILD_WINDOW_HANDLE.into())))};
+                match property {
+                    0|1=>{
+                        let axis=property as usize;
+                        if window.scroll_flags&(1<<axis)==0 {return Some(Err(ethornell_vm::VmError::Runtime("native child window has no requested scrollbar".into())))}
+                        let range=value as u32&65535;let page=value as u32>>16;
+                        if value!=0&&range<=1 {return Some(Err(ethornell_vm::VmError::Runtime("invalid native child-window scroll range".into())))}
+                        if value==0 {
+                            window.scroll_enabled[axis]=false;window.scroll_page[axis]=0;window.scroll_widget_position[axis]=0;
+                        } else {
+                            window.scroll_range[axis]=range as i32;window.scroll_page[axis]=page as i32;window.scroll_enabled[axis]=true;
+                            window.scroll_widget_position[axis]=window.scroll_widget_position[axis].clamp(0,range as i32);
+                        }
+                    }
+                    2|3=>{
+                        let axis=(property-2) as usize;
+                        if window.scroll_flags&(1<<axis)==0||value>window.scroll_range[1] {return Some(Err(ethornell_vm::VmError::Runtime("invalid native child-window scroll position".into())))}
+                        // 06CE10 validates both axes against the cached Y
+                        // range, then only changes the OS widget's position.
+                        window.scroll_widget_position[axis]=value.clamp(0,window.scroll_range[axis]);
+                    }
+                    5=>window.redraw_policy=value,
+                    _=>return Some(Err(ethornell_vm::VmError::Runtime("invalid native child-window property".into()))),
+                }
+                ethornell_vm::Value::Int(0)
+            }
+            0x2A => {
+                let alignment=pop_int_value(stack).unwrap_or_default() as u32;
+                if alignment<3 {self.native_user.edit_alignment=alignment;}
+                ethornell_vm::Value::Int(i32::from(alignment<3))
             }
             // Portable edit control mirrors the target Win32 EDIT lifecycle.
             0x20 => {
@@ -1477,6 +1689,22 @@ impl RuntimeTraceApi {
                 }
                 ethornell_vm::Value::None
             }
+            0xC8 => {
+                // 14006B2A0 updates the first alias entry or creates one.
+                let face=pop_string_value(stack).unwrap_or_default();
+                let alias=pop_string_value(stack).unwrap_or_default();
+                self.native_user.font_aliases.insert(alias,face);
+                ethornell_vm::Value::None
+            }
+            0xCF => {
+                // 1400BE0E0(1): discard native glyph/font-resource caches,
+                // then republish the two stock face IDs.
+                self.native_user.font_resources.clear();
+                let stock=NativeUserState::default();
+                self.native_user.fonts=stock.fonts;
+                self.native_user.next_font_id=stock.next_font_id;
+                ethornell_vm::Value::None
+            }
             0xF0 => {
                 if file_policy::restricted() { return Some(Err(ethornell_vm::VmError::Runtime("unsupported desktop wallpaper capability".into()))); }
                 let tile = pop_int_value(stack).unwrap_or_default();
@@ -1514,6 +1742,23 @@ fn truncate_shift_jis(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn version_child_scroll_input_updates_queries_after_widget_configuration() {
+        let manager=crate::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api=crate::RuntimeTraceApi::new(manager);
+        let h=api.native_user.allocate_debug_window("Debug".into(),0,0,200,100).unwrap();
+        let w=api.native_user.debug_window_mut(h).unwrap();
+        w.scroll_flags=3;w.scroll_enabled=[true,true];w.scroll_range=[100,200];w.scroll_page=[20,40];
+        w.scroll_widget_position=[0,150];w.redraw_policy=7;
+        assert_eq!(api.native_child_property(h,3),Ok(0));
+        api.mouse_pos=Some((50.,50.));
+        assert!(api.handle_native_child_wheel(-1.));assert_eq!(api.native_child_property(h,3),Ok(7));
+        assert!(api.handle_native_child_pointer(100.,95.,true));
+        assert!(api.native_child_property(h,2).unwrap()>0);
+        assert_eq!(api.native_child_property(h,3),Ok(7));
+        api.native_user.debug_window_mut(h).unwrap().redraw_policy=0;
+        assert!(api.handle_native_child_wheel(-1.));assert_eq!(api.native_child_property(h,3),Ok(7));
+    }
     #[test]
     fn debug_window_handles_use_target_tag_and_eight_slots() {
         let mut state = NativeUserState::default();

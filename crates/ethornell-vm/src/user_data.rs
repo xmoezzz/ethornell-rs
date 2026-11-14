@@ -311,6 +311,10 @@ impl Vm {
     /// block, the user data (zero-filled to 1 MiB), the resource names and
     /// the read flags, each with the size the file declares.
     fn install_global_data(&mut self, raw: &[u8]) -> Option<(i32, i32, i32)> {
+        self.install_global_data_parts(raw, true)
+    }
+
+    fn install_global_data_parts(&mut self, raw: &[u8], install_memory: bool) -> Option<(i32, i32, i32)> {
         let u32_at = |offset: usize| -> Option<usize> {
             raw.get(offset..offset + 4).map(|v| u32::from_le_bytes(v.try_into().unwrap()) as usize)
         };
@@ -341,11 +345,44 @@ impl Vm {
             flags.entry(name).or_insert(crate::ReadFlagBits { bit_len, bytes });
             flags_cursor = end;
         }
-        self.install_global_config(config);
-        self.install_global_user_data(data);
+        if install_memory {
+            self.install_global_config(config);
+            self.install_global_user_data(data);
+        }
         self.set_resource_names(names);
         self.read_flags = flags;
         Some((x, y, 0))
+    }
+
+    /// 4958F0 -> 4754A0 / 1400EB680 -> C1130: read an arbitrary GDB
+    /// into caller-owned buffers; restore the process resource/read-flag tables.
+    pub(super) fn restore_gdb_buffers<A: SysApi>(&mut self, api: &mut A,
+        config: u32, config_size: u32, user: u32, user_size: u32, path: &str,
+    ) -> VmResult<bool> {
+        let Some(encoded) = self.load_resource_bytes_with_search(api, "", path).map(|v| v.0)
+            .or_else(|| api.read_user_file_bytes(path)) else { return Ok(false); };
+        let raw = if encoded.starts_with(GDB_MAGIC) { encoded }
+            else { match decode_sdc(&encoded) { Ok(raw)=>raw, Err(_)=>return Ok(false) } };
+        if !raw.starts_with(GDB_MAGIC) { return Ok(false); }
+        let word = |at:usize| raw.get(at..at+4).map(|b|u32::from_le_bytes(b.try_into().unwrap()) as usize);
+        let Some(config_len) = word(28).filter(|&n|n<=GLOBAL_CONFIG_SIZE) else {return Ok(false)};
+        let Some(user_len) = word(32+config_len).filter(|&n|n<=GLOBAL_USER_DATA_SIZE) else {return Ok(false)};
+        let Some(config_bytes) = raw.get(32..32+config_len) else {return Ok(false)};
+        let Some(user_bytes) = raw.get(36+config_len..36+config_len+user_len) else {return Ok(false)};
+        if config != 0 {self.resolve_write_range(config, GLOBAL_CONFIG_SIZE)?;}
+        if user != 0 {self.resolve_write_range(user, GLOBAL_USER_DATA_SIZE)?;}
+        self.resolve_write_range(config_size,4)?;self.resolve_write_range(user_size,4)?;
+        if self.install_global_data_parts(&raw, false).is_none() {return Ok(false)}
+        for (ptr, size, bytes) in [(config,GLOBAL_CONFIG_SIZE,config_bytes),(user,GLOBAL_USER_DATA_SIZE,user_bytes)] {
+            if ptr==0 {continue}
+            let range=self.resolve_write_range(ptr,size)?;
+            self.memory[range.clone()].fill(0);
+            self.memory[range.start..range.start+bytes.len()].copy_from_slice(bytes);
+            self.clear_shadow_values(ptr,size);
+        }
+        self.write_int(config_size,2,GLOBAL_CONFIG_SIZE as u32)?;
+        self.write_int(user_size,2,GLOBAL_USER_DATA_SIZE as u32)?;
+        Ok(true)
     }
 
     /// The pre-3.00 fixed layout (sub_46BBE0's second branch): x, y, 1 KiB

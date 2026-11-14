@@ -936,8 +936,8 @@ impl RuntimeEngine {
         strict: bool,
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
-        let program = ethornell_script::parse_bp_program(Some(script.into()), bytes);
         let profile = confirmed_native_profile(&manager, bytes);
+        let program = ethornell_script::parse_bp_program_profile(Some(script.into()),bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
             profile.main_data_bytes,
@@ -952,6 +952,8 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.bp_profile=profile.abi;
+                if let Some(sizes)=profile.display_modes {api.display_mode_sizes=sizes.map(Some);api.display_mode_limit=16;}
                 api.modern_gradient_blur = profile.modern_gradient_blur;
                 api
             },

@@ -280,7 +280,17 @@ pub(crate) fn compose_runtime_frame_with_diagnostics(
     include_text: bool,
 ) -> RuntimeFrameComposition {
     let render_tree_nodes = api.graph_output_draw_items().len();
-    let framebuffer = compose_runtime_frame(api, include_text);
+    let mut framebuffer = compose_runtime_frame(api, include_text);
+    // Auxiliary host controls are presentation UI, not part of the engine's
+    // bitmap capture API. Keep them out of save/transition source captures.
+    for item in api.native_control_draw_items() {
+        if let Some(image)=api.graph_images.get(&item.key) {composite_runtime_item(&mut framebuffer,image,&item);}
+    }
+    if include_text {
+        for (text,x,y,size) in api.user_modeless_dialog_text_lines() {
+            rasterize_bitmap_text(&mut framebuffer,&text,x as i32,y as i32,size,0.,100.,[0.95,0.95,0.95,1.]);
+        }
+    }
     let framebuffer_hash = stable_framebuffer_hash(&framebuffer);
     RuntimeFrameComposition {
         framebuffer,
@@ -1308,13 +1318,16 @@ fn glyph_cell(
     y: f32,
     size: f32,
     rgb: [u8; 3],
+    horizontal_scale:f32,
+    bold:bool,
+    italic:bool,
     transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
 ) -> Option<(DecodedImage, i32, i32)> {
     if !valid_text_position(x, y) {
         return None;
     }
     let ratios = transform.map_or([1.0; 2], |t| t.scales());
-    let scale = PxScale { x: size * ratios[0], y: size * ratios[1] };
+    let scale = PxScale { x: size * horizontal_scale * ratios[0], y: size * ratios[1] };
     let baseline = (y + font.as_scaled(PxScale::from(size)).ascent()) * ratios[1];
     let outlined = font.outline_glyph(
         font.glyph_id(ch)
@@ -1325,15 +1338,18 @@ fn glyph_cell(
         return None;
     }
     let (left, top) = (bounds.min.x as i32, bounds.min.y as i32);
-    let width = (bounds.max.x as i32 - left).max(1) as u32;
     let height = (bounds.max.y as i32 - top).max(1) as u32;
+    let width = (bounds.max.x as i32 - left).max(1) as u32
+        +u32::from(bold)+if italic {(height as f32*0.2).ceil() as u32} else {0};
     let mut cell = new_raster(width, height)?;
     outlined.draw(|gx, gy, coverage| {
-        if gx < width && gy < height {
-            let at = ((gy * width + gx) * 4) as usize;
-            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
-            if alpha > cell.rgba[at + 3] {
-                cell.rgba[at..at + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+        let gx=gx+if italic {((height-gy) as f32*0.2).round() as u32} else {0};
+        for stroke in 0..=u32::from(bold) {
+            let gx=gx+stroke;
+            if gx < width && gy < height {
+                let at = ((gy * width + gx) * 4) as usize;
+                let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+                if alpha > cell.rgba[at + 3] {cell.rgba[at..at + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);}
             }
         }
     });
@@ -1374,6 +1390,15 @@ pub(crate) fn rasterize_transformed_glyph_records(
     shadow: Option<TextShadow>,
     transform: Option<crate::native_graph_sys91::Graph91FontTransform>,
 ) {
+    rasterize_styled_glyph_records(dst,dst_format,glyphs,size,color,color_of,shadow,transform,&|_|(size,1.,false,false));
+}
+
+pub(crate) fn rasterize_styled_glyph_records(
+    dst:&mut DecodedImage,dst_format:i32,glyphs:&[crate::text_layout::PlacedGlyph],size:f32,
+    color:[f32;4],color_of:&dyn Fn(usize)->Option<[f32;4]>,shadow:Option<TextShadow>,
+    transform:Option<crate::native_graph_sys91::Graph91FontTransform>,
+    metrics:&dyn Fn(usize)->(f32,f32,bool,bool),
+) {
     if !valid_raster(dst) || !valid_text_raster(size, glyphs.len()) {
         return;
     }
@@ -1382,13 +1407,14 @@ pub(crate) fn rasterize_transformed_glyph_records(
         return;
     };
     check_font_coverage(&font, glyphs.iter().map(|glyph| glyph.ch));
-    let size = size.max(1.0);
     let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     let shadow = shadow.filter(|shadow| matches!(shadow.mode, 1 | 2));
     for glyph in glyphs {
+        let (size,width,bold,italic)=metrics(glyph.index);
+        if !valid_text_raster(size,1)||!width.is_finite()||width<=0.||width>128. {record_raster_error("invalid styled glyph metrics");return;}
         let color = color_of(glyph.index).unwrap_or(color);
         let rgb = [byte(color[0]), byte(color[1]), byte(color[2])];
-        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb, transform)
+        let Some((cell, left, top)) = glyph_cell(&font, glyph.ch, glyph.x, glyph.y, size, rgb,width,bold,italic,transform)
         else {
             continue;
         };
@@ -2397,6 +2423,7 @@ mod styled_text_snapshot_tests {
                     packed_rgb: Some(0xff0000),
                     bold: true,
                     italic: true,
+                    ..RuntimeTextStyle::default()
                 },
             }],
         };

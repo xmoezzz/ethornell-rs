@@ -1879,7 +1879,7 @@ impl RuntimeTraceApi {
         Some(Ok(value))
     }
 
-    fn graph91_set_object_suppressed(&mut self, object: i32, suppressed: bool) {
+    pub(super) fn graph91_set_object_suppressed(&mut self, object: i32, suppressed: bool) {
         if !self.graph_handle_exists(object) {
             return;
         }

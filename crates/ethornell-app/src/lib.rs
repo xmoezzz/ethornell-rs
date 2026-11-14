@@ -78,6 +78,8 @@ mod native_sprite_link;
 mod native_sprite_perspective;
 mod native_system;
 mod native_user;
+mod property_inspector;
+mod object_inspector;
 mod perspective_blit;
 mod platform;
 mod resource_lookup;
@@ -1292,6 +1294,8 @@ struct RuntimeTraceApi {
     modern_gradient_blur: bool,
     native_additive_coverage: bool,
     pending_transition_destination: Option<i32>,
+    portable_window_identity: u64,
+    pending_window_resizable: Option<bool>,
     pending_window_title: Option<String>,
     pending_window_position: Option<(i32, i32)>,
     pending_window_size: Option<(u32, u32)>,
@@ -1698,6 +1702,8 @@ impl RuntimeTraceApi {
             modern_gradient_blur: false,
             native_additive_coverage: false,
             pending_transition_destination: None,
+            portable_window_identity: 0,
+            pending_window_resizable: None,
             pending_window_title: None,
             pending_window_position: None,
             pending_window_size: None,
@@ -20888,6 +20894,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             push_runtime_window_message(api, 0x0202, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::MouseWheel { delta_y } => {
+            if api.native_user.inspectors.wheel(delta_y)||api.handle_native_child_wheel(delta_y) {return;}
             if delta_y == 0.0 {
                 return;
             }
@@ -23197,6 +23204,38 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         ok
     }
 
+    fn inspect_native_display_object(&self,object:i32)->std::result::Result<ethornell_vm::NativeObjectInspector,i32> {
+        self.native_object_inspector(object)
+    }
+    fn edit_native_display_object(&mut self,object:i32,key:u8,value:i32)->ethornell_vm::VmResult<()> {
+        self.edit_native_object_inspector(object,key,value)
+    }
+    fn publish_native_inspector(&mut self,view:&ethornell_vm::NativeInspectorView)->ethornell_vm::VmResult<bool> {
+        if !self.graph_resources.contains_key(&property_inspector::PANEL_BITMAP) {
+            self.store_runtime_bitmap(property_inspector::PANEL_BITMAP,DecodedImage {width:1,height:1,rgba:vec![32,36,44,255]},1);
+        }
+        self.native_user.inspectors.publish(view)
+    }
+    fn close_native_inspector(&mut self,handle:u32)->ethornell_vm::VmResult<()> {
+        self.native_user.inspectors.close(handle);Ok(())
+    }
+    fn take_native_inspector_events(&mut self,handle:u32)->ethornell_vm::VmResult<Vec<ethornell_vm::NativeInspectorEvent>> {
+        Ok(self.native_user.inspectors.take_events(handle))
+    }
+
+    fn portable_window_identity(&self)->u64 {self.portable_window_identity}
+
+    fn configure_window_resizable(&mut self,enabled:bool) {
+        self.pending_window_resizable=Some(enabled);
+    }
+
+    fn configure_presentation_size(&mut self,width:i32,height:i32)->bool {
+        if width<=0||height<=0 {return false}
+        self.windowed_client_size=(width,height);
+        if self.window_mode==0 {self.pending_window_size=Some((width as u32,height as u32));}
+        true
+    }
+
     fn user_data_root(&mut self, kind: i32) -> Option<String> {
         if file_policy::restricted() {
             return Some("bgi-user\\".into());
@@ -25183,6 +25222,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 surface.valid_bottom,
             ]
         })
+    }
+
+    fn blend_native_bitmap_sources(&mut self,destination:i32,first:i32,second:i32,mix:i32,transparency:i32)->ethornell_vm::VmResult<()> {
+        if self.bitmap_formats.get(&destination)!=Some(&1)||self.bitmap_formats.get(&first)!=Some(&2)||self.bitmap_formats.get(&second)!=Some(&2) {return Ok(())}
+        let (Some(mut d),Some(a),Some(b))=(self.graph_bitmap_image(destination),self.graph_bitmap_image(first),self.graph_bitmap_image(second)) else {return Ok(())};
+        bitmap_blend::blend_two_sources_over_rgb(&mut d,&a,&b,mix,transparency);
+        if !self.replace_graph_bitmap_pixels(destination,d) {return Err(ethornell_vm::VmError::Runtime("native bitmap blend destination was retired".into()))}
+        Ok(())
     }
 
     fn query_graph91_object_property(
@@ -29401,6 +29448,8 @@ impl ethornell_vm::SoundApi for RuntimeTraceApi {
     fn query_cd_audio_mode(&self) -> Option<i32> {
         self.query_native_cd_audio_mode()
     }
+
+    fn native_child_window_property(&self,handle:i32,property:i32)->std::result::Result<i32,i32> {self.native_child_property(handle,property)}
 
     fn current_user_text(&self) -> String {
         self.native_user.text.clone()

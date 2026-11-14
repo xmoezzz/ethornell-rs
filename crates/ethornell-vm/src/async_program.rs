@@ -539,7 +539,7 @@ impl Vm {
         None
     }
 
-    fn refresh_thread_links(&mut self) {
+    pub(super) fn refresh_thread_links(&mut self) {
         let thread_ids = self
             .async_tasks
             .iter()
@@ -723,7 +723,7 @@ pub(crate) fn local_window_mut(vm: &mut Vm) -> &mut [u8] {
     }
 }
 
-fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
+pub(crate) fn transfer_async_shared_state(source: &mut Vm, destination: &mut Vm) {
     let trace_records = std::env::var_os("TRACE_ASYNC_RECORDS").is_some();
     if trace_records {
         tracing::info!(

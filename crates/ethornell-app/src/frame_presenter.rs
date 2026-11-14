@@ -58,6 +58,7 @@ pub(crate) fn prepare_frame(
     )?;
     let mut items = api.graph_output_draw_items();
     items.extend(api.directshow_movie_draw_item());
+    items.extend(api.native_control_draw_items());
     let used = items
         .iter()
         .map(|i| i.key.as_str())

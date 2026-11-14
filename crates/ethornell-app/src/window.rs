@@ -478,6 +478,8 @@ impl ApplicationHandler for WindowApp {
                         let size = monitor.current_video_mode()?.size();
                         Some([origin.x, origin.y, origin.x + size.width as i32, origin.y + size.height as i32])
                     };
+                    // A stable session-local token, never the OS window pointer.
+                    runtime.api.portable_window_identity=1;
                     runtime.api.monitor_rects =
                         window.available_monitors().filter_map(|monitor| monitor_rect(&monitor)).collect();
                     runtime.api.current_monitor_rect =
@@ -556,6 +558,7 @@ impl ApplicationHandler for WindowApp {
                         target.exit();
                         return;
                     }
+                    if let Some(resizable)=runtime.api.pending_window_resizable.take() {window.set_resizable(resizable);}
                     if let Some(title) = runtime.api.pending_window_title.take() {
                         window.set_title(&title);
                     }
