@@ -5533,6 +5533,8 @@ pub mod opcodes {
     /// | 2 | `archive` | string | Archive file path (relative to the game root or absolute). | any |
     ///
     /// Returns: i32: 1 when the archive cannot be opened; on success the target pushes the native address of size_out (nonzero, not 1).
+    /// The ModernFused x64 profile (1400EBDF0 -> 1400BA1C0) instead returns
+    /// status 0 on success, for both the size query and the directory copy.
     ///
     /// Scheduling: continue
     ///
