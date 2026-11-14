@@ -107,10 +107,19 @@ impl Vm {
     }
 
     pub(super) fn execute_quote_string(&mut self) -> VmResult<()> {
-        let delimiter = char::from(self.pop_int()? as u8);
-        let source = self.pop_string_lossy()?;
+        let delimiter = self.pop_int()? as u32;
+        let mut source = self.pop_native_string_bytes()?;
         let destination = self.pop_ptr()?;
-        self.write_c_string(destination, &format!("{delimiter}{source}{delimiter}"))
+        source.truncate(source.iter().position(|&b| b == 0).unwrap_or(source.len()));
+        // 4746E0's %c uses the low byte. 4F4FD0 keeps the source bytes
+        // and uses 4F4640 for the delimiter when UTF-8 mode is selected.
+        let delimiter = if self.native_utf8_enabled() {
+            crate::version_system::encode_utf8_codepoint(delimiter)
+        } else { vec![delimiter as u8] };
+        let mut output = delimiter.clone();
+        output.extend_from_slice(&source);
+        output.extend_from_slice(&delimiter);
+        self.write_c_string_native_bytes(destination, &output)
     }
 
     pub(super) fn execute_set_memory_mode(&mut self) -> VmResult<()> {

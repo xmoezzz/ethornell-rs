@@ -3947,7 +3947,10 @@ impl Vm {
             BpOpcode::Known { code: 0x66, .. } => {
                 let needle = self.pop_native_string_bytes()?;
                 let haystack = self.pop_native_string_bytes()?;
-                let found = if needle.is_empty() {
+                let found = if let Some(limit) = self.native_string_probe_limit() {
+                    version_system::find_native_string(&haystack, &needle, version_system::encoding_kind(&haystack, limit))?
+                        .map_or(-1, |offset| offset as i32)
+                } else if needle.is_empty() {
                     0
                 } else {
                     haystack
@@ -3965,7 +3968,9 @@ impl Vm {
                 let needle = self.pop_native_string_bytes()?;
                 let haystack = self.pop_native_string_bytes()?;
                 let dst = self.pop_ptr()?;
-                let (replaced, count) = target_strreplace(&haystack, &needle, &replacement);
+                let (replaced, count) = if let Some(limit) = self.native_string_probe_limit() {
+                    version_system::replace_native_string(&haystack, &needle, &replacement, limit, self.native_utf8_enabled())?
+                } else { target_strreplace(&haystack, &needle, &replacement) };
                 self.write_c_string_native_bytes(dst, &replaced)?;
                 self.push_value(Value::Int(count));
             }
@@ -3977,9 +3982,31 @@ impl Vm {
                 self.push_value(Value::Int(bytes.len() as i32));
             }
             BpOpcode::Known { code: 0x69, .. } => {
-                let right = self.pop_native_string_bytes()?;
-                let left = self.pop_native_string_bytes()?;
-                self.push_value(Value::Int((left == right) as i32));
+                // 1.687's 1400CDD40 rejects NULL before converting each
+                // operand independently to UTF-16 (1400F95C0). Pre-fused
+                // Modern uses the same conversion (Lovepical 4D1ED0 ->
+                // 4F5C50), while legacy 4745A0/ESchoolLife 47F1F0 compare
+                // bytes. Only the fused handler explicitly guards NULL.
+                let wide = matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused);
+                let null_operand = self.native_abi_profile == NativeAbiProfile::ModernFused && (0..2).any(|from_top| {
+                    self.operand_from_top(from_top).is_some_and(|operand| {
+                        matches!(self.operand_value(operand), Value::None | Value::Int(0) | Value::Ptr(0))
+                    })
+                });
+                if null_operand {
+                    self.pop_value()?;
+                    self.pop_value()?;
+                    self.push_value(Value::Int(0));
+                } else {
+                    let right = self.pop_native_string_bytes()?;
+                    let left = self.pop_native_string_bytes()?;
+                    let equal = if wide {
+                        version_system::decode_auto(&left, 6) == version_system::decode_auto(&right, 6)
+                    } else {
+                        left == right
+                    };
+                    self.push_value(Value::Int(equal as i32));
+                }
             }
             BpOpcode::Known { code: 0x6a, .. } => {
                 let right = self.pop_value()?;
@@ -3996,37 +4023,51 @@ impl Vm {
                 self.write_c_string_native_bytes(dst, &joined)?;
             }
             BpOpcode::Known { code: 0x6c, .. } => {
-                let ptr = self.pop_ptr()?;
-                let start = self.memory_addr(ptr) as usize;
-                let first = self.memory.get(start).copied().unwrap_or_default();
-                let is_two_byte = matches!(first, 0x81..=0x9f | 0xe0..=0xfc);
-                let ch = if is_two_byte {
-                    u16::from_be_bytes([
-                        first,
-                        self.memory.get(start + 1).copied().unwrap_or_default(),
-                    ]) as i32
-                } else {
-                    first as i32
-                };
-                self.push_value(Value::Int(ch));
-                self.push_value(Value::Int(is_two_byte as i32));
-                self.push_value(Value::Int(is_sjis_delimiter(ch as u16) as i32));
+                let bytes = self.pop_native_string_bytes()?;
+                let modern = matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused);
+                let kind = self.native_string_probe_limit().map_or(0, |limit| version_system::encoding_kind(&bytes, limit));
+                let (width, value, double) = version_system::character_info(&bytes, kind)?;
+                // Modern 1400CAA10 pushes consumed bytes BEFORE the three
+                // legacy outputs. Missing that fourth result corrupts BP's
+                // operand ring even though all dispatch slots are present.
+                if modern { self.push_value(Value::Int(width as i32)); }
+                let delimiter = if kind == 0 { is_sjis_delimiter(value as u16) }
+                    else { version_system::unicode_delimiter(value) };
+                self.push_value(Value::Int(value as i32));
+                self.push_value(Value::Int(i32::from(double)));
+                self.push_value(Value::Int(i32::from(delimiter)));
             }
             BpOpcode::Known { code: 0x6d, .. } => {
                 let ptr = self.pop_ptr()?;
-                let text = self.read_c_string(ptr)?.to_ascii_lowercase();
-                self.write_c_string(ptr, &text)?;
+                let mut bytes = self.read_shadowed_c_string_bytes(ptr)?;
+                // 42EA80 only folds ASCII and skips CP932 pairs. Modern
+                // 4F5E40 probes the buffer before choosing CP932 or UTF-8.
+                let cp932 = self.native_string_probe_limit().is_none_or(|limit| version_system::encoding_kind(&bytes, limit) == 0);
+                let mut index = 0;
+                while index < bytes.len() {
+                    if cp932 && is_sjis_lead_byte(bytes[index]) && index + 1 < bytes.len() {
+                        index += 2;
+                    } else {
+                        bytes[index].make_ascii_lowercase();
+                        index += 1;
+                    }
+                }
+                let range = self.resolve_write_range(ptr, bytes.len() + 1)?;
+                let start = range.start;
+                self.memory[start..start + bytes.len()].copy_from_slice(&bytes);
+                self.memory[start + bytes.len()] = 0;
+                self.clear_shadow_values(ptr, bytes.len() + 1);
             }
             BpOpcode::Known { code: 0x6e, .. } => {
                 self.execute_quote_string()?;
             }
             BpOpcode::Known { code: 0x6f, .. } => {
-                let fmt = self.pop_string_lossy()?;
+                let fmt = self.pop_native_string_bytes()?;
                 let dst = self.pop_ptr()?;
                 let rendered = self.render_sprintf(&fmt)?;
-                self.write_c_string(dst, &rendered)?;
+                self.write_c_string_native_bytes(dst, &rendered)?;
                 // EE7E0 performs its check after printf has written the bytes.
-                self.check_native_guarded_write(api,dst,self.encode_native_string(&rendered).len()+1);
+                self.check_native_guarded_write(api,dst,rendered.len()+1);
             }
             BpOpcode::Known { code: 0x70, .. } => {
                 let size = self.pop_int()?.max(0) as u32;
@@ -7580,18 +7621,23 @@ impl Vm {
     fn value_as_numeric_operand(&mut self, value: Value) -> VmResult<i32> {
         match value {
             Value::Str(text) => {
-                if let Some((&addr, _)) = self
+                let encoded = self.encode_native_string(&text);
+                if let Some(ptr) = self
                     .script_records
                     .iter()
-                    .find(|(_, existing)| existing.as_str() == text.as_str())
+                    .find_map(|(&addr, existing)| {
+                        if existing != &text { return None; }
+                        let backing = addr.checked_sub(LOCAL_MEMORY_BASE)?;
+                        let pointer = self.target_heap.address_of(backing, &self.heap_allocations)?;
+                        self.read_c_string_bytes(pointer).is_ok_and(|bytes| bytes == encoded.as_ref())
+                            .then_some(pointer)
+                    })
                 {
-                    // The record lives in a heap block: hand back its
-                    // script address.
-                    if let Some(ptr) = self.target_heap.address_of(addr - LOCAL_MEMORY_BASE, &self.heap_allocations) {
-                        return Ok(ptr as i32);
-                    }
+                    // Skip matching global/local shadows and freed heap
+                    // records; reuse a live guest allocation when available.
+                    return Ok(ptr as i32);
                 }
-                let byte_len = self.encode_native_string(&text).len().saturating_add(1);
+                let byte_len = encoded.len().saturating_add(1);
                 let ptr = self.alloc_heap(byte_len.min(u32::MAX as usize) as u32);
                 if ptr == 0 {
                     return Err(VmError::Runtime(
@@ -8263,6 +8309,15 @@ impl Vm {
         Ok(Value::Int(0))
     }
 
+    fn native_string_probe_limit(&self) -> Option<usize> {
+        match self.native_abi_profile {
+            NativeAbiProfile::Modern | NativeAbiProfile::ModernFused => Some(6),
+            NativeAbiProfile::Anipani | NativeAbiProfile::Amachoco => Some(3),
+            _ if self.native_utf8_enabled() => Some(3),
+            _ => None,
+        }
+    }
+
     fn native_utf8_enabled(&self) -> bool {
         self.system81_shared
             .lock()
@@ -8273,11 +8328,19 @@ impl Vm {
 
     fn write_value(&mut self, ptr: u32, width: u8, value: &Value) -> VmResult<()> {
         let addr = self.value_key(ptr);
-        self.write_int(ptr, width, value.as_i32() as u32)?;
+        // A native string value is still a non-NULL char pointer when its
+        // DWORD is read by native code, exported in a structure, or copied
+        // without typed shadows. Keep those bytes consistent with load2.
+        let raw = if matches!(value, Value::Str(_)) {
+            self.value_as_numeric_operand(value.clone())? as u32
+        } else {
+            value.as_i32() as u32
+        };
+        self.write_int(ptr, width, raw)?;
         if width >= 2 {
             match value {
                 // Pointers and code offsets are raw cells like the target's;
-                // only host-side strings and program handles have no bytes.
+                // strings retain a decoded shadow over their guest pointer.
                 Value::Int(_) | Value::None | Value::Ptr(_) | Value::Func { .. } => {
                     self.mem_values.remove(&addr);
                 }
@@ -8634,11 +8697,10 @@ impl Vm {
     }
 
     fn copy_c_string_pointer(&mut self, dst: u32, src: u32) -> VmResult<()> {
-        if let Some(Value::Str(text)) = self.mem_values.get(&self.value_key(src)).cloned() {
-            return self.write_c_string(dst, &text);
-        }
-        let size = self.c_string_byte_len(src)?.saturating_add(1);
-        self.copy_buffer(dst, src, size)
+        // strcpy copies bytes, not the lossy scenario-text shadow. Preserve
+        // synthetic String overrides only when they differ from the buffer.
+        let bytes = self.read_shadowed_c_string_bytes(src)?;
+        self.write_c_string_native_bytes(dst, &bytes)
     }
 
     /// Write native bytes, keeping the String path (and its script-record
@@ -8662,7 +8724,7 @@ impl Vm {
     }
 
     fn write_c_string_raw(&mut self, ptr: u32, text: &str) -> VmResult<()> {
-        let encoded=if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0};
+        let encoded = self.encode_native_string(text);
         let bytes = encoded.as_ref();
         let range = self.resolve_write_range(ptr, bytes.len().saturating_add(1))?;
         let start = range.start;
@@ -8672,7 +8734,18 @@ impl Vm {
         Ok(())
     }
     fn encode_native_string<'a>(&self,text:&'a str)->std::borrow::Cow<'a,[u8]> {
-        if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(text).0}
+        if self.native_utf8_enabled() {
+            Cow::Borrowed(text.as_bytes())
+        } else {
+            let (encoded, _, unmappable) = encoding_rs::SHIFT_JIS.encode(text);
+            if unmappable {
+                // WideCharToMultiByte(CP932) substitutes '?', whereas
+                // encoding_rs emits HTML numeric entities by default.
+                Cow::Owned(version_system::encode_cp932(text))
+            } else {
+                encoded
+            }
+        }
     }
     fn decode_native_string_lossy(&self, bytes: &[u8]) -> String {
         if self.native_utf8_enabled() {
@@ -8682,7 +8755,7 @@ impl Vm {
         }
     }
 
-    /// Write one target Shift-JIS C string without splitting a multibyte
+    /// Write one target C string without splitting a multibyte
     /// character. The caller supplies the maximum payload length excluding
     /// the terminating NUL, matching the native dialog buffers.
     fn write_c_string_bounded(
@@ -8696,19 +8769,27 @@ impl Vm {
                 "null writable Shift-JIS string pointer".into(),
             ));
         }
-        let mut bounded = String::new();
-        for ch in text.chars() {
-            let mut candidate = bounded.clone();
-            candidate.push(ch);
-            if encoding_rs::SHIFT_JIS.encode(&candidate).0.len() > max_bytes {
-                break;
-            }
-            bounded.push(ch);
-        }
-        let byte_len = encoding_rs::SHIFT_JIS.encode(&bounded).0.len();
-        self.write_c_string_raw(ptr, &bounded)?;
+        let bytes = self.bounded_native_string_bytes(text, max_bytes);
+        let byte_len = bytes.len();
+        let range = self.resolve_write_range(ptr, byte_len + 1)?;
+        let start = range.start;
+        self.memory[start..start + byte_len].copy_from_slice(&bytes);
+        self.memory[start + byte_len] = 0;
         self.clear_shadow_values(ptr, byte_len.saturating_add(1));
         Ok(byte_len)
+    }
+
+    fn bounded_native_string_bytes(&self, text: &str, max_bytes: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for ch in text.chars().take_while(|&ch| ch != '\0') {
+            let mut character = [0; 4];
+            let encoded = self.encode_native_string(ch.encode_utf8(&mut character));
+            if encoded.len() > max_bytes.saturating_sub(bytes.len()) {
+                break;
+            }
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes
     }
 
     fn copy_buffer(&mut self, dst: u32, src: u32, size: usize) -> VmResult<()> {
@@ -10165,7 +10246,7 @@ impl Vm {
                         if destination != 0 {
                             self.write_c_string(destination, &message)?;
                         }
-                        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&message);
+                        let bytes = self.encode_native_string(&message);
                         Value::Int(bytes.len().saturating_add(1).min(i32::MAX as usize) as i32)
                     }
                 }
@@ -11985,6 +12066,9 @@ impl Vm {
             (0xb0, 0xC0) | (0xb0, 0xC2) => &[0],
             (0xb0, 0xC1) => &[1],
             (0xb0, 0xC3) | (0xb0, 0xC6) | (0xb0, 0xC7) => &[0, 1],
+            // 1.687 1400D4560 converts both alias and face through the
+            // guest char-pointer resolver, just like the legacy C7 slot.
+            (0xb0, 0xC8) if self.native_abi_profile == NativeAbiProfile::ModernFused => &[0, 1],
             (0xb0, 0xF0) => &[2],
             (0xc0, 0xF0) => &[1, 4],
             _ => return Ok(()),
@@ -12101,6 +12185,12 @@ impl Vm {
                 Value::Ptr(ptr) if ptr != 0 && text_slot => {
                     self.value_as_string_with_encoding(original.clone(), encoding)?
                 }
+                Value::Int(ptr) if ptr != 0 && text_slot => {
+                    // Pointer arithmetic and indirect DWORD loads do not
+                    // retain Value::Ptr. Native text slots still hold char*,
+                    // including control-only strings; never scan neighbours.
+                    self.value_as_string_with_encoding(original.clone(), encoding)?
+                }
                 Value::Ptr(ptr) if ptr != 0 => {
                     let direct = self.value_as_string_with_encoding(original.clone(), encoding)?;
                     let trimmed = direct.trim_matches('\0').trim_end_matches('\u{fffd}');
@@ -12135,7 +12225,9 @@ impl Vm {
             // pointer that a renderer would draw as "0x...". Integers keep the
             // plausibility test because they may be plain numbers.
             let non_null_pointer = matches!(original, Value::Ptr(ptr) if ptr != 0);
-            if non_null_pointer && text_slot {
+            let text_pointer = text_slot && matches!(original, Value::Ptr(ptr) if ptr != 0)
+                || text_slot && matches!(original, Value::Int(ptr) if ptr != 0);
+            if text_pointer {
                 self.replace_operand(operand, Value::Str(text));
             } else if non_null_pointer && !text.starts_with("0x") {
                 let cleaned = text.trim_matches('\0').trim_end_matches('\u{fffd}');
@@ -12261,7 +12353,7 @@ impl Vm {
                         },
                     )
                 }
-                Ok(text) if !text.is_empty() => Ok(text),
+                Ok(text) => Ok(text),
                 _ => Ok(format!("0x{value:08X}")),
             },
             Value::Func { offset, .. } => Ok(format!("0x{offset:08X}")),
@@ -12272,7 +12364,7 @@ impl Vm {
     fn value_as_fixed_bytes(&self, value: Value, size: usize) -> VmResult<Vec<u8>> {
         match value {
             Value::Str(text) => {
-                let encoded=if self.native_utf8_enabled() {std::borrow::Cow::Borrowed(text.as_bytes())} else {encoding_rs::SHIFT_JIS.encode(&text).0};
+                let encoded = self.encode_native_string(&text);
                 let mut bytes = Vec::with_capacity(size);
                 bytes.extend_from_slice(&encoded);
                 bytes.push(0);
@@ -12516,47 +12608,64 @@ impl Vm {
         Ok(self.encode_native_string(text).into_owned())
     }
 
-    fn render_sprintf(&mut self, fmt: &str) -> VmResult<String> {
-        let mut output = String::new();
-        let mut chars = fmt.chars().peekable();
+    /// sub_474720 passes byte strings and the original field format to the
+    /// CRT. Keep bytes until the destination write: `%c%c` may assemble a
+    /// CP932 character, and `%s` may contain fan-patch bytes or glyph codes.
+    fn render_sprintf(&mut self, fmt: &[u8]) -> VmResult<Vec<u8>> {
+        // Modern 4F4B10 / 1400F8240 independently decode the format and
+        // %s arguments, format UTF-16, then encode with the selected mode.
+        // %c is replaced with its original low byte AFTER that conversion.
+        let wide = matches!(self.native_abi_profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused);
+        let decoded_format;
+        let fmt = if wide {
+            decoded_format = version_system::decode_auto(fmt, 6);
+            decoded_format.as_bytes()
+        } else { fmt };
+        let mut byte_characters = VecDeque::new();
+        let mut output = Vec::new();
+        let mut chars = fmt.iter().copied().take_while(|&byte| byte != 0).peekable();
         while let Some(ch) = chars.next() {
-            if ch != '%' {
+            if ch != b'%' {
                 output.push(ch);
                 continue;
             }
-            if chars.peek() == Some(&'%') {
+            if chars.peek() == Some(&b'%') {
                 chars.next();
-                output.push('%');
+                output.push(b'%');
                 continue;
             }
-            let mut zero_pad = false;
-            while matches!(chars.peek(), Some('-' | '+' | ' ' | '#')) {
-                chars.next();
-            }
-            if chars.peek() == Some(&'0') {
-                zero_pad = true;
+            let (mut left_align, mut space, mut zero_pad) = (false, false, false);
+            loop {
+                match chars.peek() {
+                    Some(b'-') => left_align = true,
+                    Some(b' ') => space = true,
+                    Some(b'0') => zero_pad = true,
+                    _ => break,
+                }
                 chars.next();
             }
             let mut width = 0usize;
-            if chars.peek() == Some(&'*') {
-                width = self.pop_int().unwrap_or_default().max(0) as usize;
+            if chars.peek() == Some(&b'*') {
+                let field = self.pop_int()?;
+                left_align |= field < 0;
+                width = field.unsigned_abs() as usize;
                 chars.next();
             } else {
-                while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
-                    width = width.saturating_mul(10).saturating_add(digit as usize);
+                while let Some(&digit @ b'0'..=b'9') = chars.peek() {
+                    width = width.saturating_mul(10).saturating_add((digit - b'0') as usize);
                     chars.next();
                 }
             }
-            let precision = if chars.peek() == Some(&'.') {
+            let precision = if chars.peek() == Some(&b'.') {
                 chars.next();
-                if chars.peek() == Some(&'*') {
+                if chars.peek() == Some(&b'*') {
                     let precision = self.pop_int()?;
                     chars.next();
                     (precision >= 0).then_some(precision as usize)
                 } else {
                     let mut precision = 0usize;
-                    while let Some(digit) = chars.peek().and_then(|ch| ch.to_digit(10)) {
-                        precision = precision.saturating_mul(10).saturating_add(digit as usize);
+                    while let Some(&digit @ b'0'..=b'9') = chars.peek() {
+                        precision = precision.saturating_mul(10).saturating_add((digit - b'0') as usize);
                         chars.next();
                     }
                     Some(precision)
@@ -12565,67 +12674,85 @@ impl Vm {
             if width > 65536 || precision.is_some_and(|precision| precision > 65536) {
                 return Err(VmError::Runtime("sprintf field limit".into()));
             }
-            while matches!(chars.peek(), Some('h' | 'l' | 'j' | 'z' | 't' | 'L')) {
+            while matches!(chars.peek(), Some(b'h' | b'l' | b'j' | b'z' | b't' | b'L')) {
                 chars.next();
             }
-            let spec = chars.next().unwrap_or('%');
+            let spec = chars.next().ok_or_else(|| VmError::Runtime("incomplete sprintf format".into()))?;
+            let mut field = Vec::new();
+            let mut prefix = String::new();
+            let numeric = matches!(spec, b'd' | b'i' | b'u' | b'x' | b'X' | b'f');
             match spec {
-                'd' | 'i' | 'u' | 'x' | 'X' => {
-                    let value = self.pop_int().unwrap_or_default();
-                    let signed = matches!(spec, 'd' | 'i');
-                    let prefix = if signed && value < 0 { "-" } else { "" };
-                    let mut digits = if spec == 'x' {
-                        format!("{:x}", value as u32)
-                    } else if spec == 'X' {
-                        format!("{:X}", value as u32)
-                    } else if signed {
-                        value.unsigned_abs().to_string()
-                    } else {
-                        (value as u32).to_string()
+                b'd' | b'i' | b'u' | b'x' | b'X' => {
+                    let value = self.pop_int()?;
+                    let signed = matches!(spec, b'd' | b'i');
+                    if signed {
+                        if value < 0 { prefix.push('-'); }
+                        else if space { prefix.push(' '); }
+                    }
+                    let mut digits = match spec {
+                        b'x' => format!("{:x}", value as u32),
+                        b'X' => format!("{:X}", value as u32),
+                        _ if signed => value.unsigned_abs().to_string(),
+                        _ => (value as u32).to_string(),
                     };
-                    // sub_474720 passes the original format to the C runtime.
-                    // Integer precision is a minimum digit count, excluding
-                    // the sign. H2O's mask%.3d must produce mask003, not mask3.
                     if precision == Some(0) && value == 0 { digits.clear(); }
                     if let Some(precision) = precision {
-                        if digits.len() < precision {
-                            digits = format!("{}{}", "0".repeat(precision - digits.len()), digits);
-                        }
+                        field.extend(std::iter::repeat_n(b'0', precision.saturating_sub(digits.len())));
                     }
-                    let padding = width.saturating_sub(prefix.len() + digits.len());
-                    if zero_pad && precision.is_none() {
-                        output.push_str(prefix);
-                        output.extend(std::iter::repeat_n('0', padding));
+                    field.extend_from_slice(digits.as_bytes());
+                }
+                b'f' if wide => {
+                    let value = self.pop_int()?;
+                    if value < 0 { prefix.push('-'); }
+                    else if space { prefix.push(' '); }
+                    field = format!("{:.*}", precision.unwrap_or(6), f64::from(value).abs() / 65_536.0).into_bytes();
+                }
+                b'c' => {
+                    let byte = self.pop_int()? as u8;
+                    if wide {
+                        byte_characters.push_back(byte);
+                        field.push(0x1a);
+                    } else { field.push(byte); }
+                }
+                b's' => {
+                    field = self.pop_native_string_bytes()?;
+                    let length = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+                    field.truncate(length);
+                    if wide {
+                        let mut units: Vec<u16> = version_system::decode_auto(&field, 6).encode_utf16().collect();
+                        if let Some(limit) = precision { units.truncate(limit); }
+                        field = String::from_utf16_lossy(&units).into_bytes();
                     } else {
-                        output.extend(std::iter::repeat_n(' ', padding));
-                        output.push_str(prefix);
-                    }
-                    output.push_str(&digits);
-                }
-                'c' => {
-                    // sub_474720 hands the values to the C runtime's sprintf:
-                    // the low byte as one character. A byte that is no
-                    // character on its own (a Shift-JIS lead byte) is left out.
-                    let byte = [self.pop_int().unwrap_or_default() as u8];
-                    let (text, _, malformed) = encoding_rs::SHIFT_JIS.decode(&byte);
-                    if !malformed {
-                        if width > 1 {
-                            output.extend(std::iter::repeat_n(' ', width - 1));
-                        }
-                        output.push_str(&text);
+                        // Legacy precision counts stored bytes, even if a
+                        // character is split. Modern counts UTF-16 units.
+                        if let Some(limit) = precision { field.truncate(limit); }
                     }
                 }
-                's' => {
-                    let value = self.pop_string_lossy().unwrap_or_default();
-                    output.push_str(&value);
-                }
-                other => {
-                    output.push('%');
-                    output.push(other);
+                other => return Err(VmError::Runtime(format!("unsupported sprintf conversion 0x{other:02X}"))),
+            }
+            let field_width = if wide && spec == b's' {
+                std::str::from_utf8(&field).expect("decoded string").encode_utf16().count()
+            } else { field.len() };
+            let padding = width.saturating_sub(prefix.len() + field_width);
+            let pad_zero = numeric && zero_pad && !left_align && (precision.is_none() || spec == b'f');
+            if !left_align && !pad_zero {
+                output.extend(std::iter::repeat_n(b' ', padding));
+            }
+            output.extend_from_slice(prefix.as_bytes());
+            if pad_zero { output.extend(std::iter::repeat_n(b'0', padding)); }
+            output.extend_from_slice(&field);
+            if left_align { output.extend(std::iter::repeat_n(b' ', padding)); }
+        }
+        if wide {
+            let text = String::from_utf8(output).expect("wide format and fields are UTF-8");
+            let mut encoded = self.encode_native_string(&text).into_owned();
+            for byte in &mut encoded {
+                if *byte == 0x1a {
+                    *byte = byte_characters.pop_front().ok_or_else(|| VmError::Runtime("unmatched sprintf byte-character marker".into()))?;
                 }
             }
-        }
-        Ok(output)
+            Ok(encoded)
+        } else { Ok(output) }
     }
 
     fn jump_target(&self, program: &BpProgram, target: u32) -> VmResult<usize> {
@@ -14046,9 +14173,10 @@ mod tests {
         MAX_MEMORY_SIZE, NativeCallFrame, NativeOpcode, ResourceLoadOrigin, SoundApi, SysApi,
         System92TextFragmentRecord, TraceApi, UserDialogRequest, UserDialogResponse, Value, Vm,
         VmRunOptions, VmStopReason, empty_loaded_program, ensure_trailing_separator,
-        join_native_path, native_call, strip_native_markup_tags, system80_state,
+        join_native_path, native_call, strip_native_markup_tags, system80_state, user_dialog,
     };
     use ethornell_script::{BpInstruction, BpOpcode, BpOperand, BpProgram};
+    use ethornell_script::native_abi::NativeAbiProfile;
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -15421,6 +15549,306 @@ mod tests {
     }
 
     #[test]
+    fn native_compat_bounded_strings_use_the_written_encoding() {
+        for utf8 in [false, true] {
+            let mut vm = Vm::new();
+            vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+            let expected = if utf8 { "日".as_bytes().to_vec() }
+                else { encoding_rs::SHIFT_JIS.encode("日本").0.into_owned() };
+            vm.memory[0x2300..0x2310].fill(0xcc);
+            assert_eq!(vm.write_c_string_bounded(0x2300, "日本語", 5).unwrap(), expected.len());
+            assert_eq!(&vm.memory[0x2300..0x2300 + expected.len()], &expected);
+            assert_eq!(vm.memory[0x2300 + expected.len()], 0);
+            assert!(vm.memory[0x2301 + expected.len()..0x2310].iter().all(|&b| b == 0xcc));
+            let (_, writes) = vm.user_dialog_writes(
+                &user_dialog::UserDialogSink::Text { destination: 0x2300, capacity: 5 },
+                Some(UserDialogResponse::Input("日本語".into())),
+            ).unwrap();
+            let mut terminated = expected;
+            terminated.push(0);
+            assert_eq!(writes[0].bytes, terminated);
+            assert!(vm.bounded_native_string_bytes("日", 0).is_empty());
+            assert_eq!(vm.bounded_native_string_bytes("a\0hidden", 100), b"a");
+            vm.memory[0x2400..0x2410].fill(0xcc);
+            vm.stack = vec![Value::Ptr(0x2400), Value::Int(0), Value::Str("setting".into()),
+                Value::Str("日本語".into()), Value::Int(6)];
+            assert_eq!(vm.sys_read_profile_string().unwrap(), 0);
+            assert_eq!(&vm.memory[0x2400..0x2400 + terminated.len()], &terminated);
+            assert!(vm.memory[0x2400 + terminated.len()..0x2410].iter().all(|&b| b == 0xcc));
+            vm.system81_shared.lock().unwrap().captured_error = Some("日本語".into());
+            vm.stack = vec![Value::Ptr(0x2500)];
+            let result = vm.try_builtin_sys_with_api(&mut TraceApi, 0x81, 0x6b).unwrap();
+            let bytes = vm.read_c_string_bytes(0x2500).unwrap();
+            assert_eq!(result, Some(Value::Int((bytes.len() + 1) as i32)));
+            if !utf8 {
+                assert_eq!(vm.encode_native_string("a🙂b").as_ref(), b"a?b");
+            }
+        }
+    }
+
+    #[test]
+    fn native_compat_string_cells_export_live_guest_pointers() {
+        for utf8 in [false, true] {
+            let mut vm = Vm::new();
+            vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+            // A same-text global record sorts before the materialized heap
+            // record. It must not hide the live allocation from reuse.
+            vm.remember_script_record(0x100, "日本").unwrap();
+            for text in ["日本", ""] {
+                let value = Value::Str(text.into());
+                vm.write_value(0x200, 2, &value).unwrap();
+                let pointer = vm.read_int(0x200, 2).unwrap();
+                assert_ne!(pointer, 0);
+                assert_eq!(vm.read_c_string(pointer).unwrap(), text);
+                assert_eq!(vm.read_value(0x200, 2).unwrap(), value);
+                let allocation_count = vm.heap_allocations.len();
+                vm.write_value(0x204, 2, &value).unwrap();
+                assert_eq!(vm.read_int(0x204, 2).unwrap(), pointer);
+                assert_eq!(vm.heap_allocations.len(), allocation_count);
+                vm.copy_buffer(0x300, 0x200, 4).unwrap();
+                vm.clear_shadow_values(0x300, 4);
+                assert_eq!(vm.read_value(0x300, 2).unwrap(), Value::Int(pointer as i32));
+                // A mutable/reallocated guest buffer is not an interned
+                // constant merely because an old record still names it.
+                vm.write_int(pointer, 0, b'X' as u32).unwrap();
+                let refreshed = vm.value_as_numeric_operand(value.clone()).unwrap() as u32;
+                assert_ne!(refreshed, pointer);
+                assert_eq!(vm.read_c_string(refreshed).unwrap(), text);
+            }
+        }
+    }
+
+    #[test]
+    fn native_compat_strcpy_preserves_raw_and_overridden_strings() {
+        let mut vm = Vm::new();
+        // This GBK text does not survive a Shift-JIS decode/encode round trip.
+        let raw = [0xb9, 0xa7, 0xbd, 0xe9];
+        vm.memory[0x100..0x104].copy_from_slice(&raw);
+        vm.memory[0x104] = 0;
+        let lossy = vm.read_c_string(0x100).unwrap();
+        vm.mem_values.insert(vm.value_key(0x100), Value::Str(lossy));
+        let strcpy = test_instruction(0, 0x6a, "strcpy", vec![0x6a], Vec::new());
+        vm.stack = vec![Value::Int(77), Value::Ptr(0x200), Value::Ptr(0x100)];
+        vm.dispatch(&strcpy, &mut TraceApi).unwrap();
+        assert_eq!(vm.read_c_string_bytes(0x200).unwrap(), raw);
+        assert_eq!(vm.stack, [Value::Int(77)]);
+        vm.mem_values.insert(vm.value_key(0x100), Value::Str("replacement".into()));
+        vm.copy_c_string_pointer(0x200, 0x100).unwrap();
+        assert_eq!(vm.read_c_string(0x200).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn native_compat_streq_keeps_legacy_bytes_and_modern_wide_semantics() {
+        let cp932 = encoding_rs::SHIFT_JIS.encode("日本").0.into_owned();
+        let streq = test_instruction(0, 0x69, "streq", vec![0x69], Vec::new());
+        for profile in [NativeAbiProfile::Tayutama, NativeAbiProfile::Amachoco,
+            NativeAbiProfile::Anipani, NativeAbiProfile::HoukagoFd,
+            NativeAbiProfile::Modern, NativeAbiProfile::ModernFused] {
+            let mut vm = Vm::new();
+            vm.set_native_abi_profile(profile);
+            vm.memory[0x100..0x100 + cp932.len()].copy_from_slice(&cp932);
+            vm.memory[0x100 + cp932.len()] = 0;
+            let utf8 = "日本".as_bytes();
+            vm.memory[0x200..0x200 + utf8.len()].copy_from_slice(utf8);
+            vm.memory[0x200 + utf8.len()] = 0;
+            vm.stack = vec![Value::Int(77), Value::Ptr(0x100), Value::Ptr(0x200)];
+            vm.dispatch(&streq, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(77), Value::Int(i32::from(matches!(profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused)))]);
+            vm.stack = vec![Value::Ptr(0x100), Value::Int(0x100)];
+            vm.dispatch(&streq, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(1)]);
+        }
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(NativeAbiProfile::ModernFused);
+        for operands in [[Value::Int(0), Value::Int(0)],
+            [Value::Ptr(0), Value::Str(String::new())]] {
+            vm.stack = operands.into();
+            vm.dispatch(&streq, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(0)]);
+        }
+        vm.stack = vec![Value::Str(String::new()), Value::Str(String::new())];
+        vm.dispatch(&streq, &mut TraceApi).unwrap();
+        assert_eq!(vm.stack, [Value::Int(1)]);
+    }
+
+    #[test]
+    fn native_compat_computed_text_pointers_do_not_scan_adjacent_strings() {
+        let mut vm = Vm::new();
+        vm.memory[0x100..0x10e].copy_from_slice(b"\x01\x02\0\0unrelated\0");
+        for pointer in [Value::Ptr(0x100), Value::Int(0x100)] {
+            vm.stack = vec![pointer];
+            vm.normalize_graph_string_args(0x92, 0x1f).unwrap();
+            assert_eq!(vm.stack, [Value::Str("\x01\x02".into())]);
+        }
+        for pointer in [Value::Ptr(0x102), Value::Int(0x102)] {
+            assert_eq!(vm.value_as_string_lossy(pointer.clone()).unwrap(), "");
+            vm.stack = vec![pointer];
+            vm.normalize_user_string_args(0xb0, 0x80).unwrap();
+            assert_eq!(vm.stack, [Value::Str(String::new())]);
+        }
+    }
+
+    #[test]
+    fn native_compat_fused_font_alias_decodes_both_guest_strings() {
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(NativeAbiProfile::ModernFused);
+        vm.system81_shared.lock().unwrap().native_utf8_override = Some(true);
+        vm.write_c_string_raw(0x100, "alias").unwrap();
+        vm.write_c_string_raw(0x200, "日本語フォント").unwrap();
+        vm.stack = vec![Value::Int(77), Value::Int(0x100), Value::Ptr(0x200)];
+        vm.normalize_user_string_args(0xb0, 0xc8).unwrap();
+        assert_eq!(vm.stack, [Value::Int(77), Value::Str("alias".into()), Value::Str("日本語フォント".into())]);
+        assert_eq!(vm.effective_arg_count(0xb0, 0xc8), Some(2));
+        assert_eq!(vm.effective_output_count(0xb0, 0xc8), 0);
+    }
+
+    #[test]
+    fn native_compat_sprintf_preserves_bytes_and_crt_fields() {
+        let mut vm = Vm::new();
+        let sprintf = test_instruction(0, 0x6f, "sprintf", vec![0x6f], Vec::new());
+        vm.stack = vec![Value::Int(77), Value::Int(0xfa), Value::Int(0x93),
+            Value::Ptr(0x2300), Value::Str("%c%c".into())];
+        vm.dispatch(&sprintf, &mut TraceApi).unwrap();
+        assert_eq!(vm.read_c_string_bytes(0x2300).unwrap(), [0x93, 0xfa]);
+        assert_eq!(vm.stack, [Value::Int(77)]);
+        vm.memory[0x100..0x105].copy_from_slice(&[0xb9, 0xa7, 0xbd, 0xe9, 0]);
+        vm.stack = vec![Value::Ptr(0x100)];
+        assert_eq!(vm.render_sprintf(b"[%6.3s]").unwrap(), [b'[', b' ', b' ', b' ', 0xb9, 0xa7, 0xbd, b']']);
+        for (fmt, expected) in [(b"%-05d".as_slice(), "3    "), (b"% 5d", "    3"),
+            (b"% 05d", " 0003"), (b"%06x", "000003")] {
+            vm.stack = vec![Value::Int(3)];
+            assert_eq!(vm.render_sprintf(fmt).unwrap(), expected.as_bytes());
+            assert!(vm.stack.is_empty());
+        }
+        vm.stack = vec![Value::Str("x".into()), Value::Int(-3)];
+        assert_eq!(vm.render_sprintf(b"%*s").unwrap(), b"x  ");
+        assert!(vm.render_sprintf(b"%q").is_err());
+        assert!(vm.render_sprintf(b"%+d").is_err());
+        assert!(vm.render_sprintf(b"%#x").is_err());
+        assert!(vm.render_sprintf(b"incomplete %").is_err());
+    }
+
+    #[test]
+    fn native_compat_modern_sprintf_uses_wide_fields_and_native_output_encoding() {
+        let fmt = encoding_rs::SHIFT_JIS.encode("名:[%4.1s] %.2f %c").0.into_owned();
+        let source = encoding_rs::SHIFT_JIS.encode("日本").0.into_owned();
+        for profile in [NativeAbiProfile::Modern, NativeAbiProfile::ModernFused] {
+            for utf8 in [false, true] {
+                let mut vm = Vm::new();
+                vm.set_native_abi_profile(profile);
+                vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+                vm.memory[0x100..0x100 + source.len()].copy_from_slice(&source);
+                vm.memory[0x100 + source.len()] = 0;
+                vm.stack = vec![Value::Int(0x93), Value::Int(98_304), Value::Ptr(0x100)];
+                let rendered = vm.render_sprintf(&fmt).unwrap();
+                let mut expected = if utf8 { "名:[   日] 1.50 ".as_bytes().to_vec() }
+                    else { encoding_rs::SHIFT_JIS.encode("名:[   日] 1.50 ").0.into_owned() };
+                expected.push(0x93); // %c remains a raw byte after conversion.
+                assert_eq!(rendered, expected);
+                assert!(vm.stack.is_empty());
+                vm.stack = vec![Value::Int(-98_304)];
+                assert_eq!(vm.render_sprintf(b"%08.2f").unwrap(), b"-0001.50");
+            }
+        }
+        let mut legacy = Vm::new();
+        assert!(legacy.render_sprintf(b"%f").is_err());
+    }
+
+    #[test]
+    fn native_compat_quote_and_lowercase_preserve_payload_bytes() {
+        let mut vm = Vm::new();
+        let raw = [0xb9, 0xa7, 0xbd, 0xe9, b'A', 0x81, b'A'];
+        vm.memory[0x100..0x107].copy_from_slice(&raw);
+        vm.memory[0x107] = 0;
+        let quote = test_instruction(0, 0x6e, "quote", vec![0x6e], Vec::new());
+        vm.stack = vec![Value::Ptr(0x200), Value::Ptr(0x100), Value::Int(0xb1)];
+        vm.dispatch(&quote, &mut TraceApi).unwrap();
+        let expected: Vec<u8> = [vec![0xb1], raw.to_vec(), vec![0xb1]].concat();
+        assert_eq!(vm.read_c_string_bytes(0x200).unwrap(), expected);
+        let lower = test_instruction(0, 0x6d, "lower", vec![0x6d], Vec::new());
+        vm.memory[0x100..0x109].copy_from_slice(&[b'A', 0x81, b'A', 0xb9, 0xa7, 0xbd, 0xe9, b'1', 0]);
+        vm.stack = vec![Value::Ptr(0x100)];
+        vm.dispatch(&lower, &mut TraceApi).unwrap();
+        assert_eq!(vm.read_c_string_bytes(0x100).unwrap(), [b'a', 0x81, b'A', 0xb9, 0xa7, 0xbd, 0xe9, b'1']);
+        vm.set_native_abi_profile(NativeAbiProfile::ModernFused);
+        vm.system81_shared.lock().unwrap().native_utf8_override = Some(true);
+        vm.write_c_string_raw(0x100, "あABC").unwrap();
+        vm.stack = vec![Value::Ptr(0x100)];
+        vm.dispatch(&lower, &mut TraceApi).unwrap();
+        assert_eq!(vm.read_c_string_bytes(0x100).unwrap(), "あabc".as_bytes());
+        vm.stack = vec![Value::Ptr(0x200), Value::Ptr(0x100), Value::Int(0x300c)];
+        vm.dispatch(&quote, &mut TraceApi).unwrap();
+        assert_eq!(vm.read_c_string_bytes(0x200).unwrap(), "「あabc「".as_bytes());
+        assert_eq!(super::version_system::encode_utf8_codepoint(0x7fff_ffff), [0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf]);
+        assert!(super::version_system::encode_utf8_codepoint(0x8000_0000).is_empty());
+    }
+
+    #[test]
+    fn native_compat_character_probe_preserves_version_output_counts() {
+        let instruction = test_instruction(0, 0x6c, "character", vec![0x6c], Vec::new());
+        for profile in [NativeAbiProfile::Tayutama, NativeAbiProfile::Amachoco,
+            NativeAbiProfile::Anipani, NativeAbiProfile::HoukagoFd,
+            NativeAbiProfile::Modern, NativeAbiProfile::ModernFused] {
+            let mut vm = Vm::new();
+            vm.set_native_abi_profile(profile);
+            vm.memory[0x100..0x103].copy_from_slice(&[0x81, 0x41, 0]);
+            vm.stack = vec![Value::Int(77), Value::Ptr(0x100)];
+            vm.dispatch(&instruction, &mut TraceApi).unwrap();
+            let modern = matches!(profile, NativeAbiProfile::Modern | NativeAbiProfile::ModernFused);
+            let mut expected = vec![Value::Int(77)];
+            if modern { expected.push(Value::Int(2)); }
+            expected.extend([Value::Int(0x8141), Value::Int(1), Value::Int(1)]);
+            assert_eq!(vm.stack, expected);
+            if vm.native_string_probe_limit().is_some() {
+                let bytes = "🙂".as_bytes();
+                vm.memory[0x100..0x104].copy_from_slice(bytes);
+                vm.memory[0x104] = 0;
+                vm.stack = vec![Value::Ptr(0x100)];
+                vm.dispatch(&instruction, &mut TraceApi).unwrap();
+                let mut expected = Vec::new();
+                if modern { expected.push(Value::Int(4)); }
+                expected.extend([Value::Int(0x1f642), Value::Int(1), Value::Int(0)]);
+                assert_eq!(vm.stack, expected);
+            }
+        }
+        assert_eq!(super::version_system::character_info(&[0xed, 0xa0, 0xbd, 0xed, 0xb9, 0x82], 1).unwrap(), (6, 0x1f642, true));
+    }
+
+    #[test]
+    fn native_compat_multibyte_search_and_replacement_use_native_boundaries() {
+        let find = test_instruction(0, 0x66, "find", vec![0x66], Vec::new());
+        let replace = test_instruction(0, 0x67, "replace", vec![0x67], Vec::new());
+        for profile in [NativeAbiProfile::Tayutama, NativeAbiProfile::Anipani, NativeAbiProfile::Modern, NativeAbiProfile::ModernFused] {
+            let mut vm = Vm::new();
+            vm.set_native_abi_profile(profile);
+            vm.memory[0x100..0x104].copy_from_slice(&[0x81, b'A', b'A', 0]);
+            vm.stack = vec![Value::Ptr(0x100), Value::Str("A".into())];
+            vm.dispatch(&find, &mut TraceApi).unwrap();
+            assert_eq!(vm.stack, [Value::Int(if profile == NativeAbiProfile::Tayutama { 1 } else { 2 })]);
+            if profile == NativeAbiProfile::Tayutama { continue; }
+            for utf8 in [false, true] {
+                vm.system81_shared.lock().unwrap().native_utf8_override = Some(utf8);
+                let text = "日本abc日本";
+                let source = if utf8 { text.as_bytes().to_vec() } else { encoding_rs::SHIFT_JIS.encode(text).0.into_owned() };
+                let needle = if utf8 { "日本".as_bytes().to_vec() } else { encoding_rs::SHIFT_JIS.encode("日本").0.into_owned() };
+                let replacement = if utf8 { encoding_rs::SHIFT_JIS.encode("あ").0.into_owned() } else { "あ".as_bytes().to_vec() };
+                for (at, bytes) in [(0x100, source), (0x200, needle), (0x300, replacement)] {
+                    vm.memory[at..at + bytes.len()].copy_from_slice(&bytes);
+                    vm.memory[at + bytes.len()] = 0;
+                }
+                vm.stack = vec![Value::Int(77), Value::Ptr(0x400), Value::Ptr(0x100), Value::Ptr(0x200), Value::Ptr(0x300)];
+                vm.dispatch(&replace, &mut TraceApi).unwrap();
+                let expected = if utf8 { "あabcあ".as_bytes().to_vec() } else { encoding_rs::SHIFT_JIS.encode("あabcあ").0.into_owned() };
+                assert_eq!(vm.read_c_string_bytes(0x400).unwrap(), expected);
+                assert_eq!(vm.stack, [Value::Int(77), Value::Int(2)]);
+            }
+        }
+        assert_eq!(super::version_system::find_native_string("あああい".as_bytes(), "ああい".as_bytes(), 1).unwrap(), None);
+        assert_eq!(super::version_system::find_native_string(b"abc", b"", 0).unwrap(), Some(0));
+        assert_eq!(super::version_system::replace_native_string(b"abc", b"", b"x", 6, true).unwrap(), (b"abc".to_vec(), 0));
+    }
+
+    #[test]
     fn sprintf_integer_precision_preserves_native_resource_names() {
         let mut vm = Vm::new();
         let sprintf = test_instruction(0, 0x6f, "sprintf", vec![0x6f], Vec::new());
@@ -15438,13 +15866,13 @@ mod tests {
             ("%.3d", i32::MIN, "-2147483648"),
         ] {
             vm.stack = vec![Value::Int(value)];
-            assert_eq!(vm.render_sprintf(format).unwrap(), expected);
+            assert_eq!(vm.render_sprintf(format.as_bytes()).unwrap(), expected.as_bytes());
             assert!(vm.stack.is_empty());
         }
         vm.stack = vec![Value::Int(3), Value::Int(3)];
-        assert_eq!(vm.render_sprintf("mask%.*d").unwrap(), "mask003");
+        assert_eq!(vm.render_sprintf(b"mask%.*d").unwrap(), b"mask003");
         assert!(vm.stack.is_empty());
-        assert!(vm.render_sprintf("%.999999999d").is_err());
+        assert!(vm.render_sprintf(b"%.999999999d").is_err());
     }
 
     #[test]
@@ -17232,8 +17660,8 @@ mod tests {
         let formatted = 0x0800_3100;
         vm.stack.clear();
         vm.stack.push(Value::Ptr(text_pointer));
-        let rendered = vm.render_sprintf("%s").unwrap();
-        vm.write_c_string(formatted, &rendered).unwrap();
+        let rendered = vm.render_sprintf(b"%s").unwrap();
+        vm.write_c_string_native_bytes(formatted, &rendered).unwrap();
         assert_eq!(vm.read_c_string(formatted).unwrap(), expected);
     }
 
