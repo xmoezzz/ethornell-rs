@@ -999,6 +999,48 @@ impl FilePolicy {
 mod tests {
     use super::*;
     #[test]
+    fn hosted_archive_members_preserve_raw_bytes_and_exact_paths() {
+        use ethornell_vm::SysApi;
+        let (base, policy) = roots("raw-archive-members");
+        let write_arc = |name: &str, payload: &[u8]| {
+            let path = policy.resource.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bytes = b"BURIKO ARC20".to_vec();
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            let mut entry = [0u8; 0x60];
+            entry[..5].copy_from_slice(b"entry");
+            bytes.extend_from_slice(&entry);
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0u8; 24]);
+            bytes.extend_from_slice(payload);
+            std::fs::write(path, bytes).unwrap();
+        };
+        // Raw reads must not interpret even a malformed compressed payload:
+        // the native VM owns decoding and its error/status policy.
+        let packed = b"DSC FORMAT 1.00\0native decoder input";
+        write_arc("system.arc", packed);
+        write_arc("Archive/data01000.arc", packed);
+        write_arc("Other/data01000.arc", b"other member");
+        let manager = policy.open_manager().unwrap();
+        let mut api = super::super::RuntimeTraceApi::new_with_native_root(manager, policy.resource.clone());
+        scope(&policy, || {
+            for archive in ["system.arc", "bgi-resource/system.arc", "Archive\\data01000.arc", "bgi-resource\\archive/DATA01000.arc"] {
+                assert!(api.archive_entry_exists(archive, "entry"), "{archive}");
+                assert_eq!(api.read_archive_entry_raw(archive, "entry").unwrap(), packed, "{archive}");
+            }
+            assert_eq!(api.read_archive_entry_raw("Other/data01000.arc", "entry").unwrap(), b"other member");
+            for denied in ["../Archive/data01000.arc", "bgi-resource/Archive/../Archive/data01000.arc",
+                "bgi-user/Archive/data01000.arc", "/Archive/data01000.arc", "C:/Archive/data01000.arc",
+                "Missing/data01000.arc", ""] {
+                assert!(!api.archive_entry_exists(denied, "entry"), "{denied}");
+                assert!(api.read_archive_entry_raw(denied, "entry").is_none(), "{denied}");
+            }
+        });
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn rejects_escape_forms() {
         for p in [
             "../save",
@@ -1133,6 +1175,21 @@ mod tests {
                 vec![Value::Str("bgi-resource\\UserData/slot.sud".into())])).unwrap();
             assert_eq!(attrs, Value::Int(0x20));
             assert_eq!(api.read_user_file_bytes("bgi-resource\\UserData/slot.sud").unwrap(), b"session save");
+            assert!(api.file_exists("", "bgi-resource\\UserData/slot.sud"));
+            assert!(api.disk_file_exists("bgi-resource\\UserData/slot.sud"));
+            assert_eq!(api.file_size("", "bgi-resource\\UserData/slot.sud"), 12);
+            assert_eq!(api.read_disk_file("bgi-resource\\UserData/slot.sud").unwrap(), b"session save");
+            assert_eq!(api.load_file_bytes("bgi-resource\\", "UserData/slot.sud").unwrap(), b"session save");
+            for (id, expected) in [(0x34, 1), (0x35, 12)] {
+                let code = [0x80, id, 0x17];
+                let program = ethornell_script::parse_bp_program(Some("saved-file-query".into()), &code);
+                let mut vm = ethornell_vm::Vm::new();
+                vm.start(&program);
+                vm.stack = vec![Value::Int(0), Value::Str("bgi-resource\\UserData/slot.sud".into())];
+                let report = vm.run_loaded(&mut api, &ethornell_vm::VmRunOptions::default());
+                assert_eq!(report.stop_reason, ethornell_vm::VmStopReason::Completed, "{report:?}");
+                assert_eq!(vm.stack, vec![Value::Int(expected)]);
+            }
             assert!(!api.write_file_bytes("bgi-resource/story.arc", b"denied"));
         });
         assert!(!policy.resource.join("UserData").exists());
@@ -1286,9 +1343,9 @@ mod tests {
             assert_eq!(
                 api.load_file_bytes("bgi-resource\\", "UserData/Slot.sud")
                     .unwrap(),
-                b"resource"
+                b"user overlay"
             );
-            assert_eq!(api.file_size("bgi-resource\\", "UserData/Slot.sud"), 8);
+            assert_eq!(api.file_size("bgi-resource\\", "UserData/Slot.sud"), 12);
             assert!(api.load_file_bytes("bgi-user\\", "missing").is_none());
             assert!(
                 api.load_file_bytes("/outside", "UserData/Slot.sud")

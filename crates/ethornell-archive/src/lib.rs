@@ -382,6 +382,17 @@ impl ResourceManager {
             .and_then(|(archive, entry)| self.entry_at(archive, entry))
     }
 
+    /// An exact already-indexed archive, without reopening a filesystem path
+    /// or confusing archives with equal basenames in different directories.
+    pub fn find_in_archive_path(&self, archive_path: &Path, entry_name: &str) -> Option<ResourceEntry> {
+        let archive = self.archive_index_for_path(archive_path).ok()?;
+        if entry_name.is_empty() { return self.entry_at(archive, 0); }
+        let key = normalize_resource_name(entry_name);
+        let (_, entry) = self.inner.by_name.get(&key)?.iter()
+            .find(|&&(candidate, _)| candidate == archive)?;
+        self.entry_at(archive, *entry)
+    }
+
     pub fn first_in_archive(&self, archive_name: &str) -> Option<ResourceEntry> {
         let first = |archive: &str| {
             self.in_archive_family(archive, |index| self.entry_at(index, 0))

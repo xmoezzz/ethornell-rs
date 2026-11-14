@@ -14,10 +14,12 @@ const ARCHIVE_READ: u32 = 0x8000_0050;
 const ARCHIVE_TOO_BIG: u32 = 0x8000_0060;
 const RESOURCE_SIZE_LIMIT: usize = 0x0400_0000;
 
-/// sub_464EE0, extended for absolute paths returned by POSIX hosts.
+/// sub_464EE0, extended for POSIX paths and portable host capability roots.
 pub(crate) fn is_absolute_resource_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with(['/', '\\']) || bytes.get(1) == Some(&b':')
+        || ["bgi-resource/", "bgi-resource\\", "bgi-user/", "bgi-user\\"]
+            .iter().any(|root| path.starts_with(root))
 }
 
 /// sub_470070(src, dst, n): copies `src` up to and including its n-th
@@ -498,6 +500,16 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_capability_roots_are_not_prefixed_as_relative_files() {
+        for path in ["bgi-resource\\UserData\\slot.sud", "bgi-user/UserData/slot.sud"] {
+            assert!(is_absolute_resource_path(path));
+        }
+        for path in ["UserData/slot.sud", "bgi-resourceful/slot", "folder/bgi-user/slot"] {
+            assert!(!is_absolute_resource_path(path));
+        }
+    }
 
     #[test]
     fn marker_directory_prefix_keeps_the_target_quirks() {

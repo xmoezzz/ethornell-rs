@@ -1110,11 +1110,15 @@ mod tests {
         ethornell_core::init_tracing();
         let resource =
             PathBuf::from(std::env::var_os("ETHORNELL_RESTRICTED_REPRO_GAME").expect("game copy"));
-        let user = std::env::temp_dir().join(format!(
+        // An explicitly supplied private user root permits cross-session
+        // save/load repros. The default remains a disposable fresh root.
+        let retained_user = std::env::var_os("ETHORNELL_RESTRICTED_REPRO_USER_ROOT").map(PathBuf::from);
+        let user = retained_user.clone().unwrap_or_else(|| std::env::temp_dir().join(format!(
             "ethornell-restricted-startup-{}",
             std::process::id(),
-        ));
-        std::fs::create_dir(&user).unwrap();
+        )));
+        if retained_user.is_some() { std::fs::create_dir_all(&user).unwrap(); }
+        else { std::fs::create_dir(&user).unwrap(); }
         let outcome = (|| -> Result<()> {
             let mut host = HostRuntime::create(HostConfig {
                 resource_root: resource,
@@ -1193,7 +1197,7 @@ mod tests {
                 Ok(())
             })
         })();
-        std::fs::remove_dir_all(user).unwrap();
+        if retained_user.is_none() { std::fs::remove_dir_all(user).unwrap(); }
         outcome.unwrap();
     }
 
