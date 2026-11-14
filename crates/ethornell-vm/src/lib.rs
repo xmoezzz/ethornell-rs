@@ -6827,7 +6827,7 @@ impl Vm {
             && matches!((opcode.group, opcode.id), (0x81, 0x00) | (0x91, 0x09) | (0x92, 0x99))
         { return true; }
         if self.native_abi_profile==NativeAbiProfile::Amachoco && opcode.group==0x81 && matches!(opcode.id,0x21|0xD8|0xDA) {return true;}
-        if self.native_abi_profile == NativeAbiProfile::Anipani && (opcode.group, opcode.id) == (0x91, 0x09) { return true; }
+        if self.native_abi_profile == NativeAbiProfile::Anipani && opcode.group == 0x91 && matches!(opcode.id, 0x09 | 0x0a) { return true; }
         if matches!(self.native_abi_profile, NativeAbiProfile::HoukagoFd | NativeAbiProfile::Modern)
             && matches!((opcode.group, opcode.id), (0x81, 0x00..=0x03) | (0x91, 0x05 | 0x09..=0x0a) | (0x92, 0x0e | 0x95 | 0x99))
         { return true; }

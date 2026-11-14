@@ -3,6 +3,31 @@ use std::path::{Path, PathBuf};
 
 use super::find_runtime_resource;
 
+/// Reads through immutable archive indices only. Native composite members
+/// contain install-relative paths, not just basenames; virtual resource roots
+/// select the same held archive descriptors and never authorize loose host IO.
+pub(crate) fn indexed_archive_entry(
+    manager: &ResourceManager,
+    archive: &str,
+    entry: &str,
+) -> Option<ethornell_archive::ResourceEntry> {
+    if named_archive(archive) { return find_runtime_resource(manager, archive, entry); }
+    let normalized = archive.replace('\\', "/");
+    let relative = normalized.strip_prefix("bgi-resource/").unwrap_or(&normalized);
+    if relative.is_empty() || relative.split('/').any(|part| {
+        part.is_empty() || matches!(part, "." | "..") || part.contains([':', '\0'])
+    }) || relative.starts_with("bgi-user/") { return None; }
+    if normalized.starts_with("bgi-resource/") && named_archive(relative) {
+        return find_runtime_resource(manager, relative, entry);
+    }
+    let index = manager.archives().archives.iter().find(|index| {
+        index.path.strip_prefix(&manager.archives().root).is_ok_and(|path| {
+            path.to_string_lossy().replace('\\', "/").eq_ignore_ascii_case(relative)
+        })
+    })?;
+    manager.find_in_archive_path(&index.path, entry)
+}
+
 pub(crate) fn authorized_archive_arg(archive: &str) -> bool {
     let normalized = archive.replace('\\', "/");
     is_empty_archive_arg(archive)
@@ -325,7 +350,7 @@ pub(crate) fn runtime_file_exists_from_root(
         let Some(name) = scoped_name(archive, file) else {
             return false;
         };
-        if policy.metadata(&name).is_some_and(|m| m.is_file()) {
+        if policy.user_metadata(&name).is_some_and(|m| m.is_file()) {
             return true;
         }
         if name.replace('\\', "/").starts_with("bgi-") {
@@ -403,7 +428,9 @@ pub(crate) fn read_runtime_bytes(
             let entry = find_runtime_resource(manager, archive, file)?;
             return manager.read_by_entry_decoded(&entry).ok();
         }
-        let file = scoped_name(archive, file)?;
+        // Native file reads share the user-data aliases used by writes,
+        // existence and size queries. Original installed saves stay separate.
+        let file = super::file_policy::user_data_alias(&scoped_name(archive, file)?);
         let file = file.as_str();
         match policy.read_loose(file) {
             Ok(bytes) => return Some(bytes),

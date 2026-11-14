@@ -20,6 +20,7 @@ mod debug_trace;
 mod display_tree;
 mod effects;
 mod file_policy;
+mod native_profile;
 mod frame_presenter;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
@@ -31,6 +32,7 @@ mod graph_bitmap_nodes;
 mod graph_color;
 mod graph_config;
 mod font_transform;
+mod game_font;
 mod graph_defaults;
 mod graph_effect;
 #[cfg(not(any(target_os = "vita", target_os = "horizon")))]
@@ -253,6 +255,12 @@ impl Default for NativeRuntimeProfile {
 }
 
 fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
+    let mut profile = resource_native_profile(manager, bootstrap);
+    native_profile::apply(manager, &mut profile);
+    profile
+}
+
+fn resource_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
     // Session version detection uses confirmed code-resource pairs,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
@@ -377,8 +385,6 @@ pub fn show_error(title: &str, text: &str) {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
-    let font = snapshot::load_default_font()?;
-    let _font_session = snapshot::enter_font_session(&font);
     let headless = config.headless || std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some();
     // A full recursive magic probe opens every loose file in the game tree and
     // is diagnostic work, not runtime initialization. Keep it behind --trace;
@@ -395,6 +401,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         );
     }
     let manager = ResourceManager::open_game(config.game_root.path())?;
+    let manager = if config.script.is_none() { manager.for_native_bootstrap(None)? } else { manager };
     tracing::info!(
         archives = manager.archives().archives.len(),
         resources = manager.resource_count(),
@@ -411,6 +418,8 @@ pub fn run(config: AppConfig) -> Result<()> {
     };
     #[cfg(not(desktop_host))]
     let encoding = encoding_rs::SHIFT_JIS;
+    let font = snapshot::load_game_font(config.game_root.path(), encoding == encoding_rs::GBK)?;
+    let _font_session = snapshot::enter_font_session(&font);
     let bgm = load_runtime_bgm(&manager);
     let native_root = game_root_path(&manager);
     tracing::info!(
@@ -428,30 +437,22 @@ pub fn run(config: AppConfig) -> Result<()> {
         manager.read_decoded_from_archive("system.arc", "ipl._bp")
     };
     tracing::info!(script = startup_script, "selected runtime bootstrap script");
-    let runtime = match Some(startup_script) {
-        Some(script) => match startup_bytes {
-            Ok(bytes) => Some(RuntimeEngine::new(
-                script,
-                &bytes,
-                manager.clone(),
-                native_root,
-                config.trace,
-                config.fail_on_stub,
-                !headless,
-                encoding,
-            )),
-            Err(err) => {
-                tracing::warn!(script, %err, "startup script unavailable");
-                None
-            }
-        },
-        None => None,
-    };
-    let image = if runtime.is_some() {
-        None
-    } else {
-        Some(load_runtime_image(&manager)?)
-    };
+    // A title bitmap cannot substitute for a running interpreter: it has no
+    // native button objects, input handlers or title script state.
+    let bytes = startup_bytes.map_err(|error| EthornellError::Other(format!(
+        "native bootstrap {startup_script} could not be loaded: {error}"
+    )))?;
+    let runtime = Some(RuntimeEngine::new(
+        startup_script,
+        &bytes,
+        manager.clone(),
+        native_root,
+        config.trace,
+        config.fail_on_stub,
+        !headless,
+        encoding,
+    ));
+    let image: Option<DecodedImage> = None;
     if config.trace
         && let Some(image) = image.as_ref()
     {
@@ -2476,7 +2477,7 @@ impl RuntimeTraceApi {
                 return -1;
             };
             let explicit = name.replace('\\', "/").starts_with("bgi-");
-            let metadata = policy.metadata(&name).or_else(|| {
+            let metadata = policy.user_metadata(&name).or_else(|| {
                 if explicit {
                     None
                 } else {
@@ -7643,13 +7644,25 @@ impl RuntimeTraceApi {
             }
         }
         self.store_graph_image(composite_key.clone(), destination_image);
-        self.graph_resources.insert(
-            destination,
-            RuntimeGraphResource::whole(composite_key.clone()),
-        );
+        // sub_40A9E0 writes the existing bitmap's pixels; it does not allocate
+        // another descriptor. Keep the binding generation, just as 90:15
+        // does, so eye/mouth blits do not invalidate live projected sprites.
+        // SugarStyle's 484020 -> 402980 likewise resolves the existing
+        // descriptors via 4085F0 before 40AC60, without allocating a slot.
+        // Keep the writable copy separate from shared decoded archive images.
+        if let Some(binding) = self.graph_resources.get_mut(&destination) {
+            binding.key = composite_key.clone();
+            binding.source_rect = None;
+        } else {
+            self.graph_resources.insert(
+                destination,
+                RuntimeGraphResource::whole(composite_key.clone()),
+            );
+        }
         if let Some(surface) = self.graph_surfaces.get_mut(&destination) {
             surface.resource_id = Some(destination);
         }
+        self.refresh_bitmap_nodes(destination);
         Some(composite_key)
     }
 
@@ -9710,7 +9723,8 @@ impl RuntimeEngine {
             }
             None => self.api.native_root.clone(),
         };
-        let manager = match ResourceManager::open_game(&native_root) {
+        let manager = match ResourceManager::open_game(&native_root).and_then(|manager|
+            manager.for_native_bootstrap(self.api.manager.archive_language())) {
             Ok(manager) => manager,
             Err(err) => {
                 tracing::warn!(%err, root = %native_root.display(), "bootstrap root unusable");
@@ -22369,7 +22383,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn read_disk_file(&mut self, path: &str) -> Option<Vec<u8>> {
         if let Some(policy) = file_policy::active() {
-            return policy.read_loose(path).ok();
+            return policy.read_loose(&file_policy::user_data_alias(path)).ok();
         }
         let host = find_runtime_file_from_root(&self.manager, &self.native_root, "", path)?;
         host.is_file().then(|| std::fs::read(&host).ok()).flatten()
@@ -22377,7 +22391,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn disk_file_exists(&mut self, path: &str) -> bool {
         if let Some(policy) = file_policy::active() {
-            return policy.metadata(path).is_some_and(|meta| !meta.is_dir());
+            return policy.user_metadata(path).is_some_and(|meta| !meta.is_dir());
         }
         find_runtime_file_from_root(&self.manager, &self.native_root, "", path)
             .is_some_and(|host| host.is_file())
@@ -22388,13 +22402,20 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             return None;
         }
         if file_policy::active().is_some() {
-            return read_runtime_bytes(&self.manager, archive, entry);
+            // The VM owns DSC/SDC decoding and native archive status codes.
+            // Return packed bytes from an indexed descriptor, including for
+            // composite members named Archive\\data01000.arc.
+            let found = user_files::indexed_archive_entry(&self.manager, archive, entry)?;
+            return self.manager.read_by_entry_raw(&found).ok();
         }
         let found = find_runtime_resource(&self.manager, archive, entry)?;
         self.manager.read_by_entry_raw(&found).ok()
     }
 
     fn archive_entry_exists(&mut self, archive: &str, entry: &str) -> bool {
+        if file_policy::restricted() {
+            return user_files::indexed_archive_entry(&self.manager, archive, entry).is_some();
+        }
         !is_empty_archive_arg(archive)
             && find_runtime_resource(&self.manager, archive, entry).is_some()
     }
@@ -22593,6 +22614,16 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn user_ui_language(&mut self) -> i32 {
+        use ethornell_archive::ArchiveLanguage;
+        if let Some(language) = self.manager.archive_language() {
+            return match language {
+                ArchiveLanguage::Japanese => 0x0411,
+                ArchiveLanguage::English => 0x0409,
+                ArchiveLanguage::SimplifiedChinese => 0x0804,
+                ArchiveLanguage::TraditionalChinese => 0x0404,
+                ArchiveLanguage::Korean => 0x0412,
+            };
+        }
         let locale = std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES"))
             .or_else(|_| std::env::var("LANG")).unwrap_or_default().to_ascii_lowercase();
         if locale.starts_with("ja") { 0x0411 }
@@ -24324,14 +24355,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0x2a) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                if let Some(policy) = file_policy::active() {
-                    return Ok(ethornell_vm::Value::Int(i32::from(
-                        policy.metadata(&path).is_some_and(|m| m.is_dir()),
-                    )));
-                }
-                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
-                    .map(|path| path.is_dir())
-                    .unwrap_or(false);
+                // Match validated user-root checks (80:68) and directory
+                // creation: resource/UserData is a private storage alias.
+                let exists = ethornell_vm::SysApi::directory_exists(self, &path);
                 tracing::info!(path, exists, "DirectoryExists");
                 return Ok(ethornell_vm::Value::Int(i32::from(exists)));
             }
@@ -30022,7 +30048,7 @@ fn windows_wildcard_matches(pattern: &str, value: &str) -> bool {
 fn runtime_file_attributes(manager: &ResourceManager, file: &str) -> i32 {
     if let Some(policy) = file_policy::active() {
         return policy
-            .metadata(file)
+            .user_metadata(file)
             .map(|m| (if m.readonly() { 1 } else { 0 }) | if m.is_dir() { 0x10 } else { 0x20 })
             .unwrap_or(-1);
     }
