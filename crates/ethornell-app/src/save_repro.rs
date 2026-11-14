@@ -89,6 +89,7 @@ fn game_input_repro() {
     for frame in 0..frames {
         if let Some(control) = control.as_ref() {
             if batch_frames == 0 || control.exists() {
+                runtime.api.trace_render_snapshot(frame, None);
                 if let Some(path) = snapshot_path.as_ref() {
                     snapshot::write_runtime_snapshot(&runtime.api, path).unwrap();
                 }
