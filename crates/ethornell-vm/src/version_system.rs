@@ -6,7 +6,7 @@ use crate::*;
 /// ASCII is ambiguous (80000000); a non-UTF-8 prefix selects CP932 (0).
 /// The original stops after three/six multi-byte sequences, even if a later
 /// suffix would be invalid. This is not Rust's whole-buffer UTF-8 validation.
-fn encoding_kind(bytes: &[u8], limit: usize) -> i32 {
+pub(super) fn encoding_kind(bytes: &[u8], limit: usize) -> i32 {
     let (mut at, mut count) = (0, 0);
     while let Some(&byte) = bytes.get(at).filter(|&&b| b != 0) {
         if byte < 0x80 {
@@ -56,6 +56,123 @@ pub(super) fn encode_cp932(text: &str) -> Vec<u8> {
         }
     }
     output
+}
+
+/// 4F4640 encodes the original unsigned delimiter, including the older
+/// five/six-byte UTF-8 forms. Rust char rejects those native input values.
+pub(super) fn encode_utf8_codepoint(value: u32) -> Vec<u8> {
+    let width = match value {
+        0..=0x7f => return vec![value as u8],
+        0x80..=0x7ff => 2,
+        0x800..=0xffff => 3,
+        0x10000..=0x1fffff => 4,
+        0x200000..=0x3ffffff => 5,
+        0x4000000..=0x7fffffff => 6,
+        _ => return Vec::new(),
+    };
+    let mut bytes = vec![(0xffu8 << (8 - width)) | (value >> (6 * (width - 1))) as u8];
+    for shift in (0..width - 1).rev() {
+        bytes.push(0x80 | ((value >> (6 * shift)) & 0x3f) as u8);
+    }
+    bytes
+}
+
+fn utf8_character(bytes: &[u8]) -> VmResult<(u32, usize)> {
+    let first = bytes.first().copied().unwrap_or(0);
+    if first < 0x80 { return Ok((u32::from(first), 1)); }
+    let width = first.leading_ones() as usize;
+    if !(2..=6).contains(&width) || bytes.get(1..width)
+        .is_none_or(|tail| tail.iter().any(|b| b & 0xc0 != 0x80)) {
+        return Err(VmError::Runtime("invalid native UTF-8 character".into()));
+    }
+    let mut value = u32::from(first & ((1 << (7 - width)) - 1));
+    for &byte in &bytes[1..width] { value = (value << 6) | u32::from(byte & 0x3f); }
+    Ok((value, width))
+}
+
+/// 49EE40 / 1400F61C0: consumed byte count, native character value and
+/// full-cell flag. UTF-8 also accepts the target's CESU-8 surrogate pairs.
+pub(super) fn character_info(bytes: &[u8], kind: i32) -> VmResult<(usize, u32, bool)> {
+    let first = bytes.first().copied().unwrap_or(0);
+    match kind {
+        1 => {
+            let (mut value, mut width) = utf8_character(bytes)?;
+            if (0xd800..=0xdbff).contains(&value) && width < bytes.len() {
+                let (low, tail) = utf8_character(&bytes[width..])?;
+                if (0xdc00..=0xdfff).contains(&low) {
+                    value = 0x10000 + ((value - 0xd800) << 10) + low - 0xdc00;
+                    width += tail;
+                }
+            }
+            Ok((width, value, value.wrapping_sub(128) <= 0xfee0 || value >= 0xffa0))
+        }
+        i32::MIN => Ok((1, u32::from(first), false)),
+        _ => {
+            // The native CP932 lead test includes FF, but excludes FD/FE.
+            let double = first.wrapping_add(96) > 0x3f && first > 0x80 && !matches!(first, 0xfd | 0xfe);
+            let value = if double { (u32::from(first) << 8) | u32::from(bytes.get(1).copied().unwrap_or(0)) }
+                else { u32::from(first) };
+            Ok((if double { 2 } else { 1 }, value, double))
+        }
+    }
+}
+
+pub(super) fn unicode_delimiter(value: u32) -> bool {
+    // The UTF-16 delimiter table referenced by 140068D70.
+    ",.､｡:;?!ﾞﾟ･、。，．：；？！゛゜‐]})）〕］｝〉》」』】‘“".chars().any(|ch| ch as u32 == value)
+}
+
+/// 49EF90 / 1400F5E20 compares native characters and returns a BYTE
+/// offset. It resets after a mismatch without retrying an overlapping start.
+pub(super) fn find_native_string(haystack: &[u8], needle: &[u8], kind: i32) -> VmResult<Option<usize>> {
+    // The original multibyte helper reads an uninitialized item for an empty
+    // needle. Define the portable result consistently with its ASCII strstr.
+    if needle.is_empty() { return Ok(Some(0)); }
+    if kind == i32::MIN {
+        return Ok(haystack.windows(needle.len()).position(|part| part == needle));
+    }
+    let mut characters = Vec::new();
+    let mut at = 0;
+    while at < needle.len() {
+        let (width, value, _) = character_info(&needle[at..], kind)?;
+        characters.push(value);
+        at += width;
+    }
+    let (mut at, mut matched, mut start) = (0, 0, 0);
+    while at < haystack.len() {
+        let (width, value, _) = character_info(&haystack[at..], kind)?;
+        if value == characters[matched] {
+            if matched == 0 { start = at; }
+            matched += 1;
+            if matched == characters.len() { return Ok(Some(start)); }
+        } else { matched = 0; }
+        at += width;
+    }
+    Ok(None)
+}
+
+pub(super) fn replace_native_string(haystack: &[u8], needle: &[u8], replacement: &[u8], limit: usize, utf8: bool) -> VmResult<(Vec<u8>, i32)> {
+    // The native empty-needle replacement loop never advances. Keep the
+    // portable runtime's defined no-op instead of reproducing that fault.
+    if needle.is_empty() { return Ok((haystack.to_vec(), 0)); }
+    let kind = encoding_kind(haystack, limit);
+    let target_utf8 = if kind == i32::MIN { utf8 } else { kind == 1 };
+    let replacement_kind = encoding_kind(replacement, limit);
+    let converted = if replacement_kind == i32::MIN || (replacement_kind == 1) == target_utf8 {
+        replacement.to_vec()
+    } else {
+        let text = decode_auto(replacement, limit);
+        if target_utf8 { text.into_bytes() } else { encode_cp932(&text) }
+    };
+    let (mut output, mut rest, mut count) = (Vec::new(), haystack, 0);
+    while let Some(at) = find_native_string(rest, needle, kind)? {
+        output.extend_from_slice(&rest[..at]);
+        output.extend_from_slice(&converted);
+        rest = rest.get(at + needle.len()..).ok_or_else(|| VmError::Runtime("native replacement span exceeds source".into()))?;
+        count += 1;
+    }
+    output.extend_from_slice(rest);
+    Ok((output, count))
 }
 
 impl Vm {

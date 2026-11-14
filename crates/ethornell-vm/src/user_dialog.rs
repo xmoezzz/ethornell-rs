@@ -182,7 +182,7 @@ impl Vm {
     }
 
     /// The bytes `write_c_string_bounded` stores: the longest prefix whose
-    /// Shift-JIS form fits `max_bytes` without splitting a character, in the
+    /// native encoded form fits `max_bytes` without splitting a character,
     /// native string encoding, NUL-terminated.
     fn bounded_c_string_write(
         &self,
@@ -193,16 +193,9 @@ impl Vm {
         if address == 0 {
             return Err(VmError::Runtime("null writable Shift-JIS string pointer".into()));
         }
-        let mut bounded = String::new();
-        for ch in text.chars() {
-            let mut candidate = bounded.clone();
-            candidate.push(ch);
-            if encoding_rs::SHIFT_JIS.encode(&candidate).0.len() > max_bytes {
-                break;
-            }
-            bounded.push(ch);
-        }
-        let mut bytes = self.encode_native_string(&bounded).into_owned();
+        // Use the same encoding and capacity calculation as synchronous
+        // dialogs. Counting CP932 and writing UTF-8 overruns guest fields.
+        let mut bytes = self.bounded_native_string_bytes(text, max_bytes);
         bytes.push(0);
         Ok(HostMemoryWrite { address, bytes })
     }
