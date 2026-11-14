@@ -58,6 +58,7 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
+#[cfg(feature = "mp4-h264")]
 mod mp4_movie;
 mod native_background;
 mod native_background_effect;
@@ -735,7 +736,7 @@ enum MovieReadBuffer {
     Cdram(Option<VitaMovieReadBuffer>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MovieBytes {
     Heap(std::sync::Arc<[u8]>),
     #[cfg(target_os = "vita")]
@@ -2732,7 +2733,11 @@ impl RuntimeTraceApi {
             .read_by_entry_decoded_into(&entry, &mut bytes)
             .is_err()
         {
-            self.image_decode_buffer = bytes;
+            self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+                bytes
+            } else {
+                Vec::new()
+            };
             return false;
         }
 
@@ -26546,7 +26551,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x03) => {
                 // sub_479F60 -> sub_439C80: a new DCCache of `limit` bytes
-                // (the SDK applies its resident-memory cap; 0 drops it); more than 0x20000000 is fatal.
+                // (0 drops it); more than 0x20000000 is fatal.
                 let limit = pop_int_value(stack).unwrap_or_default() as u32;
                 if limit > 0x2000_0000 {
                     return Err(ethornell_vm::VmError::Runtime(format!(

@@ -11,6 +11,9 @@ build = "build.rs"
 name = "ethornell_mobile"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+mp4-h264 = ["ethornell-app/mp4-h264"]
+
 [dependencies]
 ethornell-app = { path = "../ethornell-app", default-features = false, features = ["host-driven"] }
 

@@ -1,659 +1,777 @@
-//! ISO Base Media File Format (MP4) demuxing and software movie decoding.
-//!
-//! Container parsing is delegated to `rff-format-mp4`; this module owns the
-//! decoded packet timeline and conversion into the engine's frame/audio types.
-
+//! Optional MP4/H.264/AAC-LC playback. The container yields Annex-B samples,
+//! including SPS/PPS. Display PTS follows each picture through B-frame reorder;
+//! neither average frame duration nor integer milliseconds select pictures.
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Cursor;
-use std::ops::Range;
 
 use ethornell_image::DecodedImage;
-use rff_core::{CodecId, Error as DemuxError, MediaType};
-use rff_format::FormatRegistry;
-use rust_h264::decoder::{Frame as H264Frame, OrderedDecoder as H264Decoder};
-use rust_h264::nal::parse_annex_b;
-use rusty_av1d::rust_api::{Decoder as Av1Decoder, Picture as Av1Picture, PlanarImageComponent};
-use rusty_vp9::{DecodedFrame as Vp9Frame, Error as Vp9Error, Vp9Decoder};
+use rff_core::{CodecId, Error as DemuxError, MediaType, Rational};
+use rff_format::{Demuxer, FormatRegistry, Stream};
+use rust_h264::decoder::{Frame, OrderedDecoder};
+use rust_h264::nal::{NalUnitType, parse_annex_b};
 
 use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
 
-struct PacketRange {
-    pts: Option<i64>,
-    duration: i64,
-    range: Range<usize>,
-}
+const MAX_PENDING_FRAMES: usize = 32;
+const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FRAME_PIXELS: usize = 4096 * 4096;
 
-#[derive(Clone, Copy)]
-enum CodecKind {
-    H264,
-    Vp9,
-    Av1,
+#[derive(Clone, Copy, Debug)]
+struct Color {
+    matrix: u8,
+    full_range: bool,
 }
-
-enum VideoDecoder {
-    H264(H264Decoder),
-    Vp9(Vp9Decoder),
-    Av1(Av1Decoder),
+impl Default for Color {
+    fn default() -> Self {
+        Self {
+            matrix: 2,
+            full_range: false,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    pts: i64,
+    color: Color,
+}
+struct TimedFrame {
+    frame: Frame,
+    timing: Timing,
 }
 
 pub(crate) struct Mp4MovieDecoder {
-    source: Vec<u8>,
-    packets: Vec<PacketRange>,
-    decoder: VideoDecoder,
-    pending_frames: VecDeque<DecodedImage>,
-    packet_index: usize,
-    codec: CodecKind,
-    width: u32,
-    height: u32,
-    frame_interval_ms: i32,
+    source: MovieBytes,
+    demuxer: Box<dyn Demuxer>,
+    video_index: usize,
+    time_base: Rational,
+    decoder: OrderedDecoder<Timing>,
+    pending: VecDeque<TimedFrame>,
+    current: Option<TimedFrame>,
+    delivered: bool,
+    color: Color,
+    size: (u32, u32),
     duration_ms: i32,
+    audio_start_ms: i32,
     audio: Option<StreamBytes>,
-    flushed: bool,
+    requested_ms: i32,
+    frame_index: Option<usize>,
+    eof: bool,
     failed: bool,
 }
-
 impl fmt::Debug for Mp4MovieDecoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let codec = match self.codec {
-            CodecKind::H264 => "h264",
-            CodecKind::Vp9 => "vp9",
-            CodecKind::Av1 => "av1",
-        };
         f.debug_struct("Mp4MovieDecoder")
-            .field("codec", &codec)
-            .field("width", &self.width)
-            .field("height", &self.height)
+            .field("size", &self.size)
             .field("duration_ms", &self.duration_ms)
-            .field("packet_index", &self.packet_index)
-            .field("packet_count", &self.packets.len())
-            .finish_non_exhaustive()
+            .field("pending_frames", &self.pending.len())
+            .field("failed", &self.failed)
+            .finish()
     }
 }
-
+fn open(source: MovieBytes) -> Option<(Box<dyn Demuxer>, Vec<Stream>)> {
+    let mut registry = FormatRegistry::new();
+    rff_format_mp4::register(&mut registry);
+    let mut demuxer = registry
+        .open_demuxer_seekable("mp4", Box::new(Cursor::new(source)))
+        .ok()?;
+    let streams = demuxer.read_header().ok()?;
+    Some((demuxer, streams))
+}
 impl Mp4MovieDecoder {
     pub(crate) fn supports_resource(resource: &str) -> bool {
         resource
             .rsplit_once('.')
-            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("mp4"))
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("mp4"))
     }
-
     pub(crate) fn probe(bytes: &[u8]) -> bool {
-        format_registry().probe(bytes).is_some()
+        bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
     }
-
-    pub(crate) fn new(bytes: MovieBytes, resource: &str) -> Option<Self> {
-        let bytes_slice = bytes.as_slice();
-        let extension = resource
-            .rsplit_once('.')
-            .map(|(_, extension)| extension.to_ascii_lowercase());
-        let registry = format_registry();
-        let format_name = extension
-            .as_deref()
-            .and_then(|extension| registry.by_extension(extension).map(|format| format.name))
-            .or_else(|| registry.probe(bytes_slice).map(|format| format.name))?;
-        let mut demuxer = registry
-            .open_demuxer_seekable(format_name, Box::new(Cursor::new(bytes)))
-            .ok()?;
-        let streams = demuxer.read_header().ok()?;
-        let video = streams
-            .iter()
-            .find(|stream| stream.media_type == MediaType::Video)?;
-        let codec = match video.codec_id {
-            CodecId::H264 => CodecKind::H264,
-            CodecId::Vp9 => CodecKind::Vp9,
-            CodecId::Avif => CodecKind::Av1,
-            _ => return None,
-        };
-        let video_index = video.index;
-        let width = video.width;
-        let height = video.height;
-        let time_base = video.time_base;
-        let duration_ms = video
-            .duration
-            .map(|duration| ticks_to_ms(duration, time_base))
-            .unwrap_or_default();
-        let frame_count = video.nb_frames;
-        let decoder = new_decoder(codec)?;
-        let mut source = Vec::new();
-        let mut packets = Vec::new();
-        let mut audio = Vec::new();
-        let mut audio_written = false;
-        let audio_stream = streams.iter().find(|stream| {
-            stream.media_type == MediaType::Audio && stream.codec_id == CodecId::Aac
-        });
-        let mut audio_config = audio_stream.map(|stream| {
-            AacConfig::from_stream(stream.sample_rate, stream.channels, &stream.extradata)
-        });
-        let audio_index = audio_stream.map(|stream| stream.index);
-        let mut first_packet_duration = None;
-        let mut last_video_end_ms = 0_i64;
-
-        loop {
-            let packet = match demuxer.read_packet() {
-                Ok(packet) => packet,
-                Err(DemuxError::Eof) => break,
-                Err(_) => return None,
-            };
-            if packet.stream_index == video_index {
-                if first_packet_duration.is_none() && packet.duration > 0 {
-                    // Packet timestamps are expressed in the stream's time
-                    // base; `Packet::time_base` is only a default the
-                    // containers do not all fill in, so a 1000-tick frame at
-                    // timescale 24000 must not be read as a 1000 ms frame.
-                    first_packet_duration = Some(ticks_to_ms(packet.duration, time_base));
-                }
-                if let (Some(pts), Some(duration)) = (packet.pts, Some(packet.duration.max(0))) {
-                    last_video_end_ms = last_video_end_ms.max(i64::from(ticks_to_ms(
-                        pts.saturating_add(duration),
-                        time_base,
-                    )));
-                }
-                let start = source.len();
-                source.extend_from_slice(&packet.data);
-                packets.push(PacketRange {
-                    pts: packet.pts,
-                    duration: packet.duration,
-                    range: start..source.len(),
-                });
-            } else if Some(packet.stream_index) == audio_index {
-                if let Some(config) = audio_config.as_mut() {
-                    if let Some(header) = config.adts_header(packet.data.len()) {
-                        audio.extend_from_slice(&header);
-                        audio.extend_from_slice(&packet.data);
-                        audio_written = true;
-                    }
-                }
-            }
-        }
-        if packets.is_empty() || source.is_empty() {
+    pub(crate) fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
+        let (mut scan, streams) = open(source.clone())?;
+        let video = streams.iter().find(|s| s.media_type == MediaType::Video)?;
+        if video.codec_id != CodecId::H264 || video.time_base.num <= 0 || video.time_base.den <= 0 {
+            tracing::warn!(codec=?video.codec_id, "mp4-h264 requires an H.264 video track with valid timestamps");
             return None;
         }
-        let duration_ms = if duration_ms > 0 {
-            duration_ms
-        } else {
-            last_video_end_ms.clamp(0, i32::MAX as i64) as i32
+        let size = (video.width, video.height);
+        let pixels = (size.0 as usize).checked_mul(size.1 as usize)?;
+        if pixels == 0 || pixels > MAX_FRAME_PIXELS {
+            return None;
+        }
+        let video_index = video.index;
+        let time_base = video.time_base;
+        let audio_track = streams.iter().find(|s| s.media_type == MediaType::Audio);
+        let audio_config = match audio_track {
+            Some(track) if track.codec_id == CodecId::Aac => {
+                Some(AacConfig::from_stream(&track.extradata)?)
+            }
+            Some(track) => {
+                tracing::warn!(codec=?track.codec_id, "mp4-h264 supports AAC-LC movie audio");
+                return None;
+            }
+            None => None,
         };
-        // Average the stream's own duration over its pictures first: it needs
-        // no per-packet timing and stays right for every container. A single
-        // packet duration is the last resort before the 30 fps assumption.
-        let frame_interval_ms = frame_count
-            .filter(|count| *count > 1)
-            .map(|count| duration_ms / count.min(i32::MAX as u64) as i32)
-            .filter(|interval| *interval > 0)
-            .or_else(|| {
-                (duration_ms > 0 && packets.len() > 1)
-                    .then(|| duration_ms / packets.len() as i32)
-                    .filter(|interval| *interval > 0)
-            })
-            .or(first_packet_duration.filter(|duration| *duration > 0))
-            .unwrap_or(33)
-            .clamp(1, 1000);
-
-        Some(Self {
+        // The existing audio host consumes compressed elementary streams.
+        // Scan AAC once; do not duplicate the compressed video or retain an
+        // RGBA timeline. The retained MovieBytes keeps Vita CDRAM ownership.
+        let mut audio = Vec::new();
+        let mut audio_start_ms = None;
+        let mut duration_ms = video.duration.map(|n| end_ms(n, time_base)).unwrap_or(0);
+        loop {
+            let packet = match scan.read_packet() {
+                Ok(packet) => packet,
+                Err(DemuxError::Eof) => break,
+                Err(error) => {
+                    tracing::warn!(?error, "MP4 packet scan failed");
+                    return None;
+                }
+            };
+            if packet.stream_index == video_index {
+                let pts = packet.pts.or(packet.dts)?;
+                duration_ms = duration_ms.max(end_ms(
+                    pts.saturating_add(packet.duration.max(0)),
+                    time_base,
+                ));
+            } else if let Some(track) = audio_track.filter(|s| s.index == packet.stream_index) {
+                if track.time_base.num <= 0 || track.time_base.den <= 0 {
+                    return None;
+                }
+                let pts = packet.pts.or(packet.dts)?;
+                audio_start_ms.get_or_insert(signed_ms(pts, track.time_base));
+                duration_ms = duration_ms.max(end_ms(
+                    pts.saturating_add(packet.duration.max(0)),
+                    track.time_base,
+                ));
+                let header = audio_config.as_ref()?.adts_header(packet.data.len())?;
+                if audio.len().checked_add(header.len() + packet.data.len())? > MAX_AUDIO_BYTES {
+                    return None;
+                }
+                audio.extend_from_slice(&header);
+                audio.extend_from_slice(&packet.data);
+            }
+        }
+        drop(scan);
+        if duration_ms <= 0 {
+            return None;
+        }
+        let (demuxer, _) = open(source.clone())?;
+        let mut movie = Self {
             source,
-            packets,
-            decoder,
-            pending_frames: VecDeque::new(),
-            packet_index: 0,
-            codec,
-            width,
-            height,
-            frame_interval_ms,
+            demuxer,
+            video_index,
+            time_base,
+            decoder: OrderedDecoder::new(),
+            pending: VecDeque::new(),
+            current: None,
+            delivered: false,
+            color: Color::default(),
+            size,
             duration_ms,
-            audio: audio_written.then(|| StreamBytes(audio.into())),
-            flushed: false,
+            audio_start_ms: audio_start_ms.unwrap_or(0),
+            audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
+            requested_ms: 0,
+            frame_index: None,
+            eof: false,
             failed: false,
-        })
+        };
+        // Fail configuration if no picture can be decoded, rather than
+        // acknowledging a movie that will only play its soundtrack.
+        let first = movie.next_frame()?;
+        movie.pending.push_front(first);
+        Some(movie)
     }
-
     pub(crate) fn duration_ms(&self) -> i32 {
         self.duration_ms
     }
-
-    pub(crate) fn frame_interval_ms(&self) -> i32 {
-        self.frame_interval_ms
+    pub(crate) fn audio_start_ms(&self) -> i32 {
+        self.audio_start_ms
     }
-
     pub(crate) fn size(&self) -> Option<(u32, u32)> {
-        (self.width > 0 && self.height > 0).then_some((self.width, self.height))
+        Some(self.size)
     }
-
     pub(crate) fn take_audio(&mut self) -> Option<StreamBytes> {
         self.audio.take()
     }
-
-    pub(crate) fn reset(&mut self) -> bool {
-        let Some(decoder) = new_decoder(self.codec) else {
-            self.failed = true;
-            return false;
-        };
-        self.decoder = decoder;
-        self.pending_frames.clear();
-        self.packet_index = 0;
-        self.flushed = false;
-        self.failed = false;
-        true
+    pub(crate) fn frame_index(&self) -> Option<usize> {
+        self.frame_index
     }
-
-    pub(crate) fn next_frame(&mut self) -> Option<DecodedImage> {
+    pub(crate) fn invalidate_delivery(&mut self) {
+        self.delivered = false;
+    }
+    pub(crate) fn reset(&mut self) {
+        self.pending.clear();
+        self.current = None;
+        self.delivered = false;
+        self.frame_index = None;
+        self.requested_ms = 0;
+        self.color = Color::default();
+        self.decoder = OrderedDecoder::new();
+        self.eof = false;
+        self.failed = false;
+        match open(self.source.clone()) {
+            Some((demuxer, _)) => self.demuxer = demuxer,
+            None => self.failed = true,
+        }
+    }
+    pub(crate) fn frame_at(&mut self, position_ms: i32) -> Option<DecodedImage> {
+        let position_ms = position_ms.max(0);
+        if position_ms < self.requested_ms {
+            self.reset();
+        }
+        self.requested_ms = position_ms;
+        let mut selected = None;
         loop {
-            if let Some(frame) = self.pending_frames.pop_front() {
-                return Some(frame);
+            let frame = self.next_frame();
+            let Some(frame) = frame else {
+                break;
+            };
+            if !due(frame.timing.pts, self.time_base, position_ms) {
+                self.pending.push_front(frame);
+                break;
             }
-            if self.failed {
-                return None;
-            }
-            if let Some(packet) = self.packets.get(self.packet_index) {
-                let range = packet.range.clone();
-                let pts = packet.pts;
-                let duration = packet.duration;
-                self.packet_index += 1;
-                let data = self.source[range].to_vec();
-                if !self.decode_packet(&data, pts, duration) {
-                    self.failed = true;
-                }
-                continue;
-            }
-            if !self.flushed {
-                self.flushed = true;
-                if !self.flush_decoder() {
-                    self.failed = true;
-                }
-                continue;
-            }
+            self.frame_index = Some(self.frame_index.map_or(0, |index| index + 1));
+            selected = Some(frame);
+        }
+        if let Some(selected) = selected {
+            self.current = Some(selected);
+            self.delivered = false;
+        }
+        if self.delivered {
             return None;
         }
+        let selected = self.current.as_ref()?;
+        let image = h264_to_image(&selected.frame, selected.timing.color);
+        if image.is_none() {
+            self.failed = true;
+            tracing::warn!("unsupported MP4 picture layout/color metadata");
+        }
+        self.delivered = image.is_some();
+        image
     }
-
-    fn decode_packet(&mut self, data: &[u8], pts: Option<i64>, duration: i64) -> bool {
-        match &mut self.decoder {
-            VideoDecoder::H264(decoder) => {
-                for nal in parse_annex_b(data) {
-                    let Ok(frames) = decoder.decode_nal(&nal) else {
-                        return false;
-                    };
-                    self.pending_frames
-                        .extend(frames.into_iter().filter_map(h264_to_image));
-                }
-                true
+    fn next_frame(&mut self) -> Option<TimedFrame> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
             }
-            VideoDecoder::Vp9(decoder) => {
-                if decoder.push(data, pts).is_err() {
-                    return false;
-                }
-                drain_vp9(decoder, &mut self.pending_frames, false)
+            if self.failed || self.eof {
+                return None;
             }
-            VideoDecoder::Av1(decoder) => {
-                let data = data.to_vec().into_boxed_slice();
-                match decoder.send_data(data, None, pts, Some(duration)) {
-                    Ok(()) => drain_av1(decoder, &mut self.pending_frames),
-                    Err(rusty_av1d::Rav1dError::TryAgain) => {
-                        if !drain_av1(decoder, &mut self.pending_frames) {
-                            return false;
-                        }
-                        match decoder.send_pending_data() {
-                            Ok(()) => drain_av1(decoder, &mut self.pending_frames),
-                            Err(rusty_av1d::Rav1dError::TryAgain) => {
-                                drain_av1(decoder, &mut self.pending_frames)
-                            }
-                            Err(_) => false,
+            let packet = match self.demuxer.read_packet() {
+                Ok(packet) => packet,
+                Err(DemuxError::Eof) => {
+                    self.eof = true;
+                    let frames = self.decoder.flush_with_meta();
+                    if !self.queue(frames) {
+                        return None;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    self.failed = true;
+                    tracing::warn!(?error, "MP4 read failed");
+                    return None;
+                }
+            };
+            if packet.stream_index != self.video_index {
+                continue;
+            }
+            let Some(pts) = packet.pts.or(packet.dts) else {
+                self.failed = true;
+                return None;
+            };
+            let nals = parse_annex_b(&packet.data);
+            if nals.is_empty() {
+                self.failed = true;
+                return None;
+            }
+            for nal in nals {
+                if nal.nal_unit_type == NalUnitType::Sps {
+                    if let Some(color) = sps_color(&nal.rbsp) {
+                        self.color = color;
+                    } else {
+                        self.failed = true;
+                        return None;
+                    }
+                }
+                let timing = Timing {
+                    pts,
+                    color: self.color,
+                };
+                match self.decoder.decode_nal_with_meta(&nal, timing) {
+                    Ok(frames) => {
+                        if !self.queue(frames) {
+                            return None;
                         }
                     }
-                    Err(_) => false,
+                    Err(error) => {
+                        self.failed = true;
+                        tracing::warn!(?error, "MP4 H.264 decode failed");
+                        return None;
+                    }
                 }
             }
         }
     }
-
-    fn flush_decoder(&mut self) -> bool {
-        match &mut self.decoder {
-            VideoDecoder::H264(decoder) => {
-                self.pending_frames
-                    .extend(decoder.flush().into_iter().filter_map(h264_to_image));
-                true
-            }
-            VideoDecoder::Vp9(decoder) => {
-                decoder.flush();
-                drain_vp9(decoder, &mut self.pending_frames, true)
-            }
-            VideoDecoder::Av1(decoder) => {
-                decoder.flush();
-                drain_av1(decoder, &mut self.pending_frames)
-            }
+    fn queue(&mut self, frames: Vec<(Frame, Timing)>) -> bool {
+        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES {
+            self.failed = true;
+            tracing::warn!("MP4 picture queue exceeded its bound");
+            return false;
         }
+        self.pending.extend(
+            frames
+                .into_iter()
+                .map(|(frame, timing)| TimedFrame { frame, timing }),
+        );
+        true
     }
 }
-
-fn format_registry() -> FormatRegistry {
-    let mut registry = FormatRegistry::new();
-    rff_format_mp4::register(&mut registry);
-    registry
+fn due(pts: i64, base: Rational, position_ms: i32) -> bool {
+    pts as i128 * base.num as i128 * 1000 <= position_ms as i128 * base.den as i128
 }
-
-fn new_decoder(codec: CodecKind) -> Option<VideoDecoder> {
-    Some(match codec {
-        CodecKind::H264 => VideoDecoder::H264(H264Decoder::new()),
-        CodecKind::Vp9 => VideoDecoder::Vp9(Vp9Decoder::new()),
-        CodecKind::Av1 => VideoDecoder::Av1(Av1Decoder::new().ok()?),
-    })
+fn signed_ms(ticks: i64, base: Rational) -> i32 {
+    (ticks as i128 * base.num as i128 * 1000 / base.den as i128)
+        .clamp(i32::MIN as i128, i32::MAX as i128) as i32
 }
-
-fn ticks_to_ms(ticks: i64, time_base: rff_core::Rational) -> i32 {
-    if time_base.den == 0 {
-        return 0;
+fn end_ms(ticks: i64, base: Rational) -> i32 {
+    let n = ticks as i128 * base.num as i128 * 1000;
+    ((n + base.den as i128 - 1) / base.den as i128).clamp(0, i32::MAX as i128) as i32
+}
+fn h264_to_image(frame: &Frame, color: Color) -> Option<DecodedImage> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let pixels = width.checked_mul(height)?;
+    if pixels == 0 || pixels > MAX_FRAME_PIXELS || !matches!(frame.bit_depth, 8 | 10) {
+        return None;
     }
-    (ticks as i128 * time_base.num as i128 * 1000 / time_base.den as i128)
-        .clamp(0, i32::MAX as i128) as i32
-}
-
-fn drain_vp9(
-    decoder: &mut Vp9Decoder,
-    pending: &mut VecDeque<DecodedImage>,
-    flushing: bool,
-) -> bool {
-    loop {
-        match decoder.next_frame() {
-            Ok(frame) => {
-                let Some(image) = vp9_to_image(&frame) else {
-                    return false;
-                };
-                pending.push_back(image);
-            }
-            Err(Vp9Error::Again) => return true,
-            Err(Vp9Error::Eof) if flushing => return true,
-            Err(_) => return false,
-        }
-    }
-}
-
-fn drain_av1(decoder: &mut Av1Decoder, pending: &mut VecDeque<DecodedImage>) -> bool {
-    loop {
-        match decoder.get_picture() {
-            Ok(picture) => {
-                let Some(image) = av1_to_image(&picture) else {
-                    return false;
-                };
-                pending.push_back(image);
-            }
-            Err(rusty_av1d::Rav1dError::TryAgain) => return true,
-            Err(_) => return false,
-        }
-    }
-}
-
-fn h264_to_image(frame: H264Frame) -> Option<DecodedImage> {
-    let (sub_x, sub_y) = match frame.chroma_format {
-        rust_h264::decoder::ChromaFormat::Yuv420 => (1, 1),
-        rust_h264::decoder::ChromaFormat::Yuv422 => (1, 0),
+    let (kr, kb) = match color.matrix {
+        1 => (0.2126, 0.0722),
+        2 if width >= 1280 || height > 576 => (0.2126, 0.0722),
+        2 | 5 | 6 => (0.299, 0.114),
+        4 => (0.30, 0.11),
+        7 => (0.212, 0.087),
+        9 => (0.2627, 0.0593),
+        _ => return None,
     };
-    let bytes_per_sample = frame.bytes_per_sample();
-    let chroma_width = (frame.width as usize) >> sub_x;
-    let chroma_height = (frame.height as usize) >> sub_y;
-    yuv_to_image(
-        frame.width,
-        frame.height,
-        frame.bit_depth as usize,
-        sub_x,
-        sub_y,
-        frame.width as usize * bytes_per_sample,
-        chroma_width * bytes_per_sample,
-        chroma_width * bytes_per_sample,
-        Some(&frame.y),
-        Some(&frame.u),
-        Some(&frame.v),
-        chroma_height,
-    )
-}
-
-fn vp9_to_image(frame: &Vp9Frame) -> Option<DecodedImage> {
-    let chroma_height = (frame.height as usize) >> frame.subsampling_y;
-    yuv_to_image(
-        frame.width,
-        frame.height,
-        frame.bit_depth as usize,
-        frame.subsampling_x as usize,
-        frame.subsampling_y as usize,
-        *frame.strides.first()?,
-        *frame.strides.get(1)?,
-        *frame.strides.get(2)?,
-        frame.planes.first().map(Vec::as_slice),
-        frame.planes.get(1).map(Vec::as_slice),
-        frame.planes.get(2).map(Vec::as_slice),
-        chroma_height,
-    )
-}
-
-fn av1_to_image(frame: &Av1Picture) -> Option<DecodedImage> {
-    let (sub_x, sub_y) = match frame.pixel_layout() {
-        rusty_av1d::PixelLayout::I400 => (0, 0),
-        rusty_av1d::PixelLayout::I420 => (1, 1),
-        rusty_av1d::PixelLayout::I422 => (1, 0),
-        rusty_av1d::PixelLayout::I444 => (0, 0),
+    let scale = 16384.0_f64;
+    let yscale = if color.full_range { 1.0 } else { 255.0 / 219.0 };
+    let cscale = if color.full_range { 1.0 } else { 255.0 / 224.0 };
+    let kg = 1.0 - kr - kb;
+    let coeff = [
+        yscale,
+        2.0 * (1.0 - kr) * cscale,
+        -2.0 * kb * (1.0 - kb) / kg * cscale,
+        -2.0 * kr * (1.0 - kr) / kg * cscale,
+        2.0 * (1.0 - kb) * cscale,
+    ]
+    .map(|v| (v * scale).round() as i32);
+    let sub_y = match frame.chroma_format {
+        rust_h264::decoder::ChromaFormat::Yuv420 => 1,
+        rust_h264::decoder::ChromaFormat::Yuv422 => 0,
     };
-    let bytes_per_sample = if frame.bit_depth() > 8 { 2 } else { 1 };
-    let component = [
-        PlanarImageComponent::Y,
-        PlanarImageComponent::U,
-        PlanarImageComponent::V,
-    ];
-    let planes = component.map(|component| frame.plane(component));
-    yuv_to_image(
-        frame.width(),
-        frame.height(),
-        frame.bits_per_component()?.0 as usize,
-        sub_x,
-        sub_y,
-        frame.stride(PlanarImageComponent::Y) as usize * bytes_per_sample,
-        frame.stride(PlanarImageComponent::U) as usize * bytes_per_sample,
-        frame.stride(PlanarImageComponent::V) as usize * bytes_per_sample,
-        Some(planes[0]),
-        (frame.pixel_layout() != rusty_av1d::PixelLayout::I400).then_some(planes[1]),
-        (frame.pixel_layout() != rusty_av1d::PixelLayout::I400).then_some(planes[2]),
-        (frame.height() as usize) >> sub_y,
-    )
-}
-
-fn yuv_to_image(
-    width: u32,
-    height: u32,
-    bit_depth: usize,
-    sub_x: usize,
-    sub_y: usize,
-    y_stride: usize,
-    u_stride: usize,
-    v_stride: usize,
-    y_plane: Option<&[u8]>,
-    u_plane: Option<&[u8]>,
-    v_plane: Option<&[u8]>,
-    _chroma_height: usize,
-) -> Option<DecodedImage> {
-    let width_usize = width as usize;
-    let height_usize = height as usize;
-    let sample_bytes = if bit_depth > 8 { 2 } else { 1 };
-    let shift = bit_depth.saturating_sub(8) as u32;
-    let mut rgba = vec![0; width_usize.checked_mul(height_usize)?.checked_mul(4)?];
-    for y in 0..height_usize {
-        for x in 0..width_usize {
-            let yy = plane_sample(y_plane?, y, x, y_stride, sample_bytes)? >> shift;
-            let cx = x >> sub_x;
-            let cy = y >> sub_y;
-            let uu = if let Some(plane) = u_plane {
-                plane_sample(plane, cy, cx, u_stride, sample_bytes)? >> shift
-            } else {
-                128
-            };
-            let vv = if let Some(plane) = v_plane {
-                plane_sample(plane, cy, cx, v_stride, sample_bytes)? >> shift
-            } else {
-                128
-            };
-            let c = (yy as i32 - 16).max(0);
-            let d = uu as i32 - 128;
-            let e = vv as i32 - 128;
-            let r = (298 * c + 459 * e + 128) >> 8;
-            let g = (298 * c - 55 * d - 136 * e + 128) >> 8;
-            let b = (298 * c + 541 * d + 128) >> 8;
-            let offset = (y * width_usize + x) * 4;
-            rgba[offset] = r.clamp(0, 255) as u8;
-            rgba[offset + 1] = g.clamp(0, 255) as u8;
-            rgba[offset + 2] = b.clamp(0, 255) as u8;
+    let shift = frame.bit_depth - 8;
+    let sample_bytes = frame.bytes_per_sample();
+    let sample = |plane: &[u8], i: usize| -> Option<i32> {
+        let offset = i.checked_mul(sample_bytes)?;
+        let value = if sample_bytes == 1 {
+            u16::from(*plane.get(offset)?)
+        } else {
+            u16::from_le_bytes(plane.get(offset..offset + 2)?.try_into().ok()?)
+        };
+        Some(i32::from(value >> shift))
+    };
+    let mut rgba = vec![0; pixels.checked_mul(4)?];
+    for y in 0..height {
+        for x in 0..width {
+            let yy = sample(&frame.y, y * width + x)? - if color.full_range { 0 } else { 16 };
+            let ci = (y >> sub_y) * frame.chroma_width() as usize + (x >> 1);
+            let u = sample(&frame.u, ci)? - 128;
+            let v = sample(&frame.v, ci)? - 128;
+            let luma = coeff[0] * yy;
+            let rgb = [
+                luma + coeff[1] * v,
+                luma + coeff[2] * u + coeff[3] * v,
+                luma + coeff[4] * u,
+            ];
+            let offset = (y * width + x) * 4;
+            for i in 0..3 {
+                rgba[offset + i] = ((rgb[i] + 8192) >> 14).clamp(0, 255) as u8;
+            }
             rgba[offset + 3] = 255;
         }
     }
     Some(DecodedImage {
-        width,
-        height,
+        width: frame.width,
+        height: frame.height,
         rgba,
     })
 }
-
-fn plane_sample(
-    plane: &[u8],
-    y: usize,
-    x: usize,
-    stride: usize,
-    sample_bytes: usize,
-) -> Option<u16> {
-    let offset = y
-        .checked_mul(stride)?
-        .checked_add(x.checked_mul(sample_bytes)?)?;
-    if sample_bytes == 1 {
-        Some(u16::from(*plane.get(offset)?))
-    } else {
-        Some(u16::from_le_bytes(
-            plane.get(offset..offset + 2)?.try_into().ok()?,
-        ))
-    }
-}
-
 struct AacConfig {
-    object_type: u8,
     frequency_index: u8,
     channels: u8,
 }
-
 impl AacConfig {
-    fn from_stream(sample_rate: u32, channels: u16, extra: &[u8]) -> Self {
-        let rates = [
-            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-        ];
-        let fallback_frequency = rates
-            .iter()
-            .position(|rate| *rate == sample_rate)
-            .unwrap_or(4) as u8;
-        if extra.len() >= 2 {
-            let object_type = extra[0] >> 3;
-            let frequency_index = ((extra[0] & 7) << 1) | (extra[1] >> 7);
-            let channel_config = (extra[1] >> 3) & 0x0f;
-            if (1..=4).contains(&object_type) && frequency_index < 13 && channel_config > 0 {
-                return Self {
-                    object_type,
-                    frequency_index,
-                    channels: channel_config,
-                };
-            }
-        }
-        Self {
-            object_type: 2,
-            frequency_index: fallback_frequency,
-            channels: channels.clamp(1, 7) as u8,
-        }
-    }
-
-    fn adts_header(&self, payload_len: usize) -> Option<[u8; 7]> {
-        let frame_len = payload_len.checked_add(7)?;
-        if frame_len > 0x1fff || self.channels == 0 || self.channels > 7 {
+    fn from_stream(extra: &[u8]) -> Option<Self> {
+        if extra.len() < 2 || extra[0] >> 3 != 2 {
             return None;
         }
-        let profile = self.object_type.checked_sub(1)? & 3;
+        let frequency_index = ((extra[0] & 7) << 1) | (extra[1] >> 7);
+        let channels = (extra[1] >> 3) & 15;
+        (frequency_index < 13 && (1..=2).contains(&channels)).then_some(Self {
+            frequency_index,
+            channels,
+        })
+    }
+    fn adts_header(&self, payload_len: usize) -> Option<[u8; 7]> {
+        let n = payload_len.checked_add(7)?;
+        if n > 0x1fff {
+            return None;
+        }
         Some([
             0xff,
             0xf1,
-            (profile << 6) | ((self.frequency_index & 0x0f) << 2) | (self.channels >> 2),
-            ((self.channels & 3) << 6) | ((frame_len >> 11) as u8 & 3),
-            (frame_len >> 3) as u8,
-            ((frame_len as u8 & 7) << 5) | 0x1f,
+            0x40 | (self.frequency_index << 2) | (self.channels >> 2),
+            (self.channels << 6) | ((n >> 11) as u8 & 3),
+            (n >> 3) as u8,
+            ((n as u8 & 7) << 5) | 0x1f,
             0xfc,
         ])
     }
 }
 
+// Read only the SPS prefix through VUI color metadata. Keep codec internals
+// private: rust_h264's `dev-internals` parser is not a stable runtime API.
+struct Bits<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+impl Bits<'_> {
+    fn take(&mut self, count: usize) -> Option<u32> {
+        if count > 32 || self.position.checked_add(count)? > self.bytes.len().checked_mul(8)? {
+            return None;
+        }
+        let mut value = 0;
+        for _ in 0..count {
+            value = (value << 1)
+                | u32::from((self.bytes[self.position / 8] >> (7 - self.position % 8)) & 1);
+            self.position += 1;
+        }
+        Some(value)
+    }
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0;
+        while self.take(1)? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        (1u32.checked_shl(zeros as u32)? - 1).checked_add(self.take(zeros)?)
+    }
+    fn se(&mut self) -> Option<i32> {
+        let n = self.ue()?;
+        let magnitude = i32::try_from((u64::from(n) + 1) / 2).ok()?;
+        Some(if n & 1 == 0 { -magnitude } else { magnitude })
+    }
+}
+fn sps_color(rbsp: &[u8]) -> Option<Color> {
+    let mut r = Bits {
+        bytes: rbsp,
+        position: 0,
+    };
+    let profile = r.take(8)?;
+    r.take(16)?;
+    r.ue()?;
+    if matches!(
+        profile,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        let chroma = r.ue()?;
+        if chroma > 3 {
+            return None;
+        }
+        if chroma == 3 {
+            r.take(1)?;
+        }
+        r.ue()?;
+        r.ue()?;
+        r.take(1)?;
+        if r.take(1)? != 0 {
+            for i in 0..if chroma == 3 { 12 } else { 8 } {
+                if r.take(1)? == 0 {
+                    continue;
+                }
+                let (mut last, mut next) = (8i32, 8i32);
+                for _ in 0..if i < 6 { 16 } else { 64 } {
+                    if next != 0 {
+                        let delta = r.se()?;
+                        if !(-128..=127).contains(&delta) {
+                            return None;
+                        }
+                        next = (last + delta + 256) % 256;
+                    }
+                    if next != 0 {
+                        last = next;
+                    }
+                }
+            }
+        }
+    }
+    r.ue()?;
+    match r.ue()? {
+        0 => {
+            r.ue()?;
+        }
+        1 => {
+            r.take(1)?;
+            r.se()?;
+            r.se()?;
+            let count = r.ue()?;
+            if count > 255 {
+                return None;
+            }
+            for _ in 0..count {
+                r.se()?;
+            }
+        }
+        2 => {}
+        _ => return None,
+    }
+    if r.ue()? > 16 {
+        return None;
+    } // DPB reference-picture bound
+    r.take(1)?;
+    let width_mbs = u64::from(r.ue()?).checked_add(1)?;
+    let height_maps = u64::from(r.ue()?).checked_add(1)?;
+    let frame_only = r.take(1)? != 0;
+    let coded_pixels = width_mbs
+        .checked_mul(height_maps)?
+        .checked_mul(if frame_only { 256 } else { 512 })?;
+    if coded_pixels > MAX_FRAME_PIXELS as u64 {
+        return None;
+    }
+    if !frame_only {
+        r.take(1)?;
+    }
+    r.take(1)?;
+    if r.take(1)? != 0 {
+        for _ in 0..4 {
+            r.ue()?;
+        }
+    }
+    let mut color = Color::default();
+    if r.take(1)? == 0 {
+        return Some(color);
+    }
+    if r.take(1)? != 0 && r.take(8)? == 255 {
+        r.take(16)?;
+        r.take(16)?;
+    }
+    if r.take(1)? != 0 {
+        r.take(1)?;
+    }
+    if r.take(1)? != 0 {
+        r.take(3)?;
+        color.full_range = r.take(1)? != 0;
+        if r.take(1)? != 0 {
+            r.take(8)?;
+            r.take(8)?;
+            color.matrix = r.take(8)? as u8;
+        }
+    }
+    Some(color)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AacConfig, Mp4MovieDecoder};
+    use super::*;
 
     #[test]
-    fn only_mp4_resources_are_claimed() {
-        assert!(Mp4MovieDecoder::supports_resource("clip.mp4"));
-        assert!(Mp4MovieDecoder::supports_resource("CLIP.MP4"));
-        assert!(!Mp4MovieDecoder::supports_resource("clip.mkv"));
-        assert!(!Mp4MovieDecoder::supports_resource("clip.webm"));
-        assert!(!Mp4MovieDecoder::supports_resource("clip.ivf"));
-        assert!(!Mp4MovieDecoder::supports_resource("clip.mov"));
+    fn mp4_rational_deadlines_keep_fractional_cadence() {
+        let base = Rational {
+            num: 1,
+            den: 30_000,
+        };
+        assert!(!due(1001, base, 33));
+        assert!(due(1001, base, 34));
+        assert!(!due(2_700_000, base, 89_999));
+        assert!(due(2_700_000, base, 90_000));
+        assert!(due(-1001, base, 0));
+        assert_eq!(end_ms(1001, base), 34);
     }
 
     #[test]
-    #[ignore = "requires ETHORNELL_MP4_TEST pointing to an H.264/AAC MP4 fixture"]
-    fn external_mp4_decodes_video_and_extracts_aac() {
-        let path = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_TEST").unwrap());
-        let bytes = std::fs::read(&path).unwrap();
-        let resource = path.file_name().unwrap().to_string_lossy();
-        let mut movie =
-            Mp4MovieDecoder::new(crate::MovieBytes::from_vec(bytes), &resource).expect("open MP4");
-        assert!(movie.duration_ms() > 0, "MP4 duration should be known");
-        let mut frame_count = 0usize;
-        let mut size = None;
-        while let Some(frame) = movie.next_frame() {
-            size.get_or_insert((frame.width, frame.height));
-            frame_count += 1;
-        }
-        assert!(
-            frame_count > 1_000,
-            "MP4 should decode the complete video timeline"
+    fn mp4_color_range_and_aac_configuration_are_explicit() {
+        let frame = Frame {
+            width: 2,
+            height: 2,
+            y: vec![128; 4],
+            u: vec![128],
+            v: vec![128],
+            pic_order_cnt: 0,
+            chroma_format: rust_h264::decoder::ChromaFormat::Yuv420,
+            bit_depth: 8,
+        };
+        let full = h264_to_image(
+            &frame,
+            Color {
+                matrix: 1,
+                full_range: true,
+            },
+        )
+        .unwrap();
+        let limited = h264_to_image(
+            &frame,
+            Color {
+                matrix: 1,
+                full_range: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(&full.rgba[..4], &[128, 128, 128, 255]);
+        assert_eq!(&limited.rgba[..4], &[130, 130, 130, 255]);
+        let mut red = frame.clone();
+        red.y.fill(81);
+        red.u.fill(90);
+        red.v.fill(240);
+        assert_eq!(
+            &h264_to_image(
+                &red,
+                Color {
+                    matrix: 6,
+                    full_range: false
+                }
+            )
+            .unwrap()
+            .rgba[..4],
+            &[254, 0, 0, 255]
         );
-        assert_eq!(size, Some((1280, 720)), "unexpected FD MP4 frame size");
-        assert!(
-            movie.take_audio().is_some(),
-            "AAC soundtrack should be retained"
+        assert_eq!(
+            &h264_to_image(
+                &red,
+                Color {
+                    matrix: 1,
+                    full_range: false
+                }
+            )
+            .unwrap()
+            .rgba[..4],
+            &[255, 24, 0, 255]
+        );
+        let ten = Frame {
+            y: vec![0, 2, 0, 2, 0, 2, 0, 2],
+            u: vec![0, 2],
+            v: vec![0, 2],
+            bit_depth: 10,
+            ..frame
+        };
+        assert_eq!(
+            &h264_to_image(
+                &ten,
+                Color {
+                    matrix: 1,
+                    full_range: true
+                }
+            )
+            .unwrap()
+            .rgba[..4],
+            &[128, 128, 128, 255]
+        );
+        assert!(sps_color(&[]).is_none());
+        assert!(sps_color(&[0; 32]).is_none());
+        assert!(AacConfig::from_stream(&[0x2b, 0x92]).is_none()); // HE-AAC
+        assert!(AacConfig::from_stream(&[]).is_none());
+        let config = AacConfig::from_stream(&[0x12, 0x10]).unwrap();
+        assert_eq!(
+            config.adts_header(100).unwrap(),
+            [0xff, 0xf1, 0x50, 0x80, 0x0d, 0x7f, 0xfc]
         );
     }
 
     #[test]
-    #[ignore = "requires ETHORNELL_MP4_TEST pointing to an H.264/AAC MP4 fixture"]
-    fn external_mp4_aac_plays_through_kira_mock_backend() {
+    #[ignore = "requires generated cfr.mp4/vfr.mp4 in ETHORNELL_MP4_FIXTURES"]
+    fn mp4_external_timeline_reorder_seek_loop_and_aac() {
         use ethornell_audio::AudioSystem;
-        use kira::manager::AudioManagerSettings;
-        use kira::manager::backend::mock::{MockBackend, MockBackendSettings};
-
-        let path = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_TEST").unwrap());
-        let bytes = std::fs::read(&path).unwrap();
-        let resource = path.file_name().unwrap().to_string_lossy();
-        let mut movie =
-            Mp4MovieDecoder::new(crate::MovieBytes::from_vec(bytes), &resource).expect("open MP4");
-        let audio = movie.take_audio().expect("AAC soundtrack");
-        let mut settings = AudioManagerSettings::default();
-        settings.backend_settings = MockBackendSettings {
-            sample_rate: 48_000,
-        };
-        let mut system = AudioSystem::<MockBackend>::with_settings(settings).unwrap();
-        system
-            .play_stream_on_channel(1, audio.0, false, 1.0, 0)
-            .unwrap();
-    }
-
-    #[test]
-    fn adts_header_encodes_aac_lc_stereo_frame_length() {
-        let config = AacConfig {
-            object_type: 2,
-            frequency_index: 4,
-            channels: 2,
-        };
-        let header = config.adts_header(100).unwrap();
-        assert_eq!(header[0..2], [0xff, 0xf1]);
-        assert_eq!(header[2] >> 6, 1);
-        assert_eq!(header[3] >> 6, 2);
-        assert_eq!(header[6], 0xfc);
+        use kira::manager::{AudioManagerSettings, backend::mock::MockBackend};
+        let dir = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_FIXTURES").unwrap());
+        for (file, full_range, matrix) in [("cfr.mp4", false, 1), ("vfr.mp4", true, 6)] {
+            let source = MovieBytes::from_vec(std::fs::read(dir.join(file)).unwrap());
+            let mut movie = Mp4MovieDecoder::new(source.clone(), file).expect("configured movie");
+            assert_eq!(movie.size(), Some((96, 64)));
+            assert_eq!(movie.color.full_range, full_range);
+            assert_eq!(movie.color.matrix, matrix);
+            let positions = [
+                0, 33, 34, 66, 67, 99, 100, 967, 999, 1000, 1050, 1100, 1500, 2000, 2200,
+            ];
+            for position in positions {
+                let _ = movie.frame_at(position);
+                let expected = (0..60)
+                    .filter(|&i| {
+                        let pts = if file == "cfr.mp4" {
+                            i * 1001
+                        } else {
+                            i * 1000 + if i >= 30 { 3000 } else { 0 }
+                        };
+                        due(
+                            pts,
+                            Rational {
+                                num: 1,
+                                den: 30_000,
+                            },
+                            position,
+                        )
+                    })
+                    .count()
+                    .saturating_sub(1);
+                assert_eq!(
+                    movie.frame_index(),
+                    Some(expected),
+                    "{file} at {position}ms"
+                );
+                assert!(!movie.failed);
+            }
+            assert_eq!(movie.frame_index(), Some(59));
+            let first = movie.frame_at(0).expect("backward seek");
+            assert_eq!(movie.frame_index(), Some(0));
+            assert!(movie.frame_at(0).is_none()); // no duplicate upload
+            movie.reset();
+            assert_eq!(movie.frame_at(0).unwrap().rgba, first.rgba);
+            if file == "cfr.mp4" {
+                let audio = movie.take_audio().expect("AAC soundtrack");
+                let mut system =
+                    AudioSystem::<MockBackend>::with_settings(AudioManagerSettings::default())
+                        .unwrap();
+                system
+                    .play_stream_on_channel(1, audio.0, false, 1.0, 0)
+                    .unwrap();
+                let mut host = crate::graph_effect::GraphEffectRegistry::default();
+                assert_eq!(
+                    host.configure_media(7, String::new(), file.into(), source),
+                    0
+                );
+                assert!(host.prepare_initial_movie_frame(7).is_some());
+                assert_eq!(host.invoke(7).status, 0);
+                assert!(!host.tick_movies(500).is_empty());
+                assert_eq!(host.seek(7, 0), 0);
+                assert!(
+                    !host.tick_movies(1).is_empty(),
+                    "running seek republishes its picture"
+                );
+                assert_eq!(host.movie_diagnostics()[0].3, Some(0));
+                assert_eq!(host.set_paused(7, true), 0);
+                assert!(host.tick_movies(500).is_empty());
+                assert_eq!(host.position_ms(7).unwrap(), 1);
+                assert_eq!(host.set_paused(7, false), 0);
+                assert_eq!(host.set_movie_options(7, true, 128), 0);
+                let generation = host.movie_audio()[0].generation;
+                host.tick_movies(10_000);
+                assert!(host.movie_playing(7));
+                assert!(host.movie_audio()[0].generation > generation);
+                assert_eq!(host.close_movie_slot(7), 0);
+                assert!(host.movie_audio().is_empty());
+            }
+        }
     }
 }

@@ -695,12 +695,7 @@ impl ApplicationHandler for WindowApp {
                     runtime.api.performance_profile.begin();
                 }
                 let commands = if let Some(runtime) = runtime.as_mut() {
-                    match frame_presenter::prepare_frame(
-                        renderer,
-                        &mut runtime.api,
-                        graph_textures,
-                        presenter,
-                    ) {
+                    match frame_presenter::prepare_frame(renderer, &mut runtime.api, graph_textures, presenter) {
                         Ok(commands) => commands,
                         Err(error) => {
                             if let Ok(mut slot) = failure.lock() {

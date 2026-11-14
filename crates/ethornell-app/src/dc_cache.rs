@@ -3,8 +3,6 @@
 //! entry until the data fits (sub_4464D0/sub_446500), a lookup moves the
 //! hit to the front and refreshes its time (sub_446430).
 
-const MAX_RESIDENT_BYTES: u32 = 64 * 1024 * 1024;
-
 #[derive(Debug, Clone)]
 struct Entry {
     namespace: Option<String>,
@@ -21,26 +19,13 @@ pub(crate) struct DcCache {
 }
 
 impl DcCache {
-    /// The target accepts a 512 MiB request, but the SDK also retains decoded
-    /// RGBA images. Keep the raw-resource cache bounded so those two copies
-    /// cannot consume the entire process address space.
     pub(crate) fn new(budget: u32) -> Self {
-        Self {
-            budget: budget.min(MAX_RESIDENT_BYTES),
-            used: 0,
-            entries: Vec::new(),
-        }
+        Self { budget, used: 0, entries: Vec::new() }
     }
 
     /// sub_446310: refused when empty or larger than half the budget; a
     /// duplicate key is stored again rather than replaced.
-    pub(crate) fn store(
-        &mut self,
-        namespace: Option<&str>,
-        name: Option<&str>,
-        bytes: &[u8],
-        now: u32,
-    ) -> bool {
+    pub(crate) fn store(&mut self, namespace: Option<&str>, name: Option<&str>, bytes: &[u8], now: u32) -> bool {
         let size = bytes.len() as u32;
         if size == 0 || size > self.budget >> 1 {
             return false;
@@ -50,15 +35,12 @@ impl DcCache {
             let entry = self.entries.remove(oldest);
             self.used = self.used.wrapping_sub(entry.bytes.len() as u32);
         }
-        self.entries.insert(
-            0,
-            Entry {
-                namespace: namespace.map(str::to_owned),
-                name: name.map(str::to_owned),
-                bytes: bytes.to_vec(),
-                time: now,
-            },
-        );
+        self.entries.insert(0, Entry {
+            namespace: namespace.map(str::to_owned),
+            name: name.map(str::to_owned),
+            bytes: bytes.to_vec(),
+            time: now,
+        });
         self.used = self.used.wrapping_add(size);
         true
     }
@@ -75,15 +57,11 @@ impl DcCache {
     }
 
     /// sub_446430: exact (case-sensitive) key match, null matching null.
-    pub(crate) fn lookup(
-        &mut self,
-        namespace: Option<&str>,
-        name: Option<&str>,
-        now: u32,
-    ) -> Option<Vec<u8>> {
-        let index = self.entries.iter().position(|entry| {
-            entry.namespace.as_deref() == namespace && entry.name.as_deref() == name
-        })?;
+    pub(crate) fn lookup(&mut self, namespace: Option<&str>, name: Option<&str>, now: u32) -> Option<Vec<u8>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.namespace.as_deref() == namespace && entry.name.as_deref() == name)?;
         let mut entry = self.entries.remove(index);
         entry.time = now;
         let bytes = entry.bytes.clone();
@@ -97,17 +75,9 @@ mod tests {
     use super::DcCache;
 
     #[test]
-    fn large_requested_budget_is_bounded() {
-        let cache = DcCache::new(u32::MAX);
-        assert_eq!(cache.budget, 64 * 1024 * 1024);
-    }
-    #[test]
     fn store_evicts_least_recently_used_and_lookup_refreshes() {
         let mut cache = DcCache::new(8);
-        assert!(
-            !cache.store(Some("a"), Some("x"), &[1; 5], 0),
-            "over half the budget"
-        );
+        assert!(!cache.store(Some("a"), Some("x"), &[1; 5], 0), "over half the budget");
         assert!(cache.store(Some("a"), Some("1"), &[1; 4], 1));
         assert!(cache.store(Some("a"), Some("2"), &[2; 4], 2));
         assert_eq!(cache.lookup(Some("a"), Some("1"), 3), Some(vec![1; 4]));

@@ -397,6 +397,52 @@ mod tests {
     }
 
     #[test]
+    fn mixed_rate_seeks_match_the_continuous_timeline() {
+        for (intro_rate, body_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            let intro = pcm_wave(intro_rate, 317);
+            let body = pcm_wave(body_rate, 20_000);
+            let mut decoder = StreamedDecoder::new(Some((intro, None)), (body, None), 1.0).unwrap();
+            let expected = decode_all(&mut decoder);
+            for at in [0, 300, 317, 318, 8_193, 14_999, expected.len() - 10] {
+                assert_eq!(decoder.seek(at).unwrap(), at);
+                let got = decoder.decode().unwrap();
+                let count = got.len().min(expected.len() - at);
+                assert!(count > 0);
+                assert_same(&got[..count], &expected[at..at + count]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires FD bgm_4160/4170 head/loop in ETHORNELL_FD_BGM"]
+    fn mixed_rate_owner_fd_pairs_decode_and_seek_across_the_join() {
+        let dir = std::path::PathBuf::from(std::env::var_os("ETHORNELL_FD_BGM").unwrap());
+        for code in ["4160", "4170"] {
+            let head = std::fs::read(dir.join(format!("bgm_{code}_head"))).unwrap();
+            let body = std::fs::read(dir.join(format!("bgm_{code}_loop"))).unwrap();
+            let mut decoder = StreamedDecoder::new(Some(part(&head)), part(&body), 1.0).unwrap();
+            assert_eq!(decoder.intro.as_ref().unwrap().sample_rate, 44_100);
+            assert_eq!(decoder.body.sample_rate, 48_000);
+            assert_eq!(decoder.sample_rate(), 44_100);
+            for at in [
+                decoder.body_start() - 16,
+                decoder.body_start(),
+                decoder.body_start() + 10_001,
+                decoder.num_frames() - 64,
+            ] {
+                assert_eq!(decoder.seek(at).unwrap(), at);
+                let frames = decoder.decode().unwrap();
+                assert!(!frames.is_empty());
+                assert!(
+                    frames
+                        .iter()
+                        .all(|f| f.left.is_finite() && f.right.is_finite())
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "needs ETHORNELL_BGM_DIR with bgm_4040_head / bgm_4040_loop"]
     fn streamed_matches_static_decode() {
         let dir = std::path::PathBuf::from(std::env::var("ETHORNELL_BGM_DIR").unwrap());
