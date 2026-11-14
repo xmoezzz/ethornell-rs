@@ -15,13 +15,12 @@ fn target(ins: &BpInstruction, index: usize) -> VmResult<u32> {
 }
 
 impl Vm {
-    fn fused_frame_value(&self, displacement: i32) -> VmResult<i32> {
-        Ok(self
-            .read_value(self.modern_frame_offset(displacement as u32)?, 2)?
-            .as_i32())
+    fn fused_frame_value(&mut self, displacement: i32) -> VmResult<i32> {
+        let value = self.read_value(self.modern_frame_offset(displacement as u32)?, 2)?;
+        self.value_as_numeric_operand(value)
     }
 
-    fn fused_indirect(&self, frame: i32, offset: i32) -> VmResult<u32> {
+    fn fused_indirect(&mut self, frame: i32, offset: i32) -> VmResult<u32> {
         Ok((self.fused_frame_value(frame)? as u32).wrapping_add(offset as u32))
     }
 
@@ -59,8 +58,8 @@ impl Vm {
                 let base = if branch { 2 } else { 1 };
                 let left = if indirect {
                     let pointer = self.fused_indirect(arg(base)?, arg(base + 2)?)?;
-                    self.read_value(pointer, width(arg(base + 1)? as u32))?
-                        .as_i32()
+                    let value = self.read_value(pointer, width(arg(base + 1)? as u32))?;
+                    self.value_as_numeric_operand(value)?
                 } else {
                     self.fused_frame_value(arg(base)?)?
                 };
@@ -80,7 +79,8 @@ impl Vm {
                     self.fused_frame_value((packed & 0x7fff) as i32)?
                 } else {
                     let pointer = self.fused_indirect((packed & 0x7fff) as i32, arg(3)?)?;
-                    self.read_value(pointer, width(arg(2)? as u32))?.as_i32()
+                    let value = self.read_value(pointer, width(arg(2)? as u32))?;
+                    self.value_as_numeric_operand(value)?
                 };
                 if (left != 0) == (packed & 0x8000 != 0) {
                     return Ok(Some(target(ins, 0)?));
@@ -157,12 +157,29 @@ impl Vm {
                 };
                 self.write_int(destination, width(packed >> 14), value as u32)?;
             }
-            0xf7..=0xfb => {
+            0xfa | 0xfb => {
+                let base = if op == 0xfa {
+                    arg(0)? as u32
+                } else {
+                    self.modern_frame_offset(arg(0)? as u32)?
+                };
+                let packed = arg(1)? as u32;
+                let index = self.fused_frame_value((packed & 0x3fff) as i32)?;
+                let pointer = base.wrapping_add(index.wrapping_mul(arg(2)? as i16 as i32) as u32);
+                // This is a load, not arithmetic on the loaded word. Frame
+                // arrays can contain shadow strings/program handles (e.g.
+                // syswnd's module-name table); coercing them to i32 loses
+                // their value and turns the following LoadProgram into "".
+                let value = self.read_value(pointer, width(packed >> 14))?;
+                self.push_value(value);
+            }
+            0xf7..=0xf9 => {
                 let value = match op {
                     0xf7 => {
                         let packed = arg(0)? as u32;
                         let pointer = self.fused_indirect((packed & 0x3fff) as i32, arg(1)?)?;
-                        let field = self.read_value(pointer, width(packed >> 14))?.as_i32();
+                        let field = self.read_value(pointer, width(packed >> 14))?;
+                        let field = self.value_as_numeric_operand(field)?;
                         self.pop_int()?
                             .wrapping_add(field.wrapping_mul(arg(2)? as i16 as i32))
                     }
@@ -177,18 +194,6 @@ impl Vm {
                             self.fused_frame_value(arg(2)?)?
                                 .wrapping_mul(arg(3)? as i16 as i32),
                         ),
-                    0xfa | 0xfb => {
-                        let base = if op == 0xfa {
-                            arg(0)? as u32
-                        } else {
-                            self.modern_frame_offset(arg(0)? as u32)?
-                        };
-                        let packed = arg(1)? as u32;
-                        let index = self.fused_frame_value((packed & 0x3fff) as i32)?;
-                        let pointer =
-                            base.wrapping_add(index.wrapping_mul(arg(2)? as i16 as i32) as u32);
-                        self.read_value(pointer, width(packed >> 14))?.as_i32()
-                    }
                     _ => unreachable!(),
                 };
                 self.push_value(Value::Int(value));
@@ -203,6 +208,37 @@ impl Vm {
 mod tests {
     use super::*;
     use ethornell_script::parse_bp_program;
+
+    #[test]
+    fn fused_bp_indexed_loads_preserve_module_names_and_program_handles() {
+        let mut vm = Vm::new();
+        vm.mem_ptr = 128;
+        vm.write_int(crate::FRAME_SEGMENT | 124, 2, 1).unwrap();
+        let module = Value::Str("settings._bp".into());
+        vm.write_value(260, 2, &module).unwrap();
+        vm.write_value(crate::FRAME_SEGMENT | 68, 2, &module).unwrap();
+        for bytes in [
+            &[0xfa, 0, 1, 0, 0, 4, 0x80, 4, 0][..],
+            &[0xfb, 64, 0, 4, 0x80, 4, 0][..],
+        ] {
+            let program = parse_bp_program(None, bytes);
+            vm.execute_fused_bp(&program.instructions[0]).unwrap();
+            assert_eq!(vm.pop_string_lossy().unwrap(), "settings._bp");
+        }
+        let handle = Value::Program(std::sync::Arc::new(parse_bp_program(None, &[0x17])));
+        vm.write_value(260, 2, &handle).unwrap();
+        let program = parse_bp_program(None, &[0xfa, 0, 1, 0, 0, 4, 0x80, 4, 0]);
+        vm.execute_fused_bp(&program.instructions[0]).unwrap();
+        assert_eq!(vm.pop_value().unwrap(), handle);
+        // Arithmetic needs the guest address of a shadow string, rather than
+        // Value::as_i32's zero. Exercise the corresponding frame+0 store.
+        vm.write_value(crate::FRAME_SEGMENT | 124, 2, &module).unwrap();
+        let program = parse_bp_program(None, &[0xf0, 0, 1, 0, 0, 4, 0x80, 0]);
+        vm.execute_fused_bp(&program.instructions[0]).unwrap();
+        let pointer = vm.read_int(256, 2).unwrap();
+        assert_ne!(pointer, 0);
+        assert_eq!(vm.read_shadowed_c_string(pointer).unwrap(), "settings._bp");
+    }
 
     #[test]
     fn fused_bp_covers_native_table_operations_and_operand_boundaries() {

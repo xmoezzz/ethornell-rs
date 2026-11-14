@@ -4062,6 +4062,13 @@ impl Vm {
                 self.push_value(Value::Int(result));
             }
             BpOpcode::Known { code: 0x7f, .. } => {
+                // BGI 1.687 1400CB5E0 dispatches a secondary byte, with
+                // 12 registered 7F selectors. It is not the five-argument
+                // 1.622 bitmap operation; stop before consuming its stack
+                // or treating its selector byte as another BP instruction.
+                if self.native_abi_profile == NativeAbiProfile::ModernFused {
+                    return Err(VmError::UnsupportedInstruction(0x7f));
+                }
                 self.execute_resource_blend()?;
             }
             BpOpcode::Known { code: 0x80 | 0x81, .. } => {

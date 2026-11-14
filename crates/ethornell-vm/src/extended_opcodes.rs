@@ -171,11 +171,17 @@ impl Vm {
             return Ok(returns_value.then_some(Value::Int(result)));
         }
 
-        // Every registered selector is ported; keep the stack balanced anyway.
-        let result = 0;
-        Ok(returns_value.then_some(Value::Int(result)))
+        Err(VmError::UnknownDispatch {
+            group: 0xd0,
+            id: u16::from(id),
+        })
     }
 
+    // Native table audit: 1.653 has E0:00/40/80 (diagnostic lists), plus
+    // 90/92/94/96/C0/C2. 1.687 has those three lists plus
+    // 20/3F/90/91/92/93/C0/C2. Only the lists have a windowless policy here;
+    // the six/eight remaining selectors are deliberately unsupported, not
+    // zero-argument list aliases. See 4653F0 / 1400AA5D0 and their tables.
     pub(super) fn execute_debug_inspect(&mut self, id: u8) -> VmResult<()> {
         if !matches!(id, 0x00 | 0x40 | 0x80) {
             return Err(VmError::UnknownDispatch {

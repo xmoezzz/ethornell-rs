@@ -19,6 +19,12 @@ impl Vm {
                 // image to the current CThread's module chain.
                 let file = self.pop_string_lossy()?;
                 let archive = self.pop_string_lossy()?;
+                if file.is_empty() {
+                    // Native sub_465AB0 rejects a missing module; do not let
+                    // the host's empty-program fallback create an endless
+                    // load/free loop with an invalid module name.
+                    return Err(VmError::Runtime("empty native module name".into()));
+                }
                 // sub_465AB0 failing to read/decode the module is fatal.
                 let Some(mut program) = api.load_program(&archive, &file) else {
                     return Err(VmError::Runtime(format!(
