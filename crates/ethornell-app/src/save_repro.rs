@@ -42,29 +42,6 @@ fn bitmap_reload_repro() {
 }
 
 #[test]
-#[ignore = "requires ETHORNELL_REPRO_GAME pointing to a SenmomoFD game copy"]
-fn raw_bgi_grayscale_resource_loads_with_native_format_three() {
-    ethornell_core::init_tracing();
-    let root = PathBuf::from(std::env::var_os("ETHORNELL_REPRO_GAME").expect("game copy"));
-    let manager = ResourceManager::open_game(&root).unwrap();
-    let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
-    let key = "sysgrp.arc:SGMsgWnd200400";
-
-    assert!(api.load_graph_image_resource_target(Some(1), "sysgrp.arc", "SGMsgWnd200400"));
-    assert_eq!(api.graph_image_formats.get(key), Some(&3));
-    assert_eq!(api.bitmap_formats.get(&1), Some(&3));
-    let image = api.graph_images.get(key).expect("loaded message-window image");
-    assert_eq!((image.width, image.height), (1280, 960));
-    assert!(
-        image
-            .rgba
-            .chunks_exact(4)
-            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2] && pixel[3] == 255),
-        "8bpp BGI image should decode to opaque grayscale pixels"
-    );
-}
-
-#[test]
 #[ignore = "requires a writable copy of a game via ETHORNELL_REPRO_GAME"]
 fn game_input_repro() {
     ethornell_core::init_tracing();

@@ -2,13 +2,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ethornell_image::DecodedImage;
-use na_mpeg2_decoder::{
-    Decoder, Frame, StreamType, frame_to_rgba_bt601_limited, packet_ranges,
-};
+use na_mpeg2_decoder::{Decoder, Frame, StreamType, frame_to_rgba_bt601_limited, packet_ranges};
 
 use crate::MovieBytes;
 use crate::audio_runtime::{AudioCommand, StreamBytes};
-use crate::movie_container::ContainerMovieDecoder;
 
 /// Audio channels for movie soundtracks: above the channels script sounds use.
 const MOVIE_AUDIO_CHANNEL_BASE: i32 = 0x4000_0000;
@@ -120,25 +117,22 @@ pub(crate) fn movie_audio_commands(
 
 #[derive(Debug)]
 struct MovieDecoder {
-    source: Option<MovieBytes>,
+    source: MovieBytes,
     packets: Vec<MoviePacket>,
     /// The MPEG audio elementary stream (Layer II in BGI movies), played as
     /// one stream by the audio frontend.
     audio: Option<StreamBytes>,
     decoder: Decoder,
-    container: Option<ContainerMovieDecoder>,
     pending_frames: VecDeque<Arc<Frame>>,
     packet_index: usize,
     frame_index: Option<usize>,
     current_frame: Option<Arc<Frame>>,
-    container_current_frame: Option<DecodedImage>,
     /// Index of the frame last handed to the bitmap. The target's renderer
     /// (DCVideoImageSender, sub_45C260) copies each sample once.
     delivered_index: Option<usize>,
     frame_interval_ms: i32,
     /// Picture size from the first sequence header.
     size: Option<(u32, u32)>,
-    duration_ms: i32,
     flushed: bool,
     failed: bool,
 }
@@ -149,60 +143,24 @@ struct MoviePacket {
     range: std::ops::Range<usize>,
 }
 
-#[derive(Debug)]
-enum DecodedMovieFrame {
-    Mpeg(Arc<Frame>),
-    Image(DecodedImage),
-}
-
 impl MovieDecoder {
-    fn new(source: MovieBytes, resource: &str) -> Option<Self> {
-        if ContainerMovieDecoder::supports_resource(resource)
-            || ContainerMovieDecoder::probe(source.as_slice())
-        {
-            let mut container = ContainerMovieDecoder::new(source.as_slice(), resource)?;
-            let duration_ms = container.duration_ms();
-            let frame_interval_ms = container.frame_interval_ms();
-            let size = container.size();
-            let audio = container.take_audio();
-            return Some(Self {
-                source: None,
-                packets: Vec::new(),
-                audio,
-                decoder: Decoder::new(),
-                container: Some(container),
-                pending_frames: VecDeque::new(),
-                packet_index: 0,
-                frame_index: None,
-                current_frame: None,
-                container_current_frame: None,
-                delivered_index: None,
-                frame_interval_ms,
-                size,
-                duration_ms,
-                flushed: false,
-                failed: false,
-            });
-        }
-
+    fn new(source: MovieBytes) -> Option<Self> {
         let bytes = source.as_slice();
-        let duration_ms = probe_mpeg_duration_ms(bytes);
+        let mut packets = Vec::new();
         let mut audio = Vec::new();
-
-        // MPEG Program Stream splits one picture's elementary-stream data
-        // across many small PES packets.  The video decoder needs the
-        // reassembled ES so that start-code pairs (which delimit slices)
-        // are not broken by PES boundaries.  Concatenate all video PES
-        // payloads into one contiguous buffer before chunking for decode.
-        let mut video_es = Vec::new();
-        let mut first_video_pts = None;
         for packet in packet_ranges(bytes) {
             match packet.stream_type {
                 StreamType::MpegVideo => {
-                    if first_video_pts.is_none() {
-                        first_video_pts = packet.pts_90k;
+                    // Decode at most one bounded chunk when another frame is
+                    // needed, even when the container has one enormous PES.
+                    for start in (packet.range.start..packet.range.end).step_by(64 * 1024) {
+                        packets.push(MoviePacket {
+                            pts_90k: (start == packet.range.start)
+                                .then_some(packet.pts_90k)
+                                .flatten(),
+                            range: start..(start + 64 * 1024).min(packet.range.end),
+                        });
                     }
-                    video_es.extend_from_slice(&bytes[packet.range]);
                 }
                 StreamType::MpegAudio => {
                     audio.extend_from_slice(&bytes[packet.range]);
@@ -210,27 +168,9 @@ impl MovieDecoder {
                 StreamType::Unknown => {}
             }
         }
-
-        if video_es.is_empty() {
-            return None;
-        }
-
-        let video_es = MovieBytes::from_vec(video_es);
-        let es_bytes = video_es.as_slice();
-
-        // Decode at most one bounded chunk when another frame is needed,
-        // even when the reassembled ES is one enormous buffer.
-        let mut packets = Vec::new();
-        for start in (0..es_bytes.len()).step_by(64 * 1024) {
-            packets.push(MoviePacket {
-                pts_90k: if start == 0 { first_video_pts } else { None },
-                range: start..(start + 64 * 1024).min(es_bytes.len()),
-            });
-        }
         if packets.is_empty() {
             return None;
         }
-
         // A file that isn't a movie (Graph90:F0 names movies by file, so a
         // script can name an image archive) can still pass the demuxer as one
         // video elementary stream through stray start codes in its data. Its
@@ -239,48 +179,40 @@ impl MovieDecoder {
         let mut decoder = Decoder::new();
         let first = &packets[0];
         let pending_frames = decoder
-            .decode_shared(&es_bytes[first.range.clone()], first.pts_90k)
+            .decode_shared(&bytes[first.range.clone()], first.pts_90k)
             .ok()?
             .into_iter()
             .collect();
         let frame_rate = packets
             .iter()
-            .find_map(|packet| sequence_frame_rate(&es_bytes[packet.range.clone()]))
+            .find_map(|packet| sequence_frame_rate(&bytes[packet.range.clone()]))
             .unwrap_or(25.0);
         let size = packets
             .iter()
-            .find_map(|packet| sequence_frame_size(&es_bytes[packet.range.clone()]));
+            .find_map(|packet| sequence_frame_size(&bytes[packet.range.clone()]));
         Some(Self {
-            source: Some(video_es),
+            source,
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
             decoder,
-            container: None,
             pending_frames,
             packet_index: 1,
             frame_index: None,
             current_frame: None,
-            container_current_frame: None,
             delivered_index: None,
             frame_interval_ms: (1000.0 / frame_rate).round().max(1.0) as i32,
             size,
-            duration_ms,
             flushed: false,
             failed: false,
         })
     }
 
     fn reset(&mut self) {
-        if let Some(container) = self.container.as_mut() {
-            let _ = container.reset();
-        } else {
-            self.decoder = Decoder::new();
-        }
+        self.decoder = Decoder::new();
         self.pending_frames.clear();
         self.packet_index = 0;
         self.frame_index = None;
         self.current_frame = None;
-        self.container_current_frame = None;
         self.delivered_index = None;
         self.flushed = false;
         self.failed = false;
@@ -292,25 +224,12 @@ impl MovieDecoder {
             self.reset();
         }
         while self.frame_index.is_none_or(|index| index < target) {
-            match self.next_frame() {
-                Some(DecodedMovieFrame::Mpeg(frame)) => {
-                    self.frame_index = Some(self.frame_index.map_or(0, |index| index + 1));
-                    self.current_frame = Some(frame);
-                }
-                Some(DecodedMovieFrame::Image(frame)) => {
-                    self.frame_index = Some(self.frame_index.map_or(0, |index| index + 1));
-                    self.container_current_frame = Some(frame);
-                }
-                None => break,
+            if let Some(frame) = self.next_frame() {
+                self.frame_index = Some(self.frame_index.map_or(0, |index| index + 1));
+                self.current_frame = Some(frame);
+            } else {
+                break;
             }
-        }
-        if self.container.is_some() {
-            let frame = self.container_current_frame.as_ref()?;
-            if self.delivered_index == self.frame_index {
-                return None;
-            }
-            self.delivered_index = self.frame_index;
-            return Some(frame.clone());
         }
         let frame = self.current_frame.as_ref()?;
         if self.delivered_index == self.frame_index {
@@ -330,20 +249,17 @@ impl MovieDecoder {
         self.frame_at(0)
     }
 
-    fn next_frame(&mut self) -> Option<DecodedMovieFrame> {
-        if let Some(container) = self.container.as_mut() {
-            return container.next_frame().map(DecodedMovieFrame::Image);
-        }
+    fn next_frame(&mut self) -> Option<Arc<Frame>> {
         loop {
             if let Some(frame) = self.pending_frames.pop_front() {
-                return Some(DecodedMovieFrame::Mpeg(frame));
+                return Some(frame);
             }
             if self.failed {
                 return None;
             }
             if let Some(packet) = self.packets.get(self.packet_index) {
                 self.packet_index += 1;
-                let data = &self.source.as_ref()?.as_slice()[packet.range.clone()];
+                let data = &self.source.as_slice()[packet.range.clone()];
                 match self.decoder.decode_shared(data, packet.pts_90k) {
                     Ok(frames) => self.pending_frames.extend(frames),
                     Err(_) => self.failed = true,
@@ -433,15 +349,15 @@ impl GraphEffectRegistry {
         if handle < 0 || resource.is_empty() || bytes.as_slice().is_empty() {
             return 4;
         }
-        let Some(movie) = MovieDecoder::new(bytes, &resource) else {
-            return 2;
-        };
-        let duration_ms = movie.duration_ms;
+        let duration_ms = probe_mpeg_duration_ms(bytes.as_slice());
         if crate::file_policy::restricted() && duration_ms <= 0 {
             // Do not install a permanently active zero-duration process and
             // leave its native wait procedure blocked forever.
             return 2;
         }
+        let Some(movie) = MovieDecoder::new(bytes) else {
+            return 2;
+        };
         self.processes.insert(
             handle,
             GraphEffectProcess {
@@ -938,7 +854,7 @@ mod tests {
         let mut bytes = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0, 0, 0x20, 0];
         bytes.extend_from_slice(&[0, 0, 1, 0xB7]);
         bytes.resize(2 * 1024 * 1024, 0);
-        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes), "m.mpg").unwrap();
+        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes)).unwrap();
         assert_eq!(movie.packet_index, 1);
         assert!(movie.packets.iter().all(|p| p.range.len() <= 64 * 1024));
         assert!(movie.pending_frames.is_empty());
@@ -998,26 +914,6 @@ mod tests {
         assert!(sought.active);
         assert!(sought.generation > started);
         assert_eq!(sought.position_ms, 0);
-    }
-
-    #[test]
-    fn container_movie_releases_original_input_buffer_after_demux() {
-        let mut bytes = vec![0; 45];
-        bytes[..4].copy_from_slice(b"DKIF");
-        bytes[6..8].copy_from_slice(&32_u16.to_le_bytes());
-        bytes[8..12].copy_from_slice(b"AV01");
-        bytes[12..14].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[14..16].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[16..20].copy_from_slice(&30_u32.to_le_bytes());
-        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[24..28].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[32..36].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[44] = 0;
-
-        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes), "memory-test.ivf")
-            .expect("open IVF container");
-        assert!(movie.container.is_some());
-        assert!(movie.source.is_none());
     }
 
     #[test]
@@ -1097,183 +993,6 @@ mod tests {
         assert!(registry.movie_audio().is_empty());
     }
 
-    /// Count pixels with real colour. An opaque alpha channel alone must never
-    /// satisfy a playback assertion: a fully black picture carries alpha 255.
-    fn visible_rgb_pixels(frame: &DecodedImage) -> usize {
-        frame
-            .rgba
-            .chunks_exact(4)
-            .filter(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8)
-            .count()
-    }
-
-    /// The container backend must not capture the MPEG movies the existing
-    /// games play: neither their resource names nor their bytes may select it,
-    /// and their pictures must keep arriving through the MPEG decoder.
-    #[test]
-    fn mpeg_movies_keep_playing_when_requested() {
-        let Ok(game) = std::env::var("ETHORNELL_MPEG_TEST_GAME") else {
-            return;
-        };
-        let spec = std::env::var("ETHORNELL_MPEG_TEST_ENTRIES").expect("archive|resource entries");
-        let manager = ethornell_archive::ResourceManager::open_game(game).expect("open game");
-        for item in spec.split(';').filter(|item| !item.is_empty()) {
-            let (archive, resource) = item.split_once('|').expect("archive|resource item");
-            let bytes = manager
-                .read_decoded_from_archive(archive, resource)
-                .expect("read archive movie entry");
-            assert!(
-                !ContainerMovieDecoder::supports_resource(resource),
-                "{resource}: MPEG resource name must not select a container"
-            );
-            assert!(
-                !ContainerMovieDecoder::probe(&bytes),
-                "{resource}: MPEG bytes must not probe as a container"
-            );
-            let mut registry = GraphEffectRegistry::default();
-            assert_eq!(
-                registry.configure_media(
-                    7,
-                    archive.to_owned(),
-                    resource.to_owned(),
-                    MovieBytes::from_vec(bytes),
-                ),
-                0,
-                "{resource}: MPEG movie failed to open"
-            );
-            assert!(registry.movie_size(7).is_some(), "{resource}: no picture size");
-            assert_eq!(registry.invoke(7).status, 0);
-            let mut frames = 0usize;
-            let mut visible = 0usize;
-            for _ in 0..90 {
-                for update in registry.tick_movies(33) {
-                    frames += 1;
-                    visible = visible.max(visible_rgb_pixels(&update.image));
-                }
-            }
-            eprintln!("MPEG {resource}: frames={frames} visible={visible}");
-            assert!(frames > 1, "{resource}: MPEG playback stalled after one frame");
-            assert!(visible > 0, "{resource}: MPEG pictures stayed black");
-        }
-    }
-
-    #[test]
-    fn archive_movie_frames_report_visible_content_when_requested() {
-        let Ok(game) = std::env::var("ETHORNELL_FRAME_SCAN_GAME") else {
-            return;
-        };
-        let spec = std::env::var("ETHORNELL_FRAME_SCAN_ENTRY").expect("archive|resource");
-        let frames: usize = std::env::var("ETHORNELL_FRAME_SCAN_COUNT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(60);
-        let (archive, resource) = spec.split_once('|').expect("archive|resource");
-        let manager = ethornell_archive::ResourceManager::open_game(game).expect("open game");
-        let bytes = manager
-            .read_decoded_from_archive(archive, resource)
-            .expect("read archive entry");
-        let mut decoder = ContainerMovieDecoder::new(&bytes, resource).expect("open movie");
-        let frame_interval_ms = decoder.frame_interval_ms();
-        let duration_ms = decoder.duration_ms();
-        eprintln!("INTERVAL {frame_interval_ms} ms DURATION {duration_ms} ms");
-        assert!(
-            (1..=100).contains(&frame_interval_ms),
-            "frame interval {frame_interval_ms} ms cannot pace video playback"
-        );
-        let mut decoded = 0usize;
-        let mut visible_frames = 0usize;
-        for index in 0..frames {
-            let Some(frame) = decoder.next_frame() else {
-                eprintln!("FRAME {index}: decoder returned none");
-                break;
-            };
-            decoded += 1;
-            let visible = visible_rgb_pixels(&frame);
-            if visible > 0 {
-                visible_frames += 1;
-            }
-            if index % 10 == 0 || visible > 0 {
-                eprintln!("FRAME {index}: {}x{} visible={visible}", frame.width, frame.height);
-            }
-        }
-        eprintln!("DECODED {decoded} frames, {visible_frames} with visible colour");
-        assert!(decoded > 1, "decoder must advance past the first frame");
-        assert!(visible_frames > 0, "no decoded frame carried visible colour");
-    }
-
-    #[test]
-    fn activated_arc_movie_samples_decode_when_requested() {
-        let Ok(game) = std::env::var("ETHORNELL_ARC_TEST_GAME") else {
-            return;
-        };
-        let spec = std::env::var("ETHORNELL_ARC_TEST_ENTRIES")
-            .expect("archive|resource test entries");
-        let manager = ethornell_archive::ResourceManager::open_game(game).expect("open test game");
-        for item in spec.split(';').filter(|item| !item.is_empty()) {
-            let (archive, resource) = item.split_once('|').expect("archive|resource test item");
-            let bytes = manager
-                .read_decoded_from_archive(archive, resource)
-                .expect("read archive movie entry");
-            let mut decoder = ContainerMovieDecoder::new(&bytes, resource)
-                .expect("open archive movie entry");
-            let frame_interval_ms = decoder.frame_interval_ms();
-            assert!(
-                (1..=100).contains(&frame_interval_ms),
-                "{resource}: frame interval {frame_interval_ms} ms cannot pace playback"
-            );
-            // A movie may open on a black fade-in, so require colour within
-            // the first second of pictures rather than on the first frame.
-            let mut visible = 0usize;
-            let mut decoded = 0usize;
-            for _ in 0..30 {
-                let Some(frame) = decoder.next_frame() else {
-                    break;
-                };
-                decoded += 1;
-                assert!(frame.width > 0 && frame.height > 0);
-                visible = visible.max(visible_rgb_pixels(&frame));
-            }
-            assert!(decoded > 1, "{resource}: decoder stalled after one frame");
-            assert!(visible > 0, "{resource}: decoded pictures stayed black");
-            assert!(decoder.take_audio().is_some(), "archive AAC track should be retained");
-        }
-    }
-
-    #[test]
-    fn external_container_samples_decode_when_requested() {
-        let Ok(spec) = std::env::var("ETHORNELL_CONTAINER_TESTS") else {
-            return;
-        };
-        for item in spec.split(';').filter(|item| !item.is_empty()) {
-            let (path, resource) = item.split_once('|').expect("path|resource test item");
-            let bytes = std::fs::read(path).expect("read container test sample");
-            let mut decoder = ContainerMovieDecoder::new(&bytes, resource)
-                .expect("open container test sample");
-            let frame = decoder.next_frame().expect("decode container test frame");
-            assert!(frame.width > 0 && frame.height > 0);
-            assert!(visible_rgb_pixels(&frame) > 0, "{resource}: first picture is black");
-        }
-    }
-
-    #[test]
-    fn external_mp4_sample_decodes_when_requested() {
-        let Ok(path) = std::env::var("ETHORNELL_MP4_TEST") else {
-            return;
-        };
-        let bytes = std::fs::read(path).expect("read ETHORNELL_MP4_TEST");
-        let mut decoder = ContainerMovieDecoder::new(&bytes, "sample.mpg")
-            .expect("open MP4 sample");
-        assert_eq!(decoder.size(), Some((1280, 720)));
-        assert!(decoder.duration_ms() > 100_000);
-        let frame_interval_ms = decoder.frame_interval_ms();
-        assert!(
-            (1..=100).contains(&frame_interval_ms),
-            "frame interval {frame_interval_ms} ms cannot pace playback"
-        );
-        let frame = decoder.next_frame().expect("decode first MP4 frame");
-        assert_eq!((frame.width, frame.height), (1280, 720));
-        assert!(decoder.take_audio().is_some(), "AAC track should be retained");
-    }
     #[test]
     fn movie_volume_uses_native_range_and_state_errors() {
         let mut registry = GraphEffectRegistry::default();
