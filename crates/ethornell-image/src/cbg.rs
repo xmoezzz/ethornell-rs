@@ -212,7 +212,7 @@ impl<'a> CbgV2Decoder<'a> {
         for _ in 0..=y_blocks {
             offsets.push(self.input.read_i32()?);
         }
-        let input = self.input.data[base_offset..].to_vec();
+        let input = &self.input.data[base_offset..];
         let pad_skip = ((width >> 3) + 7) >> 3;
         let mut output = vec![0u8; (width * height * 4) as usize];
         let block_decoder = BlockDecoder {

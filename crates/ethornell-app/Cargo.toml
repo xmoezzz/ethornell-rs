@@ -30,8 +30,6 @@ rusty_av1d = { version = "1.3.0", default-features = false, features = ["bitdept
 rff-core = "0.4.7"
 rff-format = "0.4.7"
 rff-format-mp4 = "0.4.7"
-rff-format-mkv = "0.4.7"
-rff-format-ivf = "0.4.7"
 ab_glyph.workspace = true
 encoding_rs.workspace = true
 serde_json.workspace = true
@@ -60,3 +58,6 @@ vitasdk-sys = { version = "=0.3.3", default-features = false, features = ["SceSy
 [target.'cfg(not(any(target_os="vita",target_os="horizon")))'.dependencies]
 ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", rev = "f64085ef12bd3c01995105c5ca20fee310fc6d87", features = ["default_font", "lzma", "mp3", "aac", "nellymoser"] }
 ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", rev = "f64085ef12bd3c01995105c5ca20fee310fc6d87" }
+
+[dev-dependencies]
+kira.workspace = true

@@ -11454,7 +11454,9 @@ pub mod opcodes {
     };
     /// `90:DD` — `Graph90_DD_SwapKnobInputMode`, BGI 1.622 handler `sub_4809D0`.
     ///
-    /// Set the global knob input mode and return the previous one.
+    /// Set the global Knob mouse-wheel gate and return the previous integer.
+    /// Zero routes the wheel to ordinary input; nonzero routes it to the first
+    /// watched Knob. This does not disable pointer capture or hit testing.
     ///
     /// Swaps dword_507204.
     ///

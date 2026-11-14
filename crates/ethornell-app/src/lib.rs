@@ -2,7 +2,8 @@ use ethornell_archive::{MagicKind, ResourceManager, detect_magic, scan_game_root
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
 use ethornell_image::{
-    DecodedImage, decode_image, parse_cbg_metadata, raw_bgi_native_bitmap_format,
+    DecodedImage, decode_image, parse_cbg_metadata, raw_bgi_embedded_point,
+    raw_bgi_native_bitmap_format,
 };
 use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
 use ethornell_script::calls::known_call_arg_count;
@@ -51,7 +52,7 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
-mod movie_container;
+mod mp4_movie;
 mod native_background;
 mod native_background_effect;
 mod native_backml;
@@ -713,6 +714,7 @@ struct NativeControlInputLatch {
 }
 
 const MOVIE_READ_BUFFER_SIZE: usize = 12 * 1024 * 1024;
+const IMAGE_DECODE_BUFFER_MAX_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Storage for a compressed MPEG program stream while its decoder is built.
 /// Vita's CDRAM is separate from the 320 MiB user heap used by scene images.
@@ -743,6 +745,12 @@ impl MovieBytes {
             #[cfg(target_os = "vita")]
             Self::Cdram { buffer, len } => &buffer.as_slice()[..*len],
         }
+    }
+}
+
+impl AsRef<[u8]> for MovieBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -906,6 +914,9 @@ struct RuntimeTraceApi {
     /// Reusable storage for the next MPEG program stream.  On Vita it lives in
     /// CDRAM, preserving the constrained user heap for scene images.
     movie_read_buffer: MovieReadBuffer,
+    /// Reused for sequential archive-image reads; oversized assets are dropped
+    /// after decode so one resource cannot pin an unbounded source buffer.
+    image_decode_buffer: Vec<u8>,
     graph_images: BTreeMap<String, DecodedImage>,
     /// Native bitmap format associated with decoded resource images. Resource
     /// pixels are cached independently of concrete bitmap handles, so the
@@ -1002,10 +1013,9 @@ struct RuntimeTraceApi {
     /// Target dword_565FD0 is a prepend-only linked watch list. Duplicate
     /// registrations are permitted and 90:DF removes the first matching node.
     graph_knob_watches: VecDeque<i32>,
-    graph_knob_input_mode: i32,
-    /// Set once a script calls 90:DD. A game that never calls it keeps the
-    /// historical behavior where knob hit-testing ignores the input mode.
-    graph_knob_input_mode_set: bool,
+    /// Graph90:DD swaps the WM_MOUSEWHEEL-to-Knob gate only. Native startup
+    /// sub_496390 sets it to 1; left/right pointer capture is independent.
+    graph_knob_wheel_mode: i32,
     /// Target CDspObjGroup registry: 8 slots, handles 0xF1000000 | slot.
     graph_groups: BTreeMap<i32, GraphGroupState>,
     graph_native_owners: BTreeMap<i32, i32>,
@@ -1405,6 +1415,7 @@ impl RuntimeTraceApi {
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
             movie_read_buffer: MovieReadBuffer::new(),
+            image_decode_buffer: Vec::new(),
             graph_images: BTreeMap::from([(
                 native_background::BACK_INACTIVE_FILL_KEY.to_string(),
                 DecodedImage {
@@ -1476,8 +1487,7 @@ impl RuntimeTraceApi {
             display_changes: 0,
             graph_knob_states: BTreeMap::new(),
             graph_knob_watches: VecDeque::new(),
-            graph_knob_input_mode: 0,
-            graph_knob_input_mode_set: false,
+            graph_knob_wheel_mode: 1,
             graph_groups: BTreeMap::new(),
             graph_native_owners: BTreeMap::new(),
             surface_controls: SurfaceControlRegistry::default(),
@@ -2660,9 +2670,18 @@ impl RuntimeTraceApi {
         let Some(entry) = find_runtime_resource(&self.manager, archive_name, resource_name) else {
             return false;
         };
-        let Ok(bytes) = self.manager.read_by_entry_decoded(&entry) else {
+        let mut bytes = std::mem::take(&mut self.image_decode_buffer);
+        if bytes.capacity() > IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes = Vec::new();
+        }
+        if self
+            .manager
+            .read_by_entry_decoded_into(&entry, &mut bytes)
+            .is_err()
+        {
+            self.image_decode_buffer = bytes;
             return false;
-        };
+        }
 
         // Target sub_469EE0 copies CBG +0x10..+0x1F into the internal image
         // header. sub_401EF0 accepts embedded-point flags 0/1 and, for flag 1,
@@ -2702,10 +2721,11 @@ impl RuntimeTraceApi {
                 };
                 (native_format, None, None)
             } else if let Some(native_format) = raw_bgi_native_bitmap_format(&bytes) {
-                (native_format, None, None)
+                (native_format, raw_bgi_embedded_point(&bytes), None)
             } else {
-                // Portable PNG/JPEG compatibility resources have no target
-                // bitmap format metadata, so keep the historical RGBA path.
+                // Portable PNG/JPEG compatibility resources have no
+                // target CBG subtype to recover. Keep the historical RGBA
+                // format-2 interpretation for those non-CBG paths.
                 (2, None, None)
             };
 
@@ -2720,6 +2740,11 @@ impl RuntimeTraceApi {
                 );
                 return false;
             }
+        };
+        self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes
+        } else {
+            Vec::new()
         };
         self.graph_image_formats
             .insert(key.clone(), native_bitmap_format);
@@ -4533,19 +4558,12 @@ impl RuntimeTraceApi {
         None
     }
 
-    fn graph_knob_input_disabled(&self) -> bool {
-        self.graph_knob_input_mode_set && self.graph_knob_input_mode == 0
-    }
-
     /// Find the topmost live CDspObjKnob under the pointer. Target
     /// sub_463780 walks the knob manager's native-sort-ordered list and then
     /// asks the pointer-scope system to validate the controlled object's
     /// rectangle. The portable manager keeps the same sort key through the
     /// target Sprite, so choose the largest active key among accepted rects.
     fn graph_knob_at_point(&self, point: (f32, f32)) -> Option<i32> {
-        if self.graph_knob_input_disabled() {
-            return None;
-        }
         self.graph_knob_states
             .iter()
             .filter_map(|(&handle, state)| {
@@ -4556,10 +4574,12 @@ impl RuntimeTraceApi {
                 if point.0 < x || point.1 < y || point.0 >= x + width || point.1 >= y + height {
                     return None;
                 }
-                Some((
-                    self.graph90_native_sort_key(handle).unwrap_or_default(),
-                    handle,
-                ))
+                // SenmomoFD sub_46CBC0 queries vtable+0x1c, then
+                // sub_477650 checks the full pointer-scope chain. A higher
+                // icon/modal input scope must prevent a Knob from capturing.
+                let scope = self.graph90_native_sort_key(handle).unwrap_or_default();
+                native_pointer_scope_eligible_at(self, scope as i32, Some(point))
+                    .then_some((scope, handle))
             })
             .max()
             .map(|(_, handle)| handle)
@@ -4688,6 +4708,9 @@ impl RuntimeTraceApi {
     /// list is independent of hover/capture: its first node consumes the wheel
     /// and changes the watched Knob's logical Y coordinate by exactly one.
     fn process_graph_knob_mouse_wheel(&mut self, delta_y: f32) -> bool {
+        if self.graph_knob_wheel_mode == 0 {
+            return false;
+        }
         let Some(&handle) = self.graph_knob_watches.front() else {
             return false;
         };
@@ -15141,6 +15164,30 @@ mod input_tests {
             Value::Int(0)
         );
 
+        // 90:DD disables only Knob wheel routing. The physical wheel still
+        // reaches the ordinary input records, and the old gate is returned.
+        let mut disable_wheel = vec![Value::Int(0)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut disable_wheel).unwrap(),
+            Value::Int(1)
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseWheel { delta_y: 1.0 },
+        );
+        assert_eq!(api.graph_knob_states[&knob].y, 4);
+        assert_eq!(
+            api.pending_input_descriptor,
+            Some(super::INPUT_DESCRIPTOR_MOUSE_WHEEL_UP)
+        );
+        assert!(!api.pending_input_consumed);
+        let mut enable_wheel = vec![Value::Int(7)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut enable_wheel).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(api.graph_knob_wheel_mode, 7);
+
         let mut zero = vec![Value::Int(knob), Value::Int(0), Value::Int(0)];
         call_graph(&mut api, 0x90, 0xd6, &mut zero).unwrap();
         super::apply_runtime_input_event(
@@ -15203,63 +15250,6 @@ mod input_tests {
         let mut unwatch = vec![Value::Int(first)];
         call_graph(&mut api, 0x90, 0xdf, &mut unwatch).unwrap();
         assert!(!api.graph_knob_watches.contains(&first));
-    }
-
-    #[test]
-    fn explicit_knob_input_mode_zero_releases_pointer_capture() {
-        let manager =
-            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut api = super::RuntimeTraceApi::new(manager);
-        let target = 604;
-        api.graph_layers.insert(
-            target,
-            RuntimeGraphLayer {
-                hit_id: target,
-                owner_object: None,
-                key: "knob-mode-target".into(),
-                target_surface: None,
-                x: 100.0,
-                y: 200.0,
-                width: 40.0,
-                height: 30.0,
-                src_x: 0.0,
-                src_y: 0.0,
-                opacity: 1.0,
-                z: 2176,
-                enabled: true,
-                transform_x: 0.0,
-                transform_y: 0.0,
-                transform_z: 0,
-                scale_x: 1.0,
-                scale_y: 1.0,
-                rotation_degrees: 0.0,
-                clip: None,
-            },
-        );
-        let mut create = vec![Value::Int(target)];
-        let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
-            Value::Int(handle) => handle,
-            value => panic!("unexpected knob handle {value:?}"),
-        };
-        let mut enable = vec![Value::Int(handle), Value::Int(1)];
-        call_graph(&mut api, 0x90, 0xd4, &mut enable).unwrap();
-
-        // Games that never call 90:DD keep their existing knob behavior.
-        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
-
-        let mut disable_mode = vec![Value::Int(0)];
-        assert_eq!(
-            call_graph(&mut api, 0x90, 0xdd, &mut disable_mode).unwrap(),
-            Value::Int(0)
-        );
-        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), None);
-
-        let mut enable_mode = vec![Value::Int(1)];
-        assert_eq!(
-            call_graph(&mut api, 0x90, 0xdd, &mut enable_mode).unwrap(),
-            Value::Int(0)
-        );
-        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
     }
 
     #[test]
@@ -15367,77 +15357,11 @@ mod input_tests {
     }
 
     #[test]
-    fn disabled_knob_pointer_node_does_not_block_icon_scope() {
-        let manager =
-            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut api = super::RuntimeTraceApi::new(manager);
-        api.input_configuration_enabled = 1;
-        let target = 606;
-        let knob = 607;
-        api.graph_layers.insert(
-            target,
-            RuntimeGraphLayer {
-                hit_id: target,
-                owner_object: None,
-                key: "disabled-knob-target".into(),
-                target_surface: None,
-                x: 100.0,
-                y: 200.0,
-                width: 40.0,
-                height: 30.0,
-                src_x: 0.0,
-                src_y: 0.0,
-                opacity: 1.0,
-                z: 2176,
-                enabled: true,
-                transform_x: 0.0,
-                transform_y: 0.0,
-                transform_z: 0,
-                scale_x: 1.0,
-                scale_y: 1.0,
-                rotation_degrees: 0.0,
-                clip: None,
-            },
-        );
-        api.graph_object_layers
-            .insert(target, [target].into_iter().collect());
-        api.graph_knob_states
-            .insert(knob, super::graph_knob::GraphKnobState::new(target, 0.0, 0.0));
-        api.graph_object_draw_enabled.insert(knob, true);
-        api.pointer_object_nodes.push((0x0008_0000, knob));
-        let scope = 0x0007_ffff;
-        api.registered_pointer_input_scopes.register(scope);
-        let point = (110.0, 210.0);
-
-        // Unconfigured games keep existing knob pointer-scope behavior.
-        assert!(!super::native_pointer_scope_eligible_at(
-            &api,
-            scope,
-            Some(point)
-        ));
-
-        let mut disable_mode = vec![Value::Int(0)];
-        call_graph(&mut api, 0x90, 0xdd, &mut disable_mode).unwrap();
-        assert!(super::native_pointer_scope_eligible_at(
-            &api,
-            scope,
-            Some(point)
-        ));
-
-        let mut enable_mode = vec![Value::Int(1)];
-        call_graph(&mut api, 0x90, 0xdd, &mut enable_mode).unwrap();
-        assert!(!super::native_pointer_scope_eligible_at(
-            &api,
-            scope,
-            Some(point)
-        ));
-    }
-
-    #[test]
     fn knob_mouse_capture_drag_changed_and_active_handle_follow_target_manager() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        api.input_configuration_enabled = 1;
         let target = 604;
         api.graph_layers.insert(
             target,
@@ -15464,6 +15388,7 @@ mod input_tests {
                 clip: None,
             },
         );
+        api.graph_object_layers.insert(target, [target].into_iter().collect());
         let mut create = vec![Value::Int(target)];
         let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
             Value::Int(handle) => handle,
@@ -15477,6 +15402,19 @@ mod input_tests {
         call_graph(&mut api, 0x90, 0xd6, &mut initial).unwrap();
         let mut enable = vec![Value::Int(handle), Value::Int(1)];
         call_graph(&mut api, 0x90, 0xd4, &mut enable).unwrap();
+
+        // Like sub_46CBC0 -> sub_477650, a higher input scope blocks the
+        // wrapper even when its rectangle contains the pointer.
+        let scope = api.graph90_native_sort_key(handle).unwrap_or_default();
+        api.registered_pointer_input_scopes.register((scope + 1) as i32);
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), None);
+        api.registered_pointer_input_scopes.unregister_one((scope + 1) as i32);
+        let mut disable_wheel = vec![Value::Int(0)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut disable_wheel).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
 
         super::apply_runtime_input_event(
             &mut api,
@@ -20788,10 +20726,7 @@ fn native_pointer_scope_eligible_at(
         .pointer_object_nodes
         .iter()
         .filter_map(|&(scope, object)| {
-            // A disabled 90:DD Knob must not shadow a live icon-input item.
-            let knob_disabled =
-                api.graph_knob_input_disabled() && api.graph_knob_states.contains_key(&object);
-            (on_screen && !knob_disabled && api.graph_object_is_drawable(object)).then(|| {
+            (on_screen && api.graph_object_is_drawable(object)).then(|| {
                 (
                     scope,
                     api.graph_object_pointer_hit_at(object, point)
@@ -27679,9 +27614,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0xdd) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                self.graph_knob_input_mode_set = true;
-                let previous = std::mem::replace(&mut self.graph_knob_input_mode, value);
-                tracing::info!(value, previous, "GraphSwapKnobInputMode");
+                // SenmomoFD 48A050 -> 46CC70/46CC60: preserve and return
+                // the previous integer; only WM_MOUSEWHEEL tests this gate.
+                let previous = std::mem::replace(&mut self.graph_knob_wheel_mode, value);
+                tracing::info!(value, previous, "GraphSwapKnobWheelMode");
                 return Ok(ethornell_vm::Value::Int(previous));
             }
             (0x90, 0xde) => {
@@ -30297,12 +30233,10 @@ fn run_headless(
             // presentation: every logical frame still traverses the shared
             // render tree and produces a complete offscreen framebuffer.
             // sub_462100: a frame that is not due shows the last one again.
-            // A playing DirectShow movie updates independently of the graph
-            // scheduler (the scripts disable it during playback), so the
-            // headless compositor must re-derive the frame while a movie is
-            // active to pick up decoded samples.
             let movie_playing = runtime.api.directshow_movie_draw_item().is_some();
-            let frame_composition = if runtime.api.take_present_due() || last_composition.is_none() || movie_playing
+            let frame_composition = if runtime.api.take_present_due()
+                || last_composition.is_none()
+                || movie_playing
             {
                 runtime.api.performance_profile.begin();
                 let composition =
@@ -30339,6 +30273,34 @@ fn run_headless(
                 );
             }
             if runtime.api.debug_graph || runtime.api.trace_render_tree || frame % 60 == 0 {
+                let graph_image_bytes = runtime
+                    .api
+                    .graph_images
+                    .values()
+                    .map(|image| image.rgba.len())
+                    .sum::<usize>();
+                let runtime_graph_image_bytes = runtime
+                    .api
+                    .graph_images
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("runtime:"))
+                    .map(|(_, image)| image.rgba.len())
+                    .sum::<usize>();
+                let vm_usage = runtime.vm.resource_usage();
+                let graph_blob_bytes = runtime
+                    .api
+                    .graph_blob_cache
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>();
+                let cached_program_instructions = runtime
+                    .api
+                    .program_cache
+                    .values()
+                    .map(|program| program.instructions.len())
+                    .sum::<usize>();
+                let archive_count = runtime.api.manager.archives().archives.len();
+                let resource_count = runtime.api.manager.resource_count();
                 let report = last_report.as_ref();
                 tracing::info!(
                     frame,
@@ -30362,6 +30324,17 @@ fn run_headless(
                     ),
                     text_nodes = runtime.api.text_nodes.len(),
                     graph_images = runtime.api.graph_images.len(),
+                    graph_image_bytes,
+                    runtime_graph_image_bytes,
+                    graph_resources = runtime.api.graph_resources.len(),
+                    graph_layers = runtime.api.graph_layers.len(),
+                    vm_count = vm_usage.vm_count,
+                    vm_memory_bytes = vm_usage.memory_bytes,
+                    vm_memory_capacity_bytes = vm_usage.memory_capacity_bytes,
+                    graph_blob_bytes,
+                    cached_program_instructions,
+                    archive_count,
+                    resource_count,
                     animations = runtime.api.layer_animations.active_count(),
                     audio_pending = runtime.api.audio_requests.len(),
                     scenario_code_base = format_args!(

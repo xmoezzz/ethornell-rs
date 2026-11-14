@@ -107,6 +107,7 @@ pub fn detect_image_format(buf: &[u8]) -> ImageFormat {
     }
 }
 
+/// SenmomoFD sub_401F70 selects the format; sub_408AA0 normalizes 7 to 1.
 pub fn raw_bgi_native_bitmap_format(buf: &[u8]) -> Option<i32> {
     if detect_image_format(buf) != ImageFormat::RawBgiImage {
         return None;
@@ -114,9 +115,28 @@ pub fn raw_bgi_native_bitmap_format(buf: &[u8]) -> Option<i32> {
     match u16::from_le_bytes(buf.get(4..6)?.try_into().ok()?) {
         8 => Some(3),
         24 => Some(1),
-        32 => Some(2),
+        32 => Some(match u16::from_le_bytes(buf.get(8..10)?.try_into().ok()?) {
+            4 => 4,
+            5 => 5,
+            7 => 1,
+            _ => 2,
+        }),
         _ => None,
     }
+}
+
+/// sub_402730 passes these unsigned WORDs to the bitmap registry when
+/// header word +0x0a is 1. They are metadata, not mandatory zero padding.
+pub fn raw_bgi_embedded_point(buf: &[u8]) -> Option<[i32; 2]> {
+    if !looks_like_raw_bgi_image(buf)
+        || u16::from_le_bytes(buf.get(10..12)?.try_into().ok()?) != 1
+    {
+        return None;
+    }
+    Some([
+        i32::from(u16::from_le_bytes(buf.get(12..14)?.try_into().ok()?)),
+        i32::from(u16::from_le_bytes(buf.get(14..16)?.try_into().ok()?)),
+    ])
 }
 
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage> {
@@ -262,13 +282,10 @@ fn looks_like_raw_bgi_image(buf: &[u8]) -> bool {
     let Ok(bpp) = cursor.read_u16::<LittleEndian>() else {
         return false;
     };
-    let Ok(_flags) = cursor.read_u16::<LittleEndian>() else {
+    let Ok(flags) = cursor.read_u16::<LittleEndian>() else {
         return false;
     };
-    let Ok(padding) = cursor.read_u64::<LittleEndian>() else {
-        return false;
-    };
-    if width == 0 || height == 0 || width > 8192 || height > 8192 || padding != 0 {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || flags > 1 {
         return false;
     }
     let pixel_bytes = match bpp {
@@ -290,10 +307,11 @@ fn decode_raw_bgi_image(data: &[u8]) -> Result<DecodedImage> {
     let height = cursor.read_u16::<LittleEndian>()? as u32;
     let bpp = cursor.read_u16::<LittleEndian>()?;
     let flags = cursor.read_u16::<LittleEndian>()?;
-    let padding = cursor.read_u64::<LittleEndian>()?;
-    if padding != 0 {
-        return Err(EthornellError::Parse(format!(
-            "raw BGI image padding must be zero, got {padding}"
+    // sub_402730 accepts only direct pixels (0) or the channel-plane
+    // differential representation (1), not arbitrary nonzero flags.
+    if flags > 1 {
+        return Err(EthornellError::UnsupportedFormat(format!(
+            "raw BGI image encoding {flags} is not implemented"
         )));
     }
     let pixel_bytes = match bpp {
@@ -627,6 +645,23 @@ mod tests {
         let rgba = decode_image(&raw_32).unwrap();
         assert_eq!(raw_bgi_native_bitmap_format(&raw_32), Some(2));
         assert_eq!(rgba.rgba, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn raw_bgi_header_metadata_is_not_zero_padding() {
+        for (subtype, format) in [(0u16, 2), (4, 4), (5, 5), (7, 1)] {
+            let mut data = raw_bgi_image(1, 1, 32, 0, &[3, 2, 1, 4]);
+            data[8..10].copy_from_slice(&subtype.to_le_bytes());
+            data[10..12].copy_from_slice(&1u16.to_le_bytes());
+            data[12..14].copy_from_slice(&123u16.to_le_bytes());
+            data[14..16].copy_from_slice(&456u16.to_le_bytes());
+            assert_eq!(detect_image_format(&data), ImageFormat::RawBgiImage);
+            assert_eq!(raw_bgi_native_bitmap_format(&data), Some(format));
+            assert_eq!(raw_bgi_embedded_point(&data), Some([123, 456]));
+        }
+        let data = raw_bgi_image(1, 1, 8, 2, &[1]);
+        assert_eq!(detect_image_format(&data), ImageFormat::Unknown);
+        assert!(decode_raw_bgi_image(&data).is_err());
     }
 
     #[test]

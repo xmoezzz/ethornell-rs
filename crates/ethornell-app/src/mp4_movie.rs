@@ -1,3 +1,8 @@
+//! ISO Base Media File Format (MP4) demuxing and software movie decoding.
+//!
+//! Container parsing is delegated to `rff-format-mp4`; this module owns the
+//! decoded packet timeline and conversion into the engine's frame/audio types.
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Cursor;
@@ -5,12 +10,13 @@ use std::ops::Range;
 
 use ethornell_image::DecodedImage;
 use rff_core::{CodecId, Error as DemuxError, MediaType};
-use rff_format::{Demuxer, FormatRegistry};
-use rusty_av1d::rust_api::{Decoder as Av1Decoder, Picture as Av1Picture, PlanarImageComponent};
-use rusty_vp9::{DecodedFrame as Vp9Frame, Error as Vp9Error, Vp9Decoder};
+use rff_format::FormatRegistry;
 use rust_h264::decoder::{Frame as H264Frame, OrderedDecoder as H264Decoder};
 use rust_h264::nal::parse_annex_b;
+use rusty_av1d::rust_api::{Decoder as Av1Decoder, Picture as Av1Picture, PlanarImageComponent};
+use rusty_vp9::{DecodedFrame as Vp9Frame, Error as Vp9Error, Vp9Decoder};
 
+use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
 
 struct PacketRange {
@@ -32,7 +38,7 @@ enum VideoDecoder {
     Av1(Av1Decoder),
 }
 
-pub(crate) struct ContainerMovieDecoder {
+pub(crate) struct Mp4MovieDecoder {
     source: Vec<u8>,
     packets: Vec<PacketRange>,
     decoder: VideoDecoder,
@@ -48,14 +54,14 @@ pub(crate) struct ContainerMovieDecoder {
     failed: bool,
 }
 
-impl fmt::Debug for ContainerMovieDecoder {
+impl fmt::Debug for Mp4MovieDecoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let codec = match self.codec {
             CodecKind::H264 => "h264",
             CodecKind::Vp9 => "vp9",
             CodecKind::Av1 => "av1",
         };
-        f.debug_struct("ContainerMovieDecoder")
+        f.debug_struct("Mp4MovieDecoder")
             .field("codec", &codec)
             .field("width", &self.width)
             .field("height", &self.height)
@@ -66,30 +72,29 @@ impl fmt::Debug for ContainerMovieDecoder {
     }
 }
 
-impl ContainerMovieDecoder {
+impl Mp4MovieDecoder {
     pub(crate) fn supports_resource(resource: &str) -> bool {
-        matches!(
-            resource.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()),
-            Some(extension) if matches!(extension.as_str(), "mp4" | "mov" | "m4v" | "mkv" | "webm" | "ivf")
-        )
+        resource
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("mp4"))
     }
 
     pub(crate) fn probe(bytes: &[u8]) -> bool {
         format_registry().probe(bytes).is_some()
     }
 
-    pub(crate) fn new(bytes: &[u8], resource: &str) -> Option<Self> {
-        let extension = resource.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase());
-        if extension.as_deref() == Some("ivf") && bytes.get(8..12) == Some(b"AV01") {
-            return Self::new_av1_ivf(bytes);
-        }
+    pub(crate) fn new(bytes: MovieBytes, resource: &str) -> Option<Self> {
+        let bytes_slice = bytes.as_slice();
+        let extension = resource
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase());
         let registry = format_registry();
         let format_name = extension
             .as_deref()
             .and_then(|extension| registry.by_extension(extension).map(|format| format.name))
-            .or_else(|| registry.probe(bytes).map(|format| format.name))?;
+            .or_else(|| registry.probe(bytes_slice).map(|format| format.name))?;
         let mut demuxer = registry
-            .open_demuxer_seekable(format_name, Box::new(Cursor::new(bytes.to_vec())))
+            .open_demuxer_seekable(format_name, Box::new(Cursor::new(bytes)))
             .ok()?;
         let streams = demuxer.read_header().ok()?;
         let video = streams
@@ -115,10 +120,12 @@ impl ContainerMovieDecoder {
         let mut packets = Vec::new();
         let mut audio = Vec::new();
         let mut audio_written = false;
-        let audio_stream = streams
-            .iter()
-            .find(|stream| stream.media_type == MediaType::Audio && stream.codec_id == CodecId::Aac);
-        let mut audio_config = audio_stream.map(|stream| AacConfig::from_stream(stream.sample_rate, stream.channels, &stream.extradata));
+        let audio_stream = streams.iter().find(|stream| {
+            stream.media_type == MediaType::Audio && stream.codec_id == CodecId::Aac
+        });
+        let mut audio_config = audio_stream.map(|stream| {
+            AacConfig::from_stream(stream.sample_rate, stream.channels, &stream.extradata)
+        });
         let audio_index = audio_stream.map(|stream| stream.index);
         let mut first_packet_duration = None;
         let mut last_video_end_ms = 0_i64;
@@ -196,65 +203,6 @@ impl ContainerMovieDecoder {
             frame_interval_ms,
             duration_ms,
             audio: audio_written.then(|| StreamBytes(audio.into())),
-            flushed: false,
-            failed: false,
-        })
-    }
-
-    fn new_av1_ivf(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 32 || &bytes[..4] != b"DKIF" {
-            return None;
-        }
-        let width = u32::from(u16::from_le_bytes([bytes[12], bytes[13]]));
-        let height = u32::from(u16::from_le_bytes([bytes[14], bytes[15]]));
-        let rate_num = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
-        let rate_den = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
-        if width == 0 || height == 0 || rate_num == 0 || rate_den == 0 {
-            return None;
-        }
-        let time_base = rff_core::Rational::new(rate_den.min(i32::MAX as u32) as i32, rate_num.min(i32::MAX as u32) as i32);
-        let mut source = Vec::new();
-        let mut packets = Vec::new();
-        let mut offset = 32usize;
-        while offset + 12 <= bytes.len() {
-            let size = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
-            let pts = u64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().ok()?);
-            offset += 12;
-            let end = offset.checked_add(size)?;
-            let data = bytes.get(offset..end)?;
-            let start = source.len();
-            source.extend_from_slice(data);
-            packets.push(PacketRange {
-                pts: Some(pts.min(i64::MAX as u64) as i64),
-                duration: 1,
-                range: start..source.len(),
-            });
-            offset = end;
-        }
-        if packets.is_empty() || source.is_empty() {
-            return None;
-        }
-        let frame_interval_ms = ticks_to_ms(1, time_base).max(1);
-        let duration_ms = ticks_to_ms(
-            packets
-                .last()
-                .and_then(|packet| packet.pts)
-                .unwrap_or_default()
-                .saturating_add(1),
-            time_base,
-        );
-        Some(Self {
-            source,
-            packets,
-            decoder: new_decoder(CodecKind::Av1)?,
-            pending_frames: VecDeque::new(),
-            packet_index: 0,
-            codec: CodecKind::Av1,
-            width,
-            height,
-            frame_interval_ms,
-            duration_ms,
-            audio: None,
             flushed: false,
             failed: false,
         })
@@ -381,8 +329,6 @@ impl ContainerMovieDecoder {
 fn format_registry() -> FormatRegistry {
     let mut registry = FormatRegistry::new();
     rff_format_mp4::register(&mut registry);
-    rff_format_mkv::register(&mut registry);
-    rff_format_ivf::register(&mut registry);
     registry
 }
 
@@ -402,7 +348,11 @@ fn ticks_to_ms(ticks: i64, time_base: rff_core::Rational) -> i32 {
         .clamp(0, i32::MAX as i128) as i32
 }
 
-fn drain_vp9(decoder: &mut Vp9Decoder, pending: &mut VecDeque<DecodedImage>, flushing: bool) -> bool {
+fn drain_vp9(
+    decoder: &mut Vp9Decoder,
+    pending: &mut VecDeque<DecodedImage>,
+    flushing: bool,
+) -> bool {
     loop {
         match decoder.next_frame() {
             Ok(frame) => {
@@ -552,15 +502,29 @@ fn yuv_to_image(
             rgba[offset + 3] = 255;
         }
     }
-    Some(DecodedImage { width, height, rgba })
+    Some(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
 }
 
-fn plane_sample(plane: &[u8], y: usize, x: usize, stride: usize, sample_bytes: usize) -> Option<u16> {
-    let offset = y.checked_mul(stride)?.checked_add(x.checked_mul(sample_bytes)?)?;
+fn plane_sample(
+    plane: &[u8],
+    y: usize,
+    x: usize,
+    stride: usize,
+    sample_bytes: usize,
+) -> Option<u16> {
+    let offset = y
+        .checked_mul(stride)?
+        .checked_add(x.checked_mul(sample_bytes)?)?;
     if sample_bytes == 1 {
         Some(u16::from(*plane.get(offset)?))
     } else {
-        Some(u16::from_le_bytes(plane.get(offset..offset + 2)?.try_into().ok()?))
+        Some(u16::from_le_bytes(
+            plane.get(offset..offset + 2)?.try_into().ok()?,
+        ))
     }
 }
 
@@ -572,8 +536,13 @@ struct AacConfig {
 
 impl AacConfig {
     fn from_stream(sample_rate: u32, channels: u16, extra: &[u8]) -> Self {
-        let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
-        let fallback_frequency = rates.iter().position(|rate| *rate == sample_rate).unwrap_or(4) as u8;
+        let rates = [
+            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+        ];
+        let fallback_frequency = rates
+            .iter()
+            .position(|rate| *rate == sample_rate)
+            .unwrap_or(4) as u8;
         if extra.len() >= 2 {
             let object_type = extra[0] >> 3;
             let frequency_index = ((extra[0] & 7) << 1) | (extra[1] >> 7);
@@ -613,7 +582,66 @@ impl AacConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::AacConfig;
+    use super::{AacConfig, Mp4MovieDecoder};
+
+    #[test]
+    fn only_mp4_resources_are_claimed() {
+        assert!(Mp4MovieDecoder::supports_resource("clip.mp4"));
+        assert!(Mp4MovieDecoder::supports_resource("CLIP.MP4"));
+        assert!(!Mp4MovieDecoder::supports_resource("clip.mkv"));
+        assert!(!Mp4MovieDecoder::supports_resource("clip.webm"));
+        assert!(!Mp4MovieDecoder::supports_resource("clip.ivf"));
+        assert!(!Mp4MovieDecoder::supports_resource("clip.mov"));
+    }
+
+    #[test]
+    #[ignore = "requires ETHORNELL_MP4_TEST pointing to an H.264/AAC MP4 fixture"]
+    fn external_mp4_decodes_video_and_extracts_aac() {
+        let path = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_TEST").unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        let resource = path.file_name().unwrap().to_string_lossy();
+        let mut movie =
+            Mp4MovieDecoder::new(crate::MovieBytes::from_vec(bytes), &resource).expect("open MP4");
+        assert!(movie.duration_ms() > 0, "MP4 duration should be known");
+        let mut frame_count = 0usize;
+        let mut size = None;
+        while let Some(frame) = movie.next_frame() {
+            size.get_or_insert((frame.width, frame.height));
+            frame_count += 1;
+        }
+        assert!(
+            frame_count > 1_000,
+            "MP4 should decode the complete video timeline"
+        );
+        assert_eq!(size, Some((1280, 720)), "unexpected FD MP4 frame size");
+        assert!(
+            movie.take_audio().is_some(),
+            "AAC soundtrack should be retained"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ETHORNELL_MP4_TEST pointing to an H.264/AAC MP4 fixture"]
+    fn external_mp4_aac_plays_through_kira_mock_backend() {
+        use ethornell_audio::AudioSystem;
+        use kira::manager::AudioManagerSettings;
+        use kira::manager::backend::mock::{MockBackend, MockBackendSettings};
+
+        let path = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_TEST").unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        let resource = path.file_name().unwrap().to_string_lossy();
+        let mut movie =
+            Mp4MovieDecoder::new(crate::MovieBytes::from_vec(bytes), &resource).expect("open MP4");
+        let audio = movie.take_audio().expect("AAC soundtrack");
+        let mut settings = AudioManagerSettings::default();
+        settings.backend_settings = MockBackendSettings {
+            sample_rate: 48_000,
+        };
+        let mut system = AudioSystem::<MockBackend>::with_settings(settings).unwrap();
+        system
+            .play_stream_on_channel(1, audio.0, false, 1.0, 0)
+            .unwrap();
+    }
 
     #[test]
     fn adts_header_encodes_aac_lc_stereo_frame_length() {

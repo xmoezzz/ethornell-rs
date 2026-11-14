@@ -1619,14 +1619,13 @@ dependencies = [
  "ethornell-vm",
  "game-network",
  "image",
+ "kira 0.8.7",
  "libc",
  "na_mpeg2_decoder",
  "pelite",
  "pollster",
  "rff-core",
  "rff-format",
- "rff-format-ivf",
- "rff-format-mkv",
  "rff-format-mp4",
  "ruffle_core",
  "ruffle_render_wgpu",
@@ -4839,27 +4838,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rff-format-ivf"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dac1b61c2c8d9ee488e9c4ef42567ae8cb82601c749106ee79efc63aa36f109"
-dependencies = [
- "rff-core",
- "rff-format",
-]
-
-[[package]]
-name = "rff-format-mkv"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c4f550c733ebeaadc6794bbffe5fb6992e0b5379a516280e41f843b332d8c3"
-dependencies = [
- "rff-core",
- "rff-format",
- "rff-subtitle",
-]
-
-[[package]]
 name = "rff-format-mp4"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4868,12 +4846,6 @@ dependencies = [
  "rff-core",
  "rff-format",
 ]
-
-[[package]]
-name = "rff-subtitle"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e13540fbe16d4222a6012a82d39593d8496ea689f2ec8037daef8b68321437e"
 
 [[package]]
 name = "ring"

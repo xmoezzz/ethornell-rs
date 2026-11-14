@@ -8,6 +8,7 @@ use kira::manager::backend::DefaultBackend;
 pub mod pump;
 #[cfg(not(target_arch = "wasm32"))]
 mod streamed;
+mod resample;
 /// Desktop/mobile use cpal; web and native consoles pull the shared mixer.
 #[cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))]
 pub type PlatformBackend = DefaultBackend;
@@ -285,17 +286,19 @@ impl<B: Backend> AudioSystem<B> {
         {
             let intro = decode_static_sound(intro_bytes, StaticSoundSettings::default())?;
             let loop_sound = decode_static_sound(loop_bytes, StaticSoundSettings::default())?;
-            if intro.sample_rate != loop_sound.sample_rate {
-                return Err(EthornellError::Other(format!(
-                    "BGM pair sample-rate mismatch: intro={}Hz loop={}Hz",
-                    intro.sample_rate, loop_sound.sample_rate
-                )));
-            }
-
             let loop_start = intro.frames.len();
             let mut frames = Vec::with_capacity(loop_start.saturating_add(loop_sound.frames.len()));
             frames.extend_from_slice(&intro.frames);
-            frames.extend_from_slice(&loop_sound.frames);
+            if loop_sound.sample_rate == intro.sample_rate {
+                frames.extend_from_slice(&loop_sound.frames);
+            } else {
+                let loop_frames = resample::resample_all(
+                    &loop_sound.frames,
+                    loop_sound.sample_rate,
+                    intro.sample_rate,
+                );
+                frames.extend_from_slice(&loop_frames);
+            }
 
             let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
             if looped {
@@ -367,14 +370,10 @@ impl<B: Backend> AudioSystem<B> {
         let decoder =
             streamed::StreamedDecoder::new(intro.map(part), part(body), decode_gain.max(0.0) as f32)
                 .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
-        let (intro_rate, body_rate) = decoder.sample_rates();
-        if intro_rate != body_rate {
-            return Err(EthornellError::Other(format!(
-                "BGM pair sample-rate mismatch: intro={intro_rate}Hz loop={body_rate}Hz"
-            )));
-        }
         if let Some(loop_start) = loop_start {
-            let loop_start = decoder.body_start().saturating_add(loop_start);
+            let loop_start = decoder
+                .body_start()
+                .saturating_add(decoder.body_output_index(loop_start));
             settings = settings
                 .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
         }
