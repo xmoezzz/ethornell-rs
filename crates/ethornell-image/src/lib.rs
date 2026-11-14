@@ -107,6 +107,38 @@ pub fn detect_image_format(buf: &[u8]) -> ImageFormat {
     }
 }
 
+/// SenmomoFD sub_401F70 selects the format; sub_408AA0 normalizes 7 to 1.
+pub fn raw_bgi_native_bitmap_format(buf: &[u8]) -> Option<i32> {
+    if detect_image_format(buf) != ImageFormat::RawBgiImage {
+        return None;
+    }
+    match u16::from_le_bytes(buf.get(4..6)?.try_into().ok()?) {
+        8 => Some(3),
+        24 => Some(1),
+        32 => Some(match u16::from_le_bytes(buf.get(8..10)?.try_into().ok()?) {
+            4 => 4,
+            5 => 5,
+            7 => 1,
+            _ => 2,
+        }),
+        _ => None,
+    }
+}
+
+/// sub_402730 passes these unsigned WORDs to the bitmap registry when
+/// header word +0x0a is 1. They are metadata, not mandatory zero padding.
+pub fn raw_bgi_embedded_point(buf: &[u8]) -> Option<[i32; 2]> {
+    if !looks_like_raw_bgi_image(buf)
+        || u16::from_le_bytes(buf.get(10..12)?.try_into().ok()?) != 1
+    {
+        return None;
+    }
+    Some([
+        i32::from(u16::from_le_bytes(buf.get(12..14)?.try_into().ok()?)),
+        i32::from(u16::from_le_bytes(buf.get(14..16)?.try_into().ok()?)),
+    ])
+}
+
 pub fn decode_image(data: &[u8]) -> Result<DecodedImage> {
     match detect_image_format(data) {
         ImageFormat::CompressedBg => decode_cbg(data),
@@ -247,53 +279,125 @@ fn looks_like_raw_bgi_image(buf: &[u8]) -> bool {
     let Ok(height) = cursor.read_u16::<LittleEndian>() else {
         return false;
     };
-    let Ok(bpp) = cursor.read_u32::<LittleEndian>() else {
+    let Ok(bpp) = cursor.read_u16::<LittleEndian>() else {
         return false;
     };
-    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+    let Ok(flags) = cursor.read_u16::<LittleEndian>() else {
+        return false;
+    };
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || flags > 1 {
         return false;
     }
     let pixel_bytes = match bpp {
-        24 => 3usize,
-        32 => 4usize,
+        8 => 1usize,
+        24 => 3,
+        32 => 4,
         _ => return false,
     };
-    let expected = 16usize.saturating_add(width as usize * height as usize * pixel_bytes);
-    expected == buf.len()
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(pixel_bytes))
+        .and_then(|bytes| bytes.checked_add(16))
+        == Some(buf.len())
 }
 
 fn decode_raw_bgi_image(data: &[u8]) -> Result<DecodedImage> {
     let mut cursor = Cursor::new(data);
     let width = cursor.read_u16::<LittleEndian>()? as u32;
     let height = cursor.read_u16::<LittleEndian>()? as u32;
-    let bpp = cursor.read_u32::<LittleEndian>()?;
-    if !matches!(bpp, 24 | 32) {
+    let bpp = cursor.read_u16::<LittleEndian>()?;
+    let flags = cursor.read_u16::<LittleEndian>()?;
+    // sub_402730 accepts only direct pixels (0) or the channel-plane
+    // differential representation (1), not arbitrary nonzero flags.
+    if flags > 1 {
         return Err(EthornellError::UnsupportedFormat(format!(
-            "raw BGI image bpp {bpp} is not implemented"
+            "raw BGI image encoding {flags} is not implemented"
         )));
     }
-    let pixel_bytes = (bpp / 8) as usize;
-    let pixels = &data[16..];
-    let expected = width as usize * height as usize * pixel_bytes;
-    if pixels.len() != expected {
+    let pixel_bytes = match bpp {
+        8 => 1usize,
+        24 => 3,
+        32 => 4,
+        _ => {
+            return Err(EthornellError::UnsupportedFormat(format!(
+                "raw BGI image bpp {bpp} is not implemented"
+            )));
+        }
+    };
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(pixel_bytes))
+        .ok_or_else(|| EthornellError::Parse("raw BGI image dimensions overflow".into()))?;
+    let encoded = data
+        .get(16..)
+        .ok_or_else(|| EthornellError::Parse("raw BGI image header is truncated".into()))?;
+    if encoded.len() != expected {
         return Err(EthornellError::Parse(format!(
             "raw BGI image size mismatch: got {}, expected {expected}",
-            pixels.len()
+            encoded.len()
         )));
     }
+    let decoded;
+    let pixels = if flags != 0 {
+        decoded =
+            decode_scrambled_bgi_pixels(encoded, width as usize, height as usize, pixel_bytes);
+        decoded.as_slice()
+    } else {
+        encoded
+    };
+
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for pixel in pixels.chunks_exact(pixel_bytes) {
-        let b = pixel[0];
-        let g = pixel[1];
-        let r = pixel[2];
-        let a = if pixel_bytes == 4 { pixel[3] } else { 0xff };
-        rgba.extend_from_slice(&[r, g, b, a]);
+        match bpp {
+            8 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 0xff]),
+            24 => rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0xff]),
+            32 => rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]),
+            _ => unreachable!("validated above"),
+        }
     }
     Ok(DecodedImage {
         width,
         height,
         rgba,
     })
+}
+
+fn decode_scrambled_bgi_pixels(
+    encoded: &[u8],
+    width: usize,
+    height: usize,
+    pixel_bytes: usize,
+) -> Vec<u8> {
+    let stride = width * pixel_bytes;
+    let mut decoded = vec![0; encoded.len()];
+    let mut source = 0;
+    for channel in 0..pixel_bytes {
+        let mut destination = channel;
+        let mut value = 0u8;
+        let mut rows_remaining = height;
+        while rows_remaining > 0 {
+            for _ in 0..width {
+                value = value.wrapping_add(encoded[source]);
+                decoded[destination] = value;
+                source += 1;
+                destination += pixel_bytes;
+            }
+            rows_remaining -= 1;
+            if rows_remaining == 0 {
+                break;
+            }
+            destination += stride;
+            let mut position = destination;
+            for _ in 0..width {
+                position -= pixel_bytes;
+                value = value.wrapping_add(encoded[source]);
+                decoded[position] = value;
+                source += 1;
+            }
+            rows_remaining -= 1;
+        }
+    }
+    decoded
 }
 
 pub fn probe_image(buf: &[u8]) -> Result<ImageInfo> {
@@ -312,7 +416,7 @@ pub fn probe_image(buf: &[u8]) -> Result<ImageInfo> {
         Ok(ImageInfo {
             width: Some(cursor.read_u16::<LittleEndian>()? as u32),
             height: Some(cursor.read_u16::<LittleEndian>()? as u32),
-            bpp: Some(cursor.read_u32::<LittleEndian>()?),
+            bpp: Some(cursor.read_u16::<LittleEndian>()? as u32),
             format,
             cbg: None,
         })
@@ -463,6 +567,101 @@ mod tests {
             decode_image(&data).unwrap().rgba,
             vec![255, 0, 0, 255, 0, 0, 255, 255]
         );
+    }
+
+    fn raw_bgi_image(width: u16, height: u16, bpp: u16, flags: u16, pixels: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(16 + pixels.len());
+        data.extend_from_slice(&width.to_le_bytes());
+        data.extend_from_slice(&height.to_le_bytes());
+        data.extend_from_slice(&bpp.to_le_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(pixels);
+        data
+    }
+
+    #[test]
+    fn decodes_raw_bgi_8bpp_as_opaque_grayscale() {
+        let data = raw_bgi_image(2, 2, 8, 0, &[0, 64, 128, 255]);
+
+        assert_eq!(detect_image_format(&data), ImageFormat::RawBgiImage);
+        assert_eq!(raw_bgi_native_bitmap_format(&data), Some(3));
+        assert_eq!(
+            probe_image(&data).unwrap(),
+            ImageInfo {
+                width: Some(2),
+                height: Some(2),
+                bpp: Some(8),
+                format: ImageFormat::RawBgiImage,
+                cbg: None,
+            }
+        );
+        let image = decode_image(&data).unwrap();
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(
+            image.rgba,
+            vec![0, 0, 0, 255, 64, 64, 64, 255, 128, 128, 128, 255, 255, 255, 255, 255,]
+        );
+    }
+
+    #[test]
+    fn decodes_scrambled_raw_bgi_8bpp_rows_in_serpentine_order() {
+        let data = raw_bgi_image(2, 2, 8, 1, &[10, 10, 20, 246]);
+        let image = decode_image(&data).unwrap();
+
+        assert_eq!(
+            image.rgba,
+            vec![10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255]
+        );
+    }
+
+    #[test]
+    fn decodes_scrambled_raw_bgi_24bpp_channel_planes() {
+        let data = raw_bgi_image(
+            2,
+            2,
+            24,
+            1,
+            &[1, 1, 2, 255, 10, 10, 20, 246, 100, 10, 20, 246],
+        );
+        let image = decode_image(&data).unwrap();
+
+        assert_eq!(
+            image.rgba,
+            vec![
+                100, 10, 1, 255, 110, 20, 2, 255, 120, 30, 3, 255, 130, 40, 4, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_bgi_24_and_32bpp_keep_bgr_channel_order() {
+        let raw_24 = raw_bgi_image(1, 1, 24, 0, &[3, 2, 1]);
+        let rgb = decode_image(&raw_24).unwrap();
+        assert_eq!(raw_bgi_native_bitmap_format(&raw_24), Some(1));
+        assert_eq!(rgb.rgba, vec![1, 2, 3, 255]);
+
+        let raw_32 = raw_bgi_image(1, 1, 32, 0, &[3, 2, 1, 4]);
+        let rgba = decode_image(&raw_32).unwrap();
+        assert_eq!(raw_bgi_native_bitmap_format(&raw_32), Some(2));
+        assert_eq!(rgba.rgba, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn raw_bgi_header_metadata_is_not_zero_padding() {
+        for (subtype, format) in [(0u16, 2), (4, 4), (5, 5), (7, 1)] {
+            let mut data = raw_bgi_image(1, 1, 32, 0, &[3, 2, 1, 4]);
+            data[8..10].copy_from_slice(&subtype.to_le_bytes());
+            data[10..12].copy_from_slice(&1u16.to_le_bytes());
+            data[12..14].copy_from_slice(&123u16.to_le_bytes());
+            data[14..16].copy_from_slice(&456u16.to_le_bytes());
+            assert_eq!(detect_image_format(&data), ImageFormat::RawBgiImage);
+            assert_eq!(raw_bgi_native_bitmap_format(&data), Some(format));
+            assert_eq!(raw_bgi_embedded_point(&data), Some([123, 456]));
+        }
+        let data = raw_bgi_image(1, 1, 8, 2, &[1]);
+        assert_eq!(detect_image_format(&data), ImageFormat::Unknown);
+        assert!(decode_raw_bgi_image(&data).is_err());
     }
 
     #[test]
