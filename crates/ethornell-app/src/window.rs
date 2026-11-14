@@ -16,6 +16,7 @@ struct Graphics {
     window: Arc<dyn Window>,
     texture: Option<TextureHandle>,
     graph_textures: BTreeMap<String, CachedGraphTexture>,
+    presenter: frame_presenter::GpuPresenter,
     /// The game size the window was last fitted to.
     fitted_game_size: Option<(i32, i32)>,
 }
@@ -141,6 +142,7 @@ impl ApplicationHandler for WindowApp {
             window,
             texture,
             graph_textures,
+            presenter,
             fitted_game_size,
         }) = graphics.as_mut()
         else {
@@ -689,24 +691,8 @@ impl ApplicationHandler for WindowApp {
                 if let Some(runtime) = runtime.as_mut() {
                     runtime.api.performance_profile.begin();
                 }
-                // sub_462100: without a due presentation the window shows the
-                // last composed frame again (WM_PAINT path).
-                if runtime.as_mut().is_some_and(|runtime| !runtime.api.take_present_due()) {
-                    if let Some(runtime) = runtime.as_mut() {
-                        runtime.api.performance_profile.end(false);
-                    }
-                    window.pre_present_notify();
-                    if let Err(err) = renderer.render() {
-                        tracing::error!(%err, "render failed");
-                        if let Ok(mut slot) = failure.lock() {
-                            *slot = Some(err.to_string());
-                        }
-                        target.exit();
-                    }
-                    return;
-                }
-                let commands = if let Some(runtime) = runtime.as_ref() {
-                    match frame_presenter::prepare_frame(renderer, &runtime.api, graph_textures) {
+                let commands = if let Some(runtime) = runtime.as_mut() {
+                    match frame_presenter::prepare_frame(renderer, &mut runtime.api, graph_textures, presenter) {
                         Ok(commands) => commands,
                         Err(error) => {
                             if let Ok(mut slot) = failure.lock() {
@@ -754,11 +740,14 @@ impl ApplicationHandler for WindowApp {
                             z: 10,
                         });
                     }
-                    commands
+                    Some(commands)
                 };
-                renderer.submit(&commands);
+                let changed = commands.is_some();
+                if let Some(commands) = commands {
+                    renderer.submit(&commands);
+                }
                 if let Some(runtime) = runtime.as_mut() {
-                    runtime.api.performance_profile.end(true);
+                    runtime.api.performance_profile.end(changed);
                 }
                 window.pre_present_notify();
                 match renderer.render() {
@@ -833,6 +822,7 @@ impl WindowApp {
             window,
             texture,
             graph_textures: BTreeMap::new(),
+            presenter: frame_presenter::GpuPresenter::default(),
             fitted_game_size: None,
         })
     }
