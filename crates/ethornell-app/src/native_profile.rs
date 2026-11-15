@@ -20,6 +20,17 @@ struct Executable<'a> {
 }
 
 impl<'a> Executable<'a> {
+    fn imports_dll(&self, name: &str) -> bool {
+        use pelite::pe64::imports::Import as _;
+        let Ok(imports) = self.pe.imports() else { return false };
+        imports.iter().any(|desc| {
+            desc.dll_name()
+                .ok()
+                .and_then(|dll| dll.to_str().ok())
+                .is_some_and(|dll| dll.eq_ignore_ascii_case(name))
+        })
+    }
+
     fn code(&self, va: u64) -> Option<&'a [u8]> {
         let rva = u32::try_from(va.checked_sub(self.base)?).ok()?;
         let section = self.pe.section_headers().iter().find(|s| {
@@ -328,7 +339,15 @@ fn inspect_image(bytes: &[u8]) -> Option<Capabilities> {
         sound: bound,
         display_modes: exe.display_modes(),
         modern_tags,
-        fused_bp: tables.iter().any(|t| [0xd4,0xd5,0xd6,0xd7,0xd8,0xda,0xdb,0xdc,0xdd,0xde,0xdf,0xf4,0xf5,0xfa,0xfb].iter().all(|&i| exe.code(t[i]).is_some())),
+        fused_bp: tables.iter().any(|t| [0xd4,0xd5,0xd6,0xd7,0xd8,0xda,0xdb,0xdc,0xdd,0xde,0xdf,0xf4,0xf5,0xfa,0xfb].iter().all(|&i| exe.code(t[i]).is_some()))
+            // 顔のない月 -待宵の双椿- (NSM_MYST.exe, 2025) is an x64 Media
+            // Foundation build with the E2..FB fused family but no D4..DF.
+            // Its native tables (main 1401C9B70, B0 140160DD0, 81 140163DD0)
+            // match the ModernFused stack effects, not the Modern ones:
+            // B0:C5, 81:D8/DA/6C and the B0:6x/D0:Cx calls push results.
+            || (exe.width == 8
+                && exe.imports_dll("mfplat.dll")
+                && tables.iter().any(|t| [0xe2,0xe8,0xe9,0xea,0xf0,0xf1,0xf2,0xf4,0xf5,0xf7,0xf8,0xf9,0xfa,0xfb].iter().all(|&i| exe.code(t[i]).is_some()))),
         legacy_graph_extensions: exe.legacy_graph_extensions(),
         legacy_utf8_strings: exe.legacy_utf8_strings(),
     })

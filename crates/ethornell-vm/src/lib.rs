@@ -2011,9 +2011,13 @@ pub trait SoundApi {
     }
 
     /// B0:C5: GDI charset-filtered enumeration. Portable hosts may expose
-    /// their substituted stock CJK faces for DEFAULT/SHIFTJIS charsets only.
+    /// their substituted stock CJK faces for ANSI/DEFAULT/SHIFTJIS charsets.
     fn user_font_families_for_charset(&self, charset: u8) -> Vec<String> {
-        if matches!(charset, 1|128) { self.user_font_families() } else { Vec::new() }
+        // The stock Japanese faces also carry ANSI_CHARSET, so Windows lists
+        // them for charset 0 too. NSM_MYST's ipl._bp enumerates 128 then 0
+        // and frees each result buffer; an empty ANSI list leaves the
+        // previous (already freed) pointer behind and double-frees it.
+        if matches!(charset, 0|1|128) { self.user_font_families() } else { Vec::new() }
     }
 
 
@@ -18000,6 +18004,29 @@ mod tests {
             vm.mem_values.get(&vm.value_key(destination)),
             Some(&Value::Str("シナリオの台詞".into()))
         );
+    }
+
+    #[test]
+    fn modern_fused_font_enumeration_pushes_ansi_byte_count() {
+        // NSM_MYST ipl._bp enumerates charset 128 then 0 with B0:C5 and
+        // frees each result; 1400D3830 pushes the result of 14006B180.
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        let mut api = SchedulingApi {
+            font_families: vec!["ＭＳ ゴシック".into(), "ＭＳ 明朝".into()],
+            ..SchedulingApi::default()
+        };
+        let enumerate = test_instruction(0x10, 0xb0, "usr1", vec![0xb0, 0xc5], Vec::new());
+        let expected: usize = api
+            .font_families
+            .iter()
+            .map(|name| encoding_rs::SHIFT_JIS.encode(name).0.len() + 1)
+            .sum();
+
+        vm.stack.extend([Value::Int(12345), Value::Int(0), Value::Int(0)]);
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(expected as i32)]);
+        assert!(api.user_font_families_for_charset(134).is_empty());
     }
 
     #[test]
