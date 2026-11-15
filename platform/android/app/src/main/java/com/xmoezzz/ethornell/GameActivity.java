@@ -2,6 +2,9 @@ package com.xmoezzz.ethornell;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -54,6 +57,26 @@ public final class GameActivity extends Activity
     private boolean running;
     private final long[] eventMeta = new long[3];
 
+    // UI thread only: lifecycle and audio focus.
+    private final PauseState pauseState = new PauseState();
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private int audioFocusGeneration;
+    private boolean destroyed;
+
+    // Complete masks preserve overlapping Activity, window and audio focus
+    // interruptions. Regaining one focus must not clear the other pause.
+    static final class PauseState {
+        boolean resumed;
+        boolean windowFocused;
+        boolean audioFocused;
+
+        int mask() {
+            return (resumed ? 0 : NativeEngine.PAUSE_ACTIVITY)
+                    | (windowFocused && audioFocused ? 0 : NativeEngine.PAUSE_FOCUS);
+        }
+    }
+
     // UI thread only: the touch gesture in progress.
     private boolean leftDown;
     private boolean twoFinger;
@@ -72,6 +95,8 @@ public final class GameActivity extends Activity
         view.setOnTouchListener((v, event) -> onTouch(event));
         setContentView(view);
         hideSystemBars();
+        audioManager = getSystemService(AudioManager.class);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         if (Build.VERSION.SDK_INT >= 33) {
             getOnBackInvokedDispatcher()
                     .registerOnBackInvokedCallback(
@@ -373,29 +398,81 @@ public final class GameActivity extends Activity
         }
     }
 
+    private void publishPauseState() {
+        int mask = pauseState.mask();
+        if (engine != null && !destroyed) {
+            engine.post(() -> {
+                if (handle != 0 && running && NativeEngine.nativeSetPaused(handle, mask) < 0) {
+                    fail(NativeEngine.nativeLastError());
+                }
+            });
+        }
+    }
+
+    private void requestAudioFocus() {
+        if (!pauseState.resumed || destroyed || audioFocusRequest != null) {
+            return;
+        }
+        if (audioManager == null) {
+            pauseState.audioFocused = true;
+            publishPauseState();
+            return;
+        }
+        int generation = ++audioFocusGeneration;
+        audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAcceptsDelayedFocusGain(true)
+                .setWillPauseWhenDucked(true)
+                .setOnAudioFocusChangeListener(change -> {
+                    if (destroyed || generation != audioFocusGeneration) {
+                        return;
+                    }
+                    pauseState.audioFocused = change == AudioManager.AUDIOFOCUS_GAIN;
+                    if (change == AudioManager.AUDIOFOCUS_LOSS) {
+                        abandonAudioFocus();
+                    }
+                    publishPauseState();
+                }, ui).build();
+        int status = audioManager.requestAudioFocus(audioFocusRequest);
+        pauseState.audioFocused = status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        if (status == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
+            abandonAudioFocus();
+        }
+        publishPauseState();
+    }
+
+    private void abandonAudioFocus() {
+        ++audioFocusGeneration;
+        pauseState.audioFocused = false;
+        if (audioManager != null && audioFocusRequest != null) {
+            audioManager.abandonAudioFocusRequest(audioFocusRequest);
+        }
+        audioFocusRequest = null;
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
         hideSystemBars();
-        engine.post(() -> {
-            if (handle != 0) {
-                NativeEngine.nativeSetPaused(handle, 0);
-            }
-        });
+        pauseState.resumed = true;
+        publishPauseState();
+        requestAudioFocus();
     }
 
     @Override
     protected void onPause() {
-        engine.post(() -> {
-            if (handle != 0) {
-                NativeEngine.nativeSetPaused(handle, NativeEngine.PAUSE_ACTIVITY);
-            }
-        });
+        pauseState.resumed = false;
+        abandonAudioFocus();
+        publishPauseState();
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        abandonAudioFocus();
         engine.post(() -> {
             running = false;
             if (handle != 0) {
@@ -410,9 +487,15 @@ public final class GameActivity extends Activity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        pauseState.windowFocused = hasFocus;
         if (hasFocus) {
             hideSystemBars();
+            requestAudioFocus();
+        } else {
+            leftDown = false;
+            twoFinger = false;
         }
+        publishPauseState();
     }
 
     @SuppressWarnings("deprecation")
@@ -444,6 +527,7 @@ public final class GameActivity extends Activity
         float y = event.getY(0);
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                requestAudioFocus();
                 twoFinger = false;
                 leftDown = true;
                 input(NativeEngine.INPUT_MOVE, x, y, 0, 0);
