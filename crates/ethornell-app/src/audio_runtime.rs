@@ -233,10 +233,12 @@ pub(crate) fn execute_audio_command(
     audio: Option<&mut ethornell_audio::AudioSystem>,
     command: AudioCommand,
     frontend: &'static str,
-) {
-    if let Err(error) = execute_audio_command_checked(audio, command, frontend) {
+) -> ethornell_core::Result<()> {
+    let result = execute_audio_command_checked(audio, command, frontend);
+    if let Err(error) = &result {
         tracing::warn!(frontend, %error, "script audio command failed");
     }
+    result
 }
 
 /// A host must propagate this result before claiming a successful tick. None
@@ -328,17 +330,21 @@ pub(crate) fn execute_audio_command_checked(
             volume,
             start_ms,
         } => {
-            match audio.play_stream_on_channel(channel, bytes.0.clone(), false, volume, start_ms) {
-                Ok(()) => tracing::info!(
-                    frontend,
-                    channel,
-                    volume,
-                    start_ms,
-                    bytes = bytes.0.len(),
-                    "movie audio playback requested"
-                ),
-                Err(err) => tracing::warn!(frontend, channel, %err, "movie audio playback failed"),
-            }
+            audio
+                .play_stream_on_channel(channel, bytes.0.clone(), false, volume, start_ms)
+                .map_err(|error| {
+                    ethornell_core::EthornellError::Other(format!(
+                        "movie audio playback failed on channel {channel}: {error}"
+                    ))
+                })?;
+            tracing::info!(
+                frontend,
+                channel,
+                volume,
+                start_ms,
+                bytes = bytes.0.len(),
+                "movie audio playback requested"
+            );
         }
         AudioCommand::Pause {
             channel,
@@ -355,7 +361,7 @@ pub(crate) fn execute_audio_command_checked(
             );
         }
         AudioCommand::Stop { channel, fade_ms } => {
-            audio.stop_channel(channel, fade_ms);
+            audio.try_stop_channel(channel, fade_ms)?;
             tracing::debug!(frontend, channel, fade_ms, "script audio channel stopped");
         }
         AudioCommand::SetVolume {
@@ -363,7 +369,7 @@ pub(crate) fn execute_audio_command_checked(
             volume,
             fade_ms,
         } => {
-            audio.set_channel_volume(channel, volume, fade_ms);
+            audio.try_set_channel_volume(channel, volume, fade_ms)?;
             tracing::debug!(
                 frontend,
                 channel,

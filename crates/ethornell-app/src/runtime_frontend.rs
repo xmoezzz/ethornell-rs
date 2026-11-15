@@ -18,8 +18,17 @@ pub(crate) fn drive_runtime_frame(
         elapsed_ms,
         audio_elapsed_ms,
     );
-    while let Some(request) = runtime.api.audio_requests.pop_front() {
-        execute_audio_command(audio.as_deref_mut(), request, frontend);
+    let mut requests =
+        coalesce_channel_replacements(std::mem::take(&mut runtime.api.audio_requests));
+    while let Some(request) = requests.pop_front() {
+        if audio_runtime::execute_audio_command(audio.as_deref_mut(), request.clone(), frontend)
+            .is_err()
+            && audio.is_some()
+        {
+            requests.push_front(request);
+            runtime.api.audio_requests = requests;
+            break;
+        }
     }
     report
 }
@@ -51,13 +60,75 @@ pub(crate) fn drive_runtime_frame_checked(
         elapsed_ms,
         audio_elapsed_ms,
     );
-    while let Some(request) = runtime.api.audio_requests.pop_front() {
+    let mut requests =
+        coalesce_channel_replacements(std::mem::take(&mut runtime.api.audio_requests));
+    while let Some(request) = requests.pop_front() {
         if !audio_required && audio.is_none() {
             continue;
         }
-        audio_runtime::execute_audio_command_checked(audio.as_deref_mut(), request, frontend)?;
+        if let Err(error) = audio_runtime::execute_audio_command_checked(
+            audio.as_deref_mut(),
+            request.clone(),
+            frontend,
+        ) {
+            requests.push_front(request);
+            runtime.api.audio_requests = requests;
+            return Err(error);
+        }
     }
     Ok(report)
+}
+
+fn coalesce_channel_replacements(commands: VecDeque<AudioCommand>) -> VecDeque<AudioCommand> {
+    let commands = commands.into_iter().collect::<Vec<_>>();
+    let mut last_play = std::collections::BTreeMap::new();
+    let mut last_stop = std::collections::BTreeMap::new();
+    for (index, command) in commands.iter().enumerate() {
+        match command {
+            AudioCommand::Play { channel, .. } | AudioCommand::PlayStream { channel, .. } => {
+                last_play.insert(*channel, index);
+            }
+            AudioCommand::Stop { channel, .. } => {
+                last_stop.insert(*channel, index);
+            }
+            _ => {}
+        }
+    }
+
+    let mut keep = vec![true; commands.len()];
+    let channels = last_play
+        .keys()
+        .chain(last_stop.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for channel in channels {
+        let latest_play = last_play.get(&channel).copied();
+        let latest_stop = last_stop.get(&channel).copied();
+        let keep_play = latest_play.filter(|play| latest_stop.is_none_or(|stop| stop < *play));
+        for (index, command) in commands.iter().enumerate() {
+            match command {
+                AudioCommand::Play {
+                    channel: current, ..
+                }
+                | AudioCommand::PlayStream {
+                    channel: current, ..
+                } if *current == channel && Some(index) != keep_play => {
+                    keep[index] = false;
+                }
+                AudioCommand::Stop {
+                    channel: current, ..
+                } if *current == channel && Some(index) != latest_stop => {
+                    keep[index] = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    commands
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(command, keep)| keep.then_some(command))
+        .collect()
 }
 
 fn drive_frame(
@@ -95,6 +166,74 @@ fn drive_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_play(channel: i32, file: &str) -> AudioCommand {
+        AudioCommand::Play {
+            asset: AudioAsset {
+                archive: "bgm.arc".into(),
+                file: file.into(),
+                bytes: Vec::new(),
+            },
+            loop_asset: None,
+            channel,
+            looped: true,
+            volume: 1.0,
+            decode_gain: 1.0,
+            playback_rate: 1.0,
+            panning: 0.5,
+            fade_ms: 0,
+            restart: true,
+        }
+    }
+
+    #[test]
+    fn rapid_same_channel_replacements_keep_only_the_latest_track() {
+        let requests = VecDeque::from([
+            AudioCommand::Stop {
+                channel: 1,
+                fade_ms: 0,
+            },
+            test_play(1, "first"),
+            AudioCommand::Stop {
+                channel: 1,
+                fade_ms: 0,
+            },
+            test_play(1, "latest"),
+            test_play(2, "other-channel"),
+        ]);
+
+        let requests = coalesce_channel_replacements(requests);
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(requests[0], AudioCommand::Stop { channel: 1, .. }));
+        match &requests[1] {
+            AudioCommand::Play { channel, asset, .. } => {
+                assert_eq!(*channel, 1);
+                assert_eq!(asset.file, "latest");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+        match &requests[2] {
+            AudioCommand::Play { channel, asset, .. } => {
+                assert_eq!(*channel, 2);
+                assert_eq!(asset.file, "other-channel");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn a_final_stop_suppresses_queued_same_channel_plays() {
+        let requests = coalesce_channel_replacements(VecDeque::from([
+            test_play(1, "obsolete"),
+            AudioCommand::Stop {
+                channel: 1,
+                fade_ms: 0,
+            },
+        ]));
+
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], AudioCommand::Stop { channel: 1, .. }));
+    }
 
     #[test]
     fn required_audio_failure_does_not_consume_input_or_advance_vm() {

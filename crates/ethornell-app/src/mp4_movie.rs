@@ -8,8 +8,12 @@ use std::io::Cursor;
 use ethornell_image::DecodedImage;
 use rff_core::{CodecId, Error as DemuxError, MediaType, Rational};
 use rff_format::{Demuxer, FormatRegistry, Stream};
-use rust_h264::decoder::{Frame, OrderedDecoder};
+use rust_h264::decoder::Frame;
+#[cfg(target_arch = "wasm32")]
+use rust_h264::decoder::OrderedDecoder as H264Decoder;
 use rust_h264::nal::{NalUnitType, parse_annex_b};
+#[cfg(not(target_arch = "wasm32"))]
+use rust_h264::threading::ThreadedDecoder as H264Decoder;
 
 use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
@@ -54,10 +58,11 @@ pub(crate) struct Mp4MovieDecoder {
     demuxer: Box<dyn Demuxer>,
     video_index: usize,
     time_base: Rational,
-    decoder: OrderedDecoder<Timing>,
+    decoder: H264Decoder,
     #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
     extra: Option<codecs::Decoder>,
     pending: VecDeque<TimedFrame>,
+    pending_timings: Vec<Timing>,
     current: Option<TimedFrame>,
     delivered: bool,
     color: Color,
@@ -187,10 +192,11 @@ impl Mp4MovieDecoder {
             demuxer,
             video_index,
             time_base,
-            decoder: OrderedDecoder::new(),
+            decoder: h264_decoder(),
             #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
             extra,
             pending: VecDeque::new(),
+            pending_timings: Vec::new(),
             current: None,
             delivered: false,
             color: Color::default(),
@@ -229,12 +235,13 @@ impl Mp4MovieDecoder {
     }
     pub(crate) fn reset(&mut self) {
         self.pending.clear();
+        self.pending_timings.clear();
         self.current = None;
         self.delivered = false;
         self.frame_index = None;
         self.requested_ms = 0;
         self.color = Color::default();
-        self.decoder = OrderedDecoder::new();
+        self.decoder = h264_decoder();
         self.eof = false;
         self.failed = false;
         #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
@@ -307,7 +314,7 @@ impl Mp4MovieDecoder {
                         }
                         continue;
                     }
-                    let frames = self.decoder.flush_with_meta();
+                    let frames = self.decoder.flush();
                     if !self.queue(frames) {
                         return None;
                     }
@@ -339,6 +346,7 @@ impl Mp4MovieDecoder {
                 self.failed = true;
                 return None;
             }
+            let mut timing_added = false;
             for nal in nals {
                 if nal.nal_unit_type == NalUnitType::Sps {
                     if let Some(color) = sps_color(&nal.rbsp) {
@@ -348,11 +356,24 @@ impl Mp4MovieDecoder {
                         return None;
                     }
                 }
-                let timing = Timing {
-                    pts,
-                    color: self.color,
-                };
-                match self.decoder.decode_nal_with_meta(&nal, timing) {
+                if !timing_added
+                    && matches!(
+                        nal.nal_unit_type,
+                        NalUnitType::Slice | NalUnitType::SliceIdr
+                    )
+                {
+                    if self.pending_timings.len() >= MAX_PENDING_FRAMES {
+                        self.failed = true;
+                        tracing::warn!("MP4 picture timing queue exceeded its bound");
+                        return None;
+                    }
+                    self.pending_timings.push(Timing {
+                        pts,
+                        color: self.color,
+                    });
+                    timing_added = true;
+                }
+                match self.decoder.decode_nal(&nal) {
                     Ok(frames) => {
                         if !self.queue(frames) {
                             return None;
@@ -367,18 +388,37 @@ impl Mp4MovieDecoder {
             }
         }
     }
-    fn queue(&mut self, frames: Vec<(Frame, Timing)>) -> bool {
-        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES {
+    fn queue(&mut self, frames: Vec<Frame>) -> bool {
+        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES
+            || frames.len() > self.pending_timings.len()
+        {
             self.failed = true;
             tracing::warn!("MP4 picture queue exceeded its bound");
             return false;
         }
-        self.pending
-            .extend(frames.into_iter().map(|(frame, timing)| TimedFrame {
+        let mut timed = VecDeque::with_capacity(frames.len());
+        for frame in frames {
+            let Some(timing) = self.take_earliest_timing() else {
+                self.failed = true;
+                tracing::warn!("MP4 decoder produced a frame without timing");
+                return false;
+            };
+            timed.push_back(TimedFrame {
                 frame: Picture::H264(frame),
                 timing,
-            }));
+            });
+        }
+        self.pending.extend(timed);
         true
+    }
+    fn take_earliest_timing(&mut self) -> Option<Timing> {
+        let index = self
+            .pending_timings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, timing)| timing.pts)
+            .map(|(index, _)| index)?;
+        Some(self.pending_timings.swap_remove(index))
     }
     #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
     fn queue_extra(&mut self, frames: Option<Vec<(codecs::Picture, i64)>>) -> bool {
@@ -402,6 +442,19 @@ impl Mp4MovieDecoder {
         true
     }
 }
+fn h264_decoder() -> H264Decoder {
+    // Preserve native picture-worker decoding; browsers without Rust threads
+    // keep the serial implementation and the same display-order contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        H264Decoder::new(4)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        H264Decoder::new()
+    }
+}
+
 fn due(pts: i64, base: Rational, position_ms: i32) -> bool {
     pts as i128 * base.num as i128 * 1000 <= position_ms as i128 * base.den as i128
 }
@@ -914,8 +967,11 @@ mod tests {
     #[ignore = "requires generated VP9/AV1 MP4, reference YUV and PTS in ETHORNELL_MP4_FIXTURES"]
     fn mp4_external_vp9_av1_depth_pts_reference_and_lifecycle() {
         let dir = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_FIXTURES").unwrap());
-        for codec in ["vp9", "av1"] {
+        for codec in ["vp9", "av1", "h264"] {
             for depth in [8, 10] {
+                if codec == "h264" && depth == 10 {
+                    continue;
+                }
                 let name = format!("{codec}-{depth}");
                 let file = format!("{name}.mp4");
                 let source = MovieBytes::from_vec(std::fs::read(dir.join(&file)).unwrap());
@@ -932,7 +988,7 @@ mod tests {
                 let frame_len = y_len + 2 * c_len;
                 assert_eq!(yuv.len(), pts.len() * frame_len);
                 let mut movie = Mp4MovieDecoder::new(source.clone(), &file).expect(&name);
-                assert!(movie.extra.is_some());
+                assert_eq!(movie.extra.is_some(), codec != "h264");
                 assert_eq!(movie.size(), Some((96, 64)));
                 let mut first = None;
                 for (i, &pts) in pts.iter().enumerate() {
