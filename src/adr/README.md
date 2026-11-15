@@ -14,6 +14,7 @@ transcripts or re-running IDA.
 | [0005](0005-vm-value-model.md) | The VM uses BGI 1.622's value and address model | In progress |
 | [0006](0006-houkago-fd-runtime-limits.md) | Houkago Cinderella FD runtime limits | Startup limits verified; remaining differences open |
 | [0007](0007-defer-dll-plugins-until-required.md) | Defer DLL plugins until required by a game | Accepted |
+| [0008](0008-bgi-versioned-compatibility.md) | Select native behavior by BGI compatibility and engine version | Accepted |
 
 Template: `# NNNN. Title`, then **Status**, **Context**, **Decision**,
 **Consequences**, and (while open) **Progress / next step**.

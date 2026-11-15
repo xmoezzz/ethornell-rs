@@ -541,7 +541,19 @@ pub(super) fn apply(manager: &ResourceManager, profile: &mut NativeRuntimeProfil
         }
         detected = Some(caps);
     }
-    let Some(caps) = detected else { return Ok(()) };
+    let Some(caps) = detected else {
+        tracing::warn!(
+            abi = ?profile.abi,
+            "BGI runtime metadata unavailable; retaining legacy resource/default profile; Compatibility remains unknown"
+        );
+        return Ok(());
+    };
+    if caps.version.compatibility.is_none() {
+        tracing::info!(
+            engine = ?caps.version.engine,
+            "BGI Compatibility not declared; using executable dispatch-layout evidence"
+        );
+    }
     if let Some((code, data)) = caps.regions {
         profile.main_code_bytes = code;
         profile.main_data_bytes = data;
@@ -595,6 +607,11 @@ mod tests {
         assert!(NativeVersion::read(None, Some("Version : 1.687 - Compatibility : 1.73")).is_err());
         assert!(NativeVersion::read(None, Some("Version : 1.687 - Compatibility : 1.72.0")).is_err());
         assert_eq!(NativeVersion::read(Some([1,69,444,2]), Some("ver 1.69 ( build : 444.2 )")).unwrap().engine, Some([1,69,444,2]));
+        let missing_compat = NativeVersion::read(Some([1,686,4,0]), Some("Version : 1.686.4")).unwrap();
+        assert_eq!(missing_compat.compatibility, None);
+        assert!(missing_compat.fused(8, false, true).unwrap());
+        let missing_metadata = NativeVersion::read(None, None).unwrap();
+        assert_eq!(missing_metadata, NativeVersion::default());
         assert!(!NativeVersion::default().fused(4, false, false).unwrap());
     }
 

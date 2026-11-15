@@ -2,6 +2,11 @@
 
 **Status:** Startup limits verified (2026-11-05); other version differences open.
 
+Profile selection is extended by [ADR 0008](0008-bgi-versioned-compatibility.md).
+The resource-based recognition below remains a legacy fallback; new support
+uses BGI's declared compatibility and actual engine version with native
+behavior confirmation. The recovered runtime limits remain reference facts.
+
 ## Follow-up: BackML source-position curve
 
 The first heroine's route subsequently fails at Graph90:38, property 0x8E
