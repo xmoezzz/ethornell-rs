@@ -66,3 +66,7 @@ This project belongs to `CrySirror` [project](https://github.com/xmoezzz/CrySirr
 1. Bug fixes and improvements for the original Ethornell / BURIKO General Interpreter (a.k.a. "BGI") engine is acceptable in this repository. 
 
 2. If you want to support a new platform (e.g. game console), please create an issue or pull request in the `CrySirror` repository instead of this one. 
+
+## License
+
+Licensed under the [Mozilla Public License 2.0](LICENSE).
