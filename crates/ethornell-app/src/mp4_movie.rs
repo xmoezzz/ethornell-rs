@@ -8,8 +8,9 @@ use std::io::Cursor;
 use ethornell_image::DecodedImage;
 use rff_core::{CodecId, Error as DemuxError, MediaType, Rational};
 use rff_format::{Demuxer, FormatRegistry, Stream};
-use rust_h264::decoder::{Frame, OrderedDecoder};
+use rust_h264::decoder::Frame;
 use rust_h264::nal::{NalUnitType, parse_annex_b};
+use rust_h264::threading::ThreadedDecoder;
 
 use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
@@ -46,8 +47,9 @@ pub(crate) struct Mp4MovieDecoder {
     demuxer: Box<dyn Demuxer>,
     video_index: usize,
     time_base: Rational,
-    decoder: OrderedDecoder<Timing>,
+    decoder: ThreadedDecoder,
     pending: VecDeque<TimedFrame>,
+    pending_timings: Vec<Timing>,
     current: Option<TimedFrame>,
     delivered: bool,
     color: Color,
@@ -162,8 +164,9 @@ impl Mp4MovieDecoder {
             demuxer,
             video_index,
             time_base,
-            decoder: OrderedDecoder::new(),
+            decoder: ThreadedDecoder::new(4),
             pending: VecDeque::new(),
+            pending_timings: Vec::new(),
             current: None,
             delivered: false,
             color: Color::default(),
@@ -202,12 +205,13 @@ impl Mp4MovieDecoder {
     }
     pub(crate) fn reset(&mut self) {
         self.pending.clear();
+        self.pending_timings.clear();
         self.current = None;
         self.delivered = false;
         self.frame_index = None;
         self.requested_ms = 0;
         self.color = Color::default();
-        self.decoder = OrderedDecoder::new();
+        self.decoder = ThreadedDecoder::new(4);
         self.eof = false;
         self.failed = false;
         match open(self.source.clone()) {
@@ -262,7 +266,7 @@ impl Mp4MovieDecoder {
                 Ok(packet) => packet,
                 Err(DemuxError::Eof) => {
                     self.eof = true;
-                    let frames = self.decoder.flush_with_meta();
+                    let frames = self.decoder.flush();
                     if !self.queue(frames) {
                         return None;
                     }
@@ -286,6 +290,7 @@ impl Mp4MovieDecoder {
                 self.failed = true;
                 return None;
             }
+            let mut timing_added = false;
             for nal in nals {
                 if nal.nal_unit_type == NalUnitType::Sps {
                     if let Some(color) = sps_color(&nal.rbsp) {
@@ -295,11 +300,21 @@ impl Mp4MovieDecoder {
                         return None;
                     }
                 }
-                let timing = Timing {
-                    pts,
-                    color: self.color,
-                };
-                match self.decoder.decode_nal_with_meta(&nal, timing) {
+                if !timing_added
+                    && matches!(nal.nal_unit_type, NalUnitType::Slice | NalUnitType::SliceIdr)
+                {
+                    if self.pending_timings.len() >= MAX_PENDING_FRAMES {
+                        self.failed = true;
+                        tracing::warn!("MP4 picture timing queue exceeded its bound");
+                        return None;
+                    }
+                    self.pending_timings.push(Timing {
+                        pts,
+                        color: self.color,
+                    });
+                    timing_added = true;
+                }
+                match self.decoder.decode_nal(&nal) {
                     Ok(frames) => {
                         if !self.queue(frames) {
                             return None;
@@ -314,18 +329,36 @@ impl Mp4MovieDecoder {
             }
         }
     }
-    fn queue(&mut self, frames: Vec<(Frame, Timing)>) -> bool {
-        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES {
+
+    fn queue(&mut self, frames: Vec<Frame>) -> bool {
+        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES
+            || frames.len() > self.pending_timings.len()
+        {
             self.failed = true;
             tracing::warn!("MP4 picture queue exceeded its bound");
             return false;
         }
-        self.pending.extend(
-            frames
-                .into_iter()
-                .map(|(frame, timing)| TimedFrame { frame, timing }),
-        );
+        let mut timed = VecDeque::with_capacity(frames.len());
+        for frame in frames {
+            let Some(timing) = self.take_earliest_timing() else {
+                self.failed = true;
+                tracing::warn!("MP4 decoder produced a frame without timing");
+                return false;
+            };
+            timed.push_back(TimedFrame { frame, timing });
+        }
+        self.pending.extend(timed);
         true
+    }
+
+    fn take_earliest_timing(&mut self) -> Option<Timing> {
+        let index = self
+            .pending_timings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, timing)| timing.pts)
+            .map(|(index, _)| index)?;
+        Some(self.pending_timings.swap_remove(index))
     }
 }
 fn due(pts: i64, base: Rational, position_ms: i32) -> bool {
