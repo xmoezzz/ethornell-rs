@@ -394,12 +394,12 @@ pub(crate) fn compose_runtime_region(
     }
 
     if include_text && std::env::var_os("ETHORNELL_SNAPSHOT_HIDE_TEXT").is_none() {
-        for node in api.text_nodes.values() {
+        for node in api.text_nodes.values().flat_map(|n| api.presentation_text_nodes(n)) {
             if maximum_priority.is_none_or(|maximum| node.z <= maximum)
-                && api.should_draw_text_node(node)
+                && api.should_draw_text_node(&node)
             {
-                let mut positioned = node.clone();
-                positioned.style_spans = api.text_node_style_spans(node);
+                let mut positioned = (*node).clone();
+                positioned.style_spans = api.text_node_style_spans(&node);
                 if let Some(surface) = node
                     .target_surface
                     .filter(|surface| api.graph_surfaces.contains_key(surface))
@@ -520,6 +520,8 @@ pub(crate) fn compose_graph_object(
     let mut out = new_raster(width.max(1), height.max(1))?;
 
     if let Some(surface) = surface
+        && !api.graph_object_properties.get(&surface.id)
+            .and_then(|p| p.properties.get(&0x88)).is_some_and(|v| v.0 == 0)
         && let Some(resource_id) = surface.resource_id
         && let Some((key, region)) = api.resource_image_region(resource_id)
         && let Some(source) = api.graph_images.get(key)
@@ -566,13 +568,13 @@ pub(crate) fn compose_graph_object(
         composite_runtime_item(&mut out, source, &item);
     }
 
-    for node in selected_text {
+    for node in selected_text.into_iter().flat_map(|n| api.presentation_text_nodes(n)) {
         if !node.enabled || !api.object_enabled_for_layer(node.owner_object) || node.text.is_empty()
         {
             continue;
         }
-        let mut positioned = node.clone();
-        positioned.style_spans = api.text_node_style_spans(node);
+        let mut positioned = (*node).clone();
+        positioned.style_spans = api.text_node_style_spans(&node);
         if let Some(surface) = node
             .target_surface
             .filter(|surface| api.graph_surfaces.contains_key(surface))

@@ -216,6 +216,7 @@ fn compose_commands(
         .text_nodes
         .values()
         .filter(|n| api.should_draw_text_node(n))
+        .flat_map(|n| api.presentation_text_nodes(n))
     {
         // compose_commands is also exercised without a GPU in regression tests.
         validate_text(&node.text, node.size)?;
@@ -227,7 +228,7 @@ fn compose_commands(
                 (x, y, api.surface_display_opacity(s))
             })
             .unwrap_or((0.0, 0.0, 1.0));
-        let layout = api.formatted_text_layout(node);
+        let layout = api.formatted_text_layout(&node);
         // Laid-out (window) text starts a line every `layout.line_height`,
         // as the CPU compositor and the ruby above it do.
         let node_line_height = node.formatted_layout.then_some(layout.line_height);
@@ -243,7 +244,7 @@ fn compose_commands(
         color[3] *= parent.2;
         let z = text_render_z(node.z);
         let styles = api
-            .text_node_style_spans(node)
+            .text_node_style_spans(&node)
             .iter()
             .map(|s| TextStyleSpan {
                 start_char: s.start_char,
@@ -260,7 +261,7 @@ fn compose_commands(
                 ..*s
             })
             .collect::<Vec<_>>();
-        let node_shadow = api.text_node_shadow(node);
+        let node_shadow = api.text_node_shadow(&node);
         let mut glow = None;
         match node_shadow {
             TextNodeShadow::Message(Some(effect)) if effect.mode == 2 => {
@@ -324,7 +325,7 @@ fn compose_commands(
             clip,
             z,
         });
-        let mut positioned = node.clone();
+        let mut positioned = (*node).clone();
         positioned.x = x;
         positioned.y = cursor_y;
         for (ruby, x, y, size) in text::ruby_draw_runs(&positioned, layout) {

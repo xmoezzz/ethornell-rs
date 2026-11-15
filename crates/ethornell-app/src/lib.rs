@@ -5962,6 +5962,38 @@ impl RuntimeTraceApi {
         self.registered_pointer_input_scopes.unregister_one(packed);
     }
 
+    /// CProcCtrlDspObj reads virtual position/alpha getters. BackML's
+    /// overrides address the selected layer (Itsusora 410680/4106C0), not
+    /// CDspObj's otherwise unused ordinary coordinate and alpha fields.
+    fn graph_control_origin(&self, object: i32) -> ((i32, i32), i32) {
+        if self
+            .graph_object_properties
+            .get(&object)
+            .and_then(|p| p.background)
+            .is_some_and(|b| b.class == NativeBackgroundClass::BackMl)
+        {
+            let layer = &self.graph91_multilayer_background.layers
+                [self.graph91_multilayer_background.selected_layer];
+            return ((layer.x_16_16, layer.y_16_16), layer.blend_parameter);
+        }
+        let position = self.graph_native_base_position(object).unwrap_or_else(|| {
+            let (x, y) = self.graph_object_position(object);
+            (x.round() as i32, y.round() as i32)
+        });
+        // Sprite mode 1 overrides GetAlpha with its transition value.
+        let alpha = self
+            .graph_transition_nodes
+            .get(&object)
+            .filter(|t| t.blend_selector == 1)
+            .map(|t| t.alpha_multiplier.clamp(0, 256))
+            .unwrap_or_else(|| {
+                self.graph_object_properties
+                    .get(&object)
+                    .map_or(0, |p| p.alpha_parameter())
+            });
+        (position, alpha)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn schedule_native_cdspobj_control(
         &mut self,
@@ -5995,31 +6027,8 @@ impl RuntimeTraceApi {
             ));
         }
 
-        let native_position = self
-            .graph_object_properties
-            .get(&object)
-            .map(|properties| (properties.native.position_x, properties.native.position_y))
-            .unwrap_or_else(|| {
-                let (x, y) = self.graph_object_position(object);
-                (x.round() as i32, y.round() as i32)
-            });
+        let (native_position, from_transparency) = self.graph_control_origin(object);
         let target_position = target_position.unwrap_or(native_position);
-        // CProcCtrlDspObj captures vtable +76 (GetAlpha).  CDspObjSprite
-        // overrides it: selector 1 returns the mode-1 transition value at
-        // +0x240, while the other recovered selectors return base CDspObj
-        // transparency (+0xAC).  Reading only portable base properties here
-        // caused mode-1 Sprite transitions to jump to the wrong start value.
-        let from_transparency = self
-            .graph_transition_nodes
-            .get(&object)
-            .filter(|transition| transition.blend_selector == 1)
-            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
-            .unwrap_or_else(|| {
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .alpha_parameter()
-            });
         // sub_41B740 calls selector -1 of sub_41B750, which reads the
         // WORD at CDspObj+0xBA: only the integer/high half of +0xB8 survives
         // when a control starts. The native updater then reconstructs 16.16
@@ -6111,25 +6120,7 @@ impl RuntimeTraceApi {
             )));
         }
 
-        let native_position = self
-            .graph_object_properties
-            .get(&object)
-            .map(|properties| (properties.native.position_x, properties.native.position_y))
-            .unwrap_or_else(|| {
-                let (x, y) = self.graph_object_position(object);
-                (x.round() as i32, y.round() as i32)
-            });
-        let from_transparency = self
-            .graph_transition_nodes
-            .get(&object)
-            .filter(|transition| transition.blend_selector == 1)
-            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
-            .unwrap_or_else(|| {
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .alpha_parameter()
-            });
+        let (native_position, from_transparency) = self.graph_control_origin(object);
 
         let Some(control_id) = self.layer_animations.schedule_native_special_path_control(
             object,
@@ -8872,6 +8863,10 @@ impl RuntimeTraceApi {
         for surface in self.graph_surfaces.values() {
             if !surface.display_attached || !self.surface_display_chain_visible(surface.id, surface)
             {
+                continue;
+            }
+            if self.graph_object_properties.get(&surface.id)
+                .and_then(|p| p.properties.get(&0x88)).is_some_and(|v| v.0 == 0) {
                 continue;
             }
             let Some(resource_id) = surface.resource_id else {
@@ -16769,6 +16764,71 @@ mod input_tests {
         let properties = &api.graph_object_properties[&object];
         assert_eq!(properties.native.fixed_position_x_16_16, 0x2_0000);
         assert_eq!(properties.native.fixed_position_y_16_16, -0x2_0000);
+    }
+
+    #[test]
+    fn issue141_window_background_fill_and_gate_preserve_text() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(800), Value::Int(600)];
+        let Value::Int(window) = call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() else {
+            panic!("window");
+        };
+        api.draw_window_text_at_once(window, "kept");
+        let mut fill = vec![Value::Int(window), Value::Int(0x80123456_u32 as i32)];
+        call_graph(&mut api, 0x92, 0x8a, &mut fill).unwrap();
+        assert_eq!(
+            &api.graph_bitmap_image(window).unwrap().rgba[..4],
+            &[0x12, 0x34, 0x56, 0x80]
+        );
+        assert!(api.text_nodes.values().any(|n| n.text == "kept"));
+        api.graph_config.window_buffer = (1, 0);
+        let mut enabled = vec![Value::Int(window), Value::Int(1)];
+        call_graph(&mut api, 0x92, 0x88, &mut enabled).unwrap();
+        let mut items = Vec::new();
+        api.push_surface_draw_items(&mut items);
+        assert!(items.iter().any(|i| i.owner_object == Some(window)));
+        let mut disabled = vec![Value::Int(window), Value::Int(0)];
+        call_graph(&mut api, 0x92, 0x88, &mut disabled).unwrap();
+        items.clear();
+        api.push_surface_draw_items(&mut items);
+        assert!(!items.iter().any(|i| i.owner_object == Some(window)));
+        assert!(api.text_nodes.values().any(|n| n.text == "kept"));
+    }
+
+    #[test]
+    fn issue141_message_alignment_is_per_line_and_stable_during_reveal() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = 0xb0000000_u32 as i32;
+        let mut surface = super::RuntimeSurface::display(window, 800.0, 600.0);
+        surface.valid_left = 40;
+        surface.valid_right = 759;
+        api.graph_surfaces.insert(window, surface);
+        let cursor = api.surface_text_states.entry(window).or_default();
+        cursor.font_size = 24;
+        cursor.cursor_x = 40;
+        cursor.cursor_y = 246;
+        cursor.text_layout_mode = 1;
+        cursor.alignment_reserve_cell = true;
+        cursor.message_style = Some(crate::graph_defaults::MessageTextStyle::from_operands(
+            0xffffff,
+            [1, 5, 5, 0, 192],
+            24,
+        ));
+        api.start_native_message("　だるい。\n空".into(), Some(window));
+        let node_id = api.text_runtime.target_node.unwrap();
+        let mut node = api.text_nodes[&node_id].clone();
+        node.text = "　だ".into();
+        let partial = api.presentation_text_nodes(&node)[0].x;
+        node.text = "　だるい。\n空".into();
+        let lines = api.presentation_text_nodes(&node);
+        assert_eq!(partial, lines[0].x);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].x > lines[0].x);
+        assert!((lines[0].x - 328.0).abs() <= 1.0);
     }
 
     #[test]
@@ -28548,6 +28608,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         [int(4), int(3), int(2), int(1), int(0)],
                     );
                 }
+                // 444EA0 -> 416C30: final formatter flag reserves one
+                // font cell for centred text, including immediate skip draws.
+                self.surface_text_states.entry(target).or_default().alignment_reserve_cell =
+                    args.get(5).map(value_to_i32).unwrap_or_default() != 0;
                 if let Some(text) = text.as_deref() {
                     self.draw_formatted_window_text(target, text);
                 }
@@ -28615,6 +28679,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         [int(8), int(7), int(6), int(5), int(4)],
                     );
                 }
+                // Itsusora 444D60 -> 44B9A0 -> 41DAA0: the operand
+                // after the ruby controls reserves the alignment end cell.
+                self.surface_text_states.entry(target).or_default().alignment_reserve_cell =
+                    args.get(9).map(value_to_i32).unwrap_or_default() != 0;
                 if let Some(text) = text.as_ref() {
                     // sub_4863E0 always enters sub_491220 for a valid
                     // CDspObjWindow. The target has no title-departure or
