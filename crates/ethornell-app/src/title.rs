@@ -75,6 +75,7 @@ impl RuntimeTraceApi {
         {
             let key = file.to_ascii_lowercase();
             self.title_child_program_active = true;
+            self.title_scenario_requested = false;
             if self.title_child_program.as_deref() != Some(key.as_str()) {
                 let cleared = self.user_controls.len();
                 self.user_controls.clear();
@@ -91,7 +92,14 @@ impl RuntimeTraceApi {
             return;
         }
         if is_scenario_driver_program_report(program) {
-            self.depart_title_ui_for_scenario(program);
+            if should_depart_for_scenario(self.title_child_program_active) {
+                self.depart_title_ui_for_scenario(program);
+            } else {
+                self.trace_graph(format!(
+                    "scenario driver kept title ui active child_active={} requested={}",
+                    self.title_child_program_active, self.title_scenario_requested
+                ));
+            }
             return;
         }
         if !self.title_child_program_active {
@@ -125,14 +133,8 @@ impl RuntimeTraceApi {
         self.title_scenario_requested = false;
         self.user_controls
             .retain(|_, control| control.owner_id == crate::text::MESSAGE_CONTROL_OWNER_ID);
-        let cleared_text_nodes = self.clear_transient_screen_text_nodes();
+        self.clear_transient_screen_text_nodes();
         self.clear_title_graph_layers();
-        tracing::info!(
-            control = self.last_hit_control,
-            file,
-            cleared_text_nodes,
-            "title ui departed"
-        );
         self.trace_graph(format!(
             "title ui departed after control #{} loaded {file}",
             self.last_hit_control
@@ -642,6 +644,10 @@ fn is_title_program_report(program: &str) -> bool {
     program_file_name(program).eq_ignore_ascii_case("title._bp")
 }
 
+fn should_depart_for_scenario(child_active: bool) -> bool {
+    !child_active
+}
+
 fn is_scenario_driver_program_report(program: &str) -> bool {
     matches!(
         program_file_name(program).to_ascii_lowercase().as_str(),
@@ -703,8 +709,8 @@ fn pop_user_args(stack: &mut Vec<Value>, count: usize) -> ethornell_vm::VmResult
 #[cfg(test)]
 mod tests {
     use super::{
-        is_scenario_driver_program_report, is_title_program_report, title_object_for_control_text,
-        title_payload_for_control_text,
+        is_scenario_driver_program_report, is_title_program_report, should_depart_for_scenario,
+        title_object_for_control_text, title_payload_for_control_text,
     };
 
     #[test]
@@ -731,6 +737,12 @@ mod tests {
         assert!(!is_title_program_report(
             "sysprg.arc:cnfgwnd._bp#instance=64"
         ));
+    }
+
+    #[test]
+    fn nested_title_children_keep_the_title_ui_when_scrdrv_runs() {
+        assert!(!should_depart_for_scenario(true));
+        assert!(should_depart_for_scenario(false));
     }
 
     #[test]
