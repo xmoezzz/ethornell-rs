@@ -9920,6 +9920,11 @@ pub mod opcodes {
     ///
     /// Set where the message caret is drawn.
     ///
+    /// Native profile variation: NSM 1.686.4 / Triple 1.687 additionally push
+    /// success 1, and reset mode to zero without changing coordinates when
+    /// its unsigned value exceeds four. Compatibility 1.72 does not identify
+    /// this variation: ESchool 1.653.3 retains the no-result ABI.
+    ///
     /// Globals dword_565B94 (mode), 565B98 (x), 565B9C (y). Mode 1 is an absolute position; other modes place the caret relative to the window/text.
     ///
     /// # ABI
@@ -22527,12 +22532,6 @@ const THREAD_ID_PARAMETERS: &[NativeParameterSpec] = &[NativeParameterSpec {
     description: "Nonzero thread identifier searched recursively from the current root.",
 }];
 
-const FREE_PROGRAM_ABI_SLOT_PARAMETERS: &[NativeParameterSpec] = &[NativeParameterSpec {
-    name: "legacy_descriptor_slot",
-    kind: "ignored ABI slot",
-    description: "The recovered ABI descriptor reports one input, but target handler sub_488CD0 performs no pop and removes the current CThread tail module directly.",
-}];
-
 const WRITE_FILE_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "path",
@@ -33271,7 +33270,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     NativeOpcodeSpec {
         opcode: opcodes::SYS_FREE_LAST_PROGRAM_MODULE,
         symbol: "Sys80_41_FreeLastProgramModule",
-        parameters: FREE_PROGRAM_ABI_SLOT_PARAMETERS,
+        parameters: &[],
         returns: "remaining module count",
         scheduling: NativeSchedulingEffect::Continue,
         notes: "sub_488CD0 pops nothing. sub_444D80 unlinks the newest module record, rolls back the code-used end and pushes the remaining module count (the main program counts); with no record it pushes 0x80000001, and a remaining count of 0 is a fatal error.",

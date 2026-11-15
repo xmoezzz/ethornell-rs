@@ -251,7 +251,7 @@ impl HostRuntime {
                     } else {
                         encoding_rs::SHIFT_JIS
                     },
-                );
+                )?;
                 if let Some(error) = snapshot::take_raster_error() {
                     return Err(EthornellError::Other(error));
                 }
@@ -939,8 +939,8 @@ impl RuntimeEngine {
         trace: bool,
         strict: bool,
         encoding: &'static encoding_rs::Encoding,
-    ) -> Self {
-        let profile = confirmed_native_profile(&manager, bytes);
+    ) -> Result<Self> {
+        let profile = confirmed_native_profile(&manager, bytes)?;
         let program = ethornell_script::parse_bp_program_profile(Some(script.into()),bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
@@ -951,7 +951,7 @@ impl RuntimeEngine {
         vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
-        Self {
+        Ok(Self {
             vm,
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
@@ -968,7 +968,7 @@ impl RuntimeEngine {
                 collect_diagnostics: true,
             },
             last_report: None,
-        }
+        })
     }
 }
 
@@ -987,7 +987,7 @@ mod tests {
         let create = |bytes: &[u8]| RuntimeEngine::new_explicit(
             "root", bytes, ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap(),
             PathBuf::from(env!("CARGO_MANIFEST_DIR")), false, false, encoding_rs::SHIFT_JIS,
-        );
+        ).unwrap();
         let advance = |runtime: &mut RuntimeEngine| {
             runtime.last_report = Some(runtime.vm.run_loaded(&mut runtime.api, &runtime.options));
         };

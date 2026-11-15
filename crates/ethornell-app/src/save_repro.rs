@@ -91,7 +91,7 @@ fn game_input_repro() {
         false,
         false,
         encoding,
-    );
+    ).unwrap();
     let mut script = HeadlessInputScript::from_env();
     let mut events = VecDeque::new();
     let pacing = RuntimeFramePacing::from_env();

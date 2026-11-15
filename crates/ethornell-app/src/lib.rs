@@ -266,10 +266,10 @@ impl Default for NativeRuntimeProfile {
     }
 }
 
-fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
+fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Result<NativeRuntimeProfile> {
     let mut profile = resource_native_profile(manager, bootstrap);
-    native_profile::apply(manager, &mut profile);
-    profile
+    native_profile::apply(manager, &mut profile)?;
+    Ok(profile)
 }
 
 fn resource_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
@@ -463,7 +463,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         config.fail_on_stub,
         !headless,
         encoding,
-    ));
+    )?);
     let image: Option<DecodedImage> = None;
     if config.trace
         && let Some(image) = image.as_ref()
@@ -9768,8 +9768,8 @@ impl RuntimeEngine {
         fail_on_stub: bool,
         native_dialog_presentation: bool,
         encoding: &'static encoding_rs::Encoding,
-    ) -> Self {
-        let profile = confirmed_native_profile(&manager, bytes);
+    ) -> Result<Self> {
+        let profile = confirmed_native_profile(&manager, bytes)?;
         let program = ethornell_script::parse_bp_program_profile(Some(script.to_string()), bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
@@ -9780,7 +9780,7 @@ impl RuntimeEngine {
         vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
-        Self {
+        Ok(Self {
             vm,
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
@@ -9799,7 +9799,7 @@ impl RuntimeEngine {
                 collect_diagnostics: trace || fail_on_stub,
             },
             last_report: None,
-        }
+        })
     }
 
     /// Sys80:6B status 5: sub_48D480 leaves its main loop and initializes the
@@ -9843,7 +9843,7 @@ impl RuntimeEngine {
             self.options.fail_on_stub,
             self.api.native_dialog_presentation,
             self.vm.graph_text_encoding(),
-        );
+        ).map_err(|error| tracing::warn!(%error, "bootstrap native profile rejected")).ok()?;
         if self.api.host_realtime_clock {
             engine.use_host_clock();
         }
@@ -10916,6 +10916,24 @@ mod input_tests {
         call_user(&mut api, 0xb0, 0xc1, &mut args).unwrap();
         assert!(args.is_empty());
         assert_eq!(ethornell_vm::SoundApi::user_font_families(&api), families);
+        assert_eq!(ethornell_vm::SoundApi::user_font_families_for_charset(&api, 0), families);
+    }
+
+    #[test]
+    fn native_caret_status_preserves_legacy_and_fused_contracts() {
+        let manager = ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.bp_profile = ethornell_vm::NativeAbiProfile::Modern;
+        let mut args = vec![Value::Int(1), Value::Int(20), Value::Int(30)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::None);
+        assert!(args.is_empty());
+        api.bp_profile = ethornell_vm::NativeAbiProfile::ModernFused;
+        let mut args = vec![Value::Int(4), Value::Int(40), Value::Int(50)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::Int(1));
+        assert!(args.is_empty());
+        let mut args = vec![Value::Int(-1), Value::Int(100), Value::Int(200)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::Int(1));
+        assert_eq!((api.graph_defaults.caret_mode, api.graph_defaults.caret_x, api.graph_defaults.caret_y), (0, 40, 50));
     }
 
     #[test]
@@ -24516,9 +24534,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Program(std::sync::Arc::new(program)));
             }
             (0x80, 0x41) => {
-                let program = stack.pop();
-                tracing::info!(program = ?program.as_ref().map(value_summary), "FreeProgram");
-                return Ok(ethornell_vm::Value::None);
+                // The VM owns the LIFO module chain and its root-release
+                // error. Never consume a phantom host-side argument here.
+                return Err(ethornell_vm::VmError::Runtime(
+                    "FreeLastProgramModule bypassed VM module dispatch".into(),
+                ));
             }
             (0x80, 0x34) => {
                 // Target sub_4888C0 pops file first and archive/root second,
@@ -29009,6 +29029,18 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let mode = pop_int_value(stack).unwrap_or_default();
+                if self.bp_profile == ethornell_vm::NativeAbiProfile::ModernFused {
+                    // NSM 1.686.4 sub_1400721C0 / Triple 1.687
+                    // sub_140071F90 return 0x80000008; their BP wrappers
+                    // translate it to success 1. An unsigned mode >4 resets
+                    // mode to zero while retaining the previous coordinates.
+                    if mode as u32 > 4 {
+                        self.graph_defaults.caret_mode = 0;
+                    } else {
+                        self.graph_defaults.configure_caret_position(mode, x, y);
+                    }
+                    return Ok(ethornell_vm::Value::Int(1));
+                }
                 self.graph_defaults.configure_caret_position(mode, x, y);
                 tracing::info!(mode, x, y, "GraphSetCaretPosition");
             }

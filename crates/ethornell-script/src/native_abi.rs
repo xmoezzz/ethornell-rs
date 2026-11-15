@@ -28,7 +28,8 @@ pub enum NativeAbiProfile {
     Anipani,
     HoukagoFd,
     Modern,
-    /// 1.687 fused BP / Media Foundation generation.
+    /// Audited 1.686.4/1.687 fused BP / native ABI generation. The version
+    /// resource's Compatibility 1.72 alone does not select this profile.
     ModernFused,
 }
 
@@ -82,6 +83,10 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
     }
     if profile == NativeAbiProfile::ModernFused {
         let (argc, outputs, procedure) = match (group,id) {
+            // NSM 1.686.4 1400D8190 / Triple 1.687 1400D8F90:
+            // three operand pops and one status push. ESchool 1.653.3
+            // 488420 pops the same three values but pushes no result.
+            (0x90,0x9a) => (3,1,false),
             (0x81,0x34) => (2,1,true),
             (0xb0,0x12) => (6,1,false),
             (0xb0,0x1b) => (8,0,false),
@@ -159,13 +164,15 @@ impl NativeCallAbi {
     }
 }
 
+// 80:41's stale descriptor said one input. The original 1.622 module-chain
+// dispatcher and the audited H2O/ESchool/NSM/Triple handlers all pop nothing.
 const GROUP_80: [u16; 256] = [
     0x8001, 0x8100, 0x8101, 0x0000, 0x8100, 0x8101, 0x8001, 0x8002, 0x8100, 0x8100, 0x8001, 0x8100,
     0x8001, 0x8100, 0x8100, 0x8100, 0x8001, 0x8101, 0x8101, 0x8100, 0x8001, 0x8001, 0x8000, 0x8100,
     0x8001, 0x8001, 0x8101, 0x8002, 0x8101, 0x8102, 0x8101, 0x8006, 0x8101, 0x8101, 0x0000, 0x0000,
     0x8102, 0x8105, 0x8104, 0x8102, 0x8101, 0x8101, 0x8101, 0x8105, 0x8101, 0x8102, 0x0000, 0x8102,
     0x8103, 0x8105, 0x8103, 0x8102, 0x8102, 0x8102, 0x8001, 0x8001, 0x8102, 0x8101, 0x8102, 0x8106,
-    0x8103, 0x8102, 0x8101, 0x8104, 0x8102, 0x8101, 0x0000, 0x0000, 0x8105, 0x8000, 0x8100, 0x8101,
+    0x8103, 0x8102, 0x8101, 0x8104, 0x8102, 0x8100, 0x0000, 0x0000, 0x8105, 0x8000, 0x8100, 0x8101,
     0x8002, 0x8101, 0x8003, 0x8102, 0x8104, 0x0000, 0x0000, 0x0000, 0x8001, 0x0000, 0x8001, 0x8000,
     0x8101, 0x0000, 0x0000, 0x0000, 0x8001, 0x8101, 0x8100, 0x0000, 0x8103, 0x8001, 0x8001, 0x8000,
     0x8003, 0x8100, 0x8002, 0x8001, 0x8001, 0x8000, 0x8001, 0x8001, 0x8001, 0x8000, 0x8000, 0x8002,
@@ -461,7 +468,20 @@ mod tests {
     fn preserves_alias_based_argument_reads() {
         assert_eq!(lookup(0x80, 0x60).unwrap().argc, 3);
         assert_eq!(lookup(0x92, 0x97).unwrap().argc, 7);
-        assert_eq!(lookup(0x80, 0x41).unwrap().argc, 1);
+        assert_eq!(lookup(0x80, 0x41).unwrap().argc, 0);
+    }
+
+    #[test]
+    fn module_release_and_caret_results_follow_native_profiles() {
+        for profile in [NativeAbiProfile::Tayutama, NativeAbiProfile::Amachoco,
+            NativeAbiProfile::Anipani, NativeAbiProfile::HoukagoFd,
+            NativeAbiProfile::Modern, NativeAbiProfile::ModernFused] {
+            let release = lookup_profile(profile, 0x80, 0x41).unwrap();
+            assert_eq!((release.argc, release.stack_outputs), (0, 1));
+            let caret = lookup_profile(profile, 0x90, 0x9a).unwrap();
+            assert_eq!(caret.argc, 3);
+            assert_eq!(caret.stack_outputs, usize::from(profile == NativeAbiProfile::ModernFused));
+        }
     }
 
     #[test]

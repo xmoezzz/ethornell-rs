@@ -2011,9 +2011,11 @@ pub trait SoundApi {
     }
 
     /// B0:C5: GDI charset-filtered enumeration. Portable hosts may expose
-    /// their substituted stock CJK faces for DEFAULT/SHIFTJIS charsets only.
+    /// their substituted stock CJK faces for ANSI/DEFAULT/SHIFTJIS charsets.
     fn user_font_families_for_charset(&self, charset: u8) -> Vec<String> {
-        if matches!(charset, 1|128) { self.user_font_families() } else { Vec::new() }
+        // NSM_MYST's IPL enumerates SHIFTJIS then ANSI and frees each
+        // result buffer. Expose the same substituted faces to both queries.
+        if matches!(charset, 0|1|128) { self.user_font_families() } else { Vec::new() }
     }
 
 
@@ -18003,6 +18005,29 @@ mod tests {
     }
 
     #[test]
+    fn modern_fused_font_enumeration_pushes_ansi_byte_count() {
+        // NSM_MYST ipl._bp enumerates charset 128 then 0 with B0:C5 and
+        // frees each result; 1400D3830 pushes the result of 14006B180.
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        let mut api = SchedulingApi {
+            font_families: vec!["ＭＳ ゴシック".into(), "ＭＳ 明朝".into()],
+            ..SchedulingApi::default()
+        };
+        let enumerate = test_instruction(0x10, 0xb0, "usr1", vec![0xb0, 0xc5], Vec::new());
+        let expected: usize = api
+            .font_families
+            .iter()
+            .map(|name| encoding_rs::SHIFT_JIS.encode(name).0.len() + 1)
+            .sum();
+
+        vm.stack.extend([Value::Int(12345), Value::Int(0), Value::Int(0)]);
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(expected as i32)]);
+        assert!(api.user_font_families_for_charset(134).is_empty());
+    }
+
+    #[test]
     fn native_system_event_queue_preserves_two_argument_abi() {
         let destination = 0x2000u32;
         let program = BpProgram {
@@ -19996,9 +20021,11 @@ mod tests {
         let _ = vm.append_target_loaded_program(empty_loaded_program("worker._bp".into()));
         assert_eq!(vm.target_loaded_programs.len(), 2);
 
-        let (remaining, freed) = vm.free_last_target_program(false);
-        assert_eq!(remaining, 1);
-        assert!(freed.is_some());
+        vm.stack.push(Value::Int(12345));
+        let release = test_instruction(0x10, 0x80, "sys1", vec![0x80, 0x41], Vec::new());
+        vm.dispatch(&release, &mut TraceApi).unwrap();
+        // The ABI must not consume the caller's preceding operand.
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(1)]);
         assert_eq!(vm.target_loaded_programs, [0]);
     }
 
