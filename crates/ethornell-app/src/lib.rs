@@ -817,6 +817,17 @@ struct VitaMovieReadBuffer {
     len: usize,
 }
 
+// SAFETY: this buffer exclusively owns a CPU-accessible kernel memory block,
+// with no thread-affine device state. Mutable access requires &mut self; once
+// published behind Arc<MovieBytes>, readers only receive immutable slices.
+// Arc retains the allocation until the last reader has finished, and Drop frees
+// it once. The kernel allocation/free operations do not require the creator thread.
+#[cfg(target_os = "vita")]
+unsafe impl Send for VitaMovieReadBuffer {}
+// SAFETY: shared references expose only immutable bytes, as described above.
+#[cfg(target_os = "vita")]
+unsafe impl Sync for VitaMovieReadBuffer {}
+
 #[cfg(target_os = "vita")]
 impl VitaMovieReadBuffer {
     fn new(len: usize) -> Option<Self> {
