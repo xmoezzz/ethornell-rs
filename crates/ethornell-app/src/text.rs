@@ -167,6 +167,8 @@ pub(crate) struct MessagePage {
     origin_y: f32,
     /// The parsed, unwrapped text of every message drawn on the page.
     markup: ParsedMessageMarkup,
+    /// Full-message offsets, fixed before typewriter reveal (Itsusora 41F0E0).
+    line_offsets: Vec<f32>,
 }
 
 impl TextState {
@@ -1232,7 +1234,11 @@ impl RuntimeTraceApi {
         let (parsed, map) = wrap_parsed_message(markup.clone(), &state);
         self.system92_text_fragment_records = link_fragment_records(&parsed, &state);
         let committed_chars = map.get(page_chars).copied().unwrap_or_default();
-        let (cursor_x, cursor_y) = message_end_cursor(&parsed.text, &state);
+        let line_offsets = self.message_line_offsets(window, &parsed.text, &state);
+        let (mut cursor_x, cursor_y) = message_end_cursor(&parsed.text, &state);
+        if cursor_x > state.x as i32 {
+            cursor_x = cursor_x.saturating_add(line_offsets.last().copied().unwrap_or(0.0) as i32);
+        }
         let cursor = self.surface_text_states.entry(window).or_default();
         cursor.cursor_x = cursor_x;
         cursor.cursor_y = cursor_y;
@@ -1245,9 +1251,107 @@ impl RuntimeTraceApi {
                 origin_x: state.x,
                 origin_y: state.y,
                 markup,
+                line_offsets,
             },
         );
         (state, parsed, committed_chars)
+    }
+
+    /// CProcDspMsgEx::Align (Itsusora 1.66, 41F0E0): align each completed
+    /// line using its inclusive right edge, the end-cell reservation and
+    /// shadow displacement. Measure the whole message, never its reveal prefix.
+    fn message_line_offsets(&self, window: i32, text: &str, state: &TextState) -> Vec<f32> {
+        let Some(surface) = self.graph_surfaces.get(&window) else {
+            return Vec::new();
+        };
+        let cursor = self
+            .surface_text_states
+            .get(&window)
+            .copied()
+            .unwrap_or_default();
+        if cursor.text_layout_mode == 0 || surface.message_variant != 0 {
+            return Vec::new();
+        }
+        let shadow_x = cursor.message_style.map_or(0, |s| s.alignment_dx);
+        text.split('\n')
+            .map(|line| {
+                let width: f32 = line
+                    .chars()
+                    .map(|ch| crate::snapshot::glyph_advance(ch, state.font_size, 100.0))
+                    .sum();
+                let right = state.x as i32 + width.round() as i32 - 1;
+                let reserve = if cursor.alignment_reserve_cell && right < surface.valid_right {
+                    state.font_size as i32
+                } else {
+                    0
+                };
+                let remaining = shadow_x + surface.valid_right - right;
+                if cursor.text_layout_mode == 1 {
+                    ((remaining - reserve - self.graph_defaults.text_layout.boundary_offset) >> 1)
+                        as f32
+                } else {
+                    (remaining - self.graph_defaults.text_layout.layout_advance) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// Both GPU presentation and CPU captures consume these same per-line
+    /// runs. Keep colours, ruby and character indices after splitting a page.
+    pub(crate) fn presentation_text_nodes<'a>(
+        &self,
+        node: &'a RuntimeTextNode,
+    ) -> Vec<std::borrow::Cow<'a, RuntimeTextNode>> {
+        use std::borrow::Cow;
+        let Some(page) = node
+            .target_surface
+            .and_then(|id| self.message_pages.get(&id))
+            .filter(|p| !p.line_offsets.is_empty() && p.origin_x == node.x && p.origin_y == node.y)
+        else {
+            return vec![Cow::Borrowed(node)];
+        };
+        let layout = self.formatted_text_layout(node);
+        let mut start = 0;
+        node.text
+            .split('\n')
+            .enumerate()
+            .map(|(row, text)| {
+                let end = start + text.chars().count();
+                let mut line = node.clone();
+                line.text = text.to_owned();
+                line.x += page.line_offsets.get(row).copied().unwrap_or_default();
+                line.ruby_spans = node
+                    .ruby_spans
+                    .iter()
+                    .filter_map(|span| {
+                        (span.start_char >= start && span.end_char <= end).then(|| {
+                            RuntimeRubySpan {
+                                start_char: span.start_char - start,
+                                end_char: span.end_char - start,
+                                reading: span.reading.clone(),
+                            }
+                        })
+                    })
+                    .collect();
+                line.style_spans = node
+                    .style_spans
+                    .iter()
+                    .filter_map(|span| {
+                        let a = span.start_char.max(start);
+                        let b = span.end_char.min(end);
+                        (a < b).then(|| RuntimeTextStyleSpan {
+                            start_char: a - start,
+                            end_char: b - start,
+                            style: span.style,
+                        })
+                    })
+                    .collect();
+                line.y += row as f32 * layout.line_height + layout.body_y_offset
+                    - self.formatted_text_layout(&line).body_y_offset;
+                start = end + 1;
+                Cow::Owned(line)
+            })
+            .collect()
     }
 
     /// Parse and wrap one message against the process-wide ruby registry.
@@ -1689,9 +1793,11 @@ impl RuntimeTraceApi {
             .chars()
             .map(|ch| crate::snapshot::glyph_advance(ch, node.size, 100.0))
             .sum::<f32>();
+        let aligned_x = node.target_surface.and_then(|w| self.message_pages.get(&w))
+            .and_then(|page| page.line_offsets.get(lines.len() - 1)).copied().unwrap_or_default();
         Some(MessageTextEnd {
             window,
-            x: node.x + advance,
+            x: node.x + aligned_x + advance,
             y: node.y + layout.body_y_offset + (lines.len() - 1) as f32 * layout.line_height,
             line_start_x: node.x,
             line_height: layout.line_height,
