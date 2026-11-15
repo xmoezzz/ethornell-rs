@@ -37,6 +37,7 @@ final class NativeEngine {
 
     // Pause reasons.
     static final int PAUSE_ACTIVITY = 1;
+    static final int PAUSE_FOCUS = 2;
 
     static final int STATUS_OK = 0;
     static final int STATUS_NOT_YET = 1;

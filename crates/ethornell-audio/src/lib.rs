@@ -1,8 +1,13 @@
 use ethornell_core::{EthornellError, Result};
 use kira::dsp::Frame;
 use kira::manager::backend::Backend;
-#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon", target_os = "android", target_os = "ios")))]
 use kira::manager::backend::DefaultBackend;
+#[cfg(any(
+    target_os = "android", target_os = "ios",
+    all(test, not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon")))
+))]
+mod mobile_output;
 
 #[cfg(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon"))]
 pub mod pump;
@@ -10,8 +15,10 @@ mod resample;
 #[cfg(not(target_arch = "wasm32"))]
 mod streamed;
 /// Desktop/mobile use cpal; web and native consoles pull the shared mixer.
-#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon", target_os = "android", target_os = "ios")))]
 pub type PlatformBackend = DefaultBackend;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub type PlatformBackend = mobile_output::MobileOutput;
 #[cfg(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon"))]
 pub type PlatformBackend = pump::PumpBackend;
 use kira::manager::{AudioManager, AudioManagerSettings};
@@ -144,6 +151,20 @@ pub struct AudioSystem<B: Backend = PlatformBackend> {
 }
 
 impl AudioSystem {
+    /// Whether the output device is consuming the retained mixer. During a
+    /// mobile route change the host freezes VM time instead of filling command
+    /// queues or restarting the game. Mixer channels and seeks stay intact.
+    pub fn output_ready(&mut self) -> Result<bool> {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            self.manager.backend_mut().ready().map_err(EthornellError::Other)
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            Ok(true)
+        }
+    }
+
     pub fn new() -> Result<Self> {
         Self::with_settings(AudioManagerSettings::default())
     }

@@ -1654,10 +1654,12 @@ dependencies = [
 name = "ethornell-audio"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "ethornell-core",
  "kira 0.8.7",
  "serde",
  "symphonia",
+ "tracing",
 ]
 
 [[package]]

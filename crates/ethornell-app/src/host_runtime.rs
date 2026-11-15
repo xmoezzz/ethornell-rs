@@ -318,7 +318,12 @@ impl HostRuntime {
         file_policy::scope(&policy, || snapshot::with_font(&font, || f(self)))
     }
     fn sync_audio(&mut self) -> Result<()> {
-        let suspended = self.paused != 0
+        let output_ready = match self.audio.as_mut() {
+            Some(audio) => audio.output_ready()?,
+            None => true,
+        };
+        let suspended = !output_ready
+            || self.paused != 0
             || self.renderer.is_none()
             || !self.runtime.api.host.pending.is_empty()
             || self.closed;
