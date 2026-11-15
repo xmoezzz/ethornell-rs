@@ -58,6 +58,7 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
+mod mp4_movie;
 mod native_background;
 mod native_background_effect;
 mod native_backml;
@@ -724,6 +725,7 @@ struct NativeControlInputLatch {
 }
 
 const MOVIE_READ_BUFFER_SIZE: usize = 12 * 1024 * 1024;
+const IMAGE_DECODE_BUFFER_MAX_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Storage for a compressed MPEG program stream while its decoder is built.
 /// Vita's CDRAM is separate from the 320 MiB user heap used by scene images.
@@ -733,7 +735,7 @@ enum MovieReadBuffer {
     Cdram(Option<VitaMovieReadBuffer>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MovieBytes {
     Heap(std::sync::Arc<[u8]>),
     #[cfg(target_os = "vita")]
@@ -754,6 +756,12 @@ impl MovieBytes {
             #[cfg(target_os = "vita")]
             Self::Cdram { buffer, len } => &buffer.as_slice()[..*len],
         }
+    }
+}
+
+impl AsRef<[u8]> for MovieBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -808,6 +816,17 @@ struct VitaMovieReadBuffer {
     ptr: *mut u8,
     len: usize,
 }
+
+// SAFETY: this buffer exclusively owns a CPU-accessible kernel memory block,
+// with no thread-affine device state. Mutable access requires &mut self; once
+// published behind Arc<MovieBytes>, readers only receive immutable slices.
+// Arc retains the allocation until the last reader has finished, and Drop frees
+// it once. The kernel allocation/free operations do not require the creator thread.
+#[cfg(target_os = "vita")]
+unsafe impl Send for VitaMovieReadBuffer {}
+// SAFETY: shared references expose only immutable bytes, as described above.
+#[cfg(target_os = "vita")]
+unsafe impl Sync for VitaMovieReadBuffer {}
 
 #[cfg(target_os = "vita")]
 impl VitaMovieReadBuffer {
@@ -918,6 +937,9 @@ struct RuntimeTraceApi {
     /// Reusable storage for the next MPEG program stream.  On Vita it lives in
     /// CDRAM, preserving the constrained user heap for scene images.
     movie_read_buffer: MovieReadBuffer,
+    /// Reused for sequential archive-image reads; oversized assets are dropped
+    /// after decode so one resource cannot pin an unbounded source buffer.
+    image_decode_buffer: Vec<u8>,
     graph_images: BTreeMap<String, DecodedImage>,
     /// Native bitmap format associated with decoded resource images. Resource
     /// pixels are cached independently of concrete bitmap handles, so the
@@ -1423,6 +1445,7 @@ impl RuntimeTraceApi {
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
             movie_read_buffer: MovieReadBuffer::new(),
+            image_decode_buffer: Vec::new(),
             graph_images: BTreeMap::from([(
                 native_background::BACK_INACTIVE_FILL_KEY.to_string(),
                 DecodedImage {
@@ -2711,9 +2734,22 @@ impl RuntimeTraceApi {
         let Some(entry) = find_runtime_resource(&self.manager, archive_name, resource_name) else {
             return false;
         };
-        let Ok(bytes) = self.manager.read_by_entry_decoded(&entry) else {
+        let mut bytes = std::mem::take(&mut self.image_decode_buffer);
+        if bytes.capacity() > IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes = Vec::new();
+        }
+        if self
+            .manager
+            .read_by_entry_decoded_into(&entry, &mut bytes)
+            .is_err()
+        {
+            self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+                bytes
+            } else {
+                Vec::new()
+            };
             return false;
-        };
+        }
 
         // Target sub_469EE0 copies CBG +0x10..+0x1F into the internal image
         // header. sub_401EF0 accepts embedded-point flags 0/1 and, for flag 1,
@@ -2772,6 +2808,11 @@ impl RuntimeTraceApi {
                 );
                 return false;
             }
+        };
+        self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes
+        } else {
+            Vec::new()
         };
         self.graph_image_formats
             .insert(key.clone(), native_bitmap_format);

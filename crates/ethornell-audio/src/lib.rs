@@ -1,25 +1,26 @@
 use ethornell_core::{EthornellError, Result};
 use kira::dsp::Frame;
 use kira::manager::backend::Backend;
-#[cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon")))]
 use kira::manager::backend::DefaultBackend;
 
-#[cfg(any(target_arch="wasm32",target_os="vita",target_os="horizon"))]
+#[cfg(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon"))]
 pub mod pump;
+mod resample;
 #[cfg(not(target_arch = "wasm32"))]
 mod streamed;
 /// Desktop/mobile use cpal; web and native consoles pull the shared mixer.
-#[cfg(not(any(target_arch="wasm32",target_os="vita",target_os="horizon")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon")))]
 pub type PlatformBackend = DefaultBackend;
-#[cfg(any(target_arch="wasm32",target_os="vita",target_os="horizon"))]
+#[cfg(any(target_arch = "wasm32", target_os = "vita", target_os = "horizon"))]
 pub type PlatformBackend = pump::PumpBackend;
 use kira::manager::{AudioManager, AudioManagerSettings};
+#[cfg(not(target_arch = "wasm32"))]
+use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings};
 use kira::sound::{
     FromFileError, PlaybackPosition, PlaybackState,
     static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
 };
-#[cfg(not(target_arch = "wasm32"))]
-use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle, StreamingSoundSettings};
 
 /// A sound decoded while it plays. kira streams on a decoder thread, which
 /// the web lacks; there the sound is decoded up front instead.
@@ -279,28 +280,38 @@ impl<B: Backend> AudioSystem<B> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let settings = streaming_settings(volume, playback_rate, panning, fade_in_ms);
-            self.start_streamed(channel, Some(intro_bytes), loop_bytes, looped.then_some(0), decode_gain, settings)
+            self.start_streamed(
+                channel,
+                Some(intro_bytes),
+                loop_bytes,
+                looped.then_some(0),
+                decode_gain,
+                settings,
+            )
         }
         #[cfg(target_arch = "wasm32")]
         {
             let intro = decode_static_sound(intro_bytes, StaticSoundSettings::default())?;
             let loop_sound = decode_static_sound(loop_bytes, StaticSoundSettings::default())?;
-            if intro.sample_rate != loop_sound.sample_rate {
-                return Err(EthornellError::Other(format!(
-                    "BGM pair sample-rate mismatch: intro={}Hz loop={}Hz",
-                    intro.sample_rate, loop_sound.sample_rate
-                )));
-            }
-
             let loop_start = intro.frames.len();
             let mut frames = Vec::with_capacity(loop_start.saturating_add(loop_sound.frames.len()));
             frames.extend_from_slice(&intro.frames);
-            frames.extend_from_slice(&loop_sound.frames);
+            if loop_sound.sample_rate == intro.sample_rate {
+                frames.extend_from_slice(&loop_sound.frames);
+            } else {
+                let loop_frames = resample::resample_all(
+                    &loop_sound.frames,
+                    loop_sound.sample_rate,
+                    intro.sample_rate,
+                );
+                frames.extend_from_slice(&loop_frames);
+            }
 
             let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
             if looped {
-                settings = settings
-                    .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
+                settings = settings.loop_region(
+                    PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..,
+                );
             }
             let mut data = StaticSoundData {
                 sample_rate: intro.sample_rate,
@@ -364,47 +375,54 @@ impl<B: Backend> AudioSystem<B> {
                 declared_frame_count(bytes),
             )
         };
-        let decoder =
-            streamed::StreamedDecoder::new(intro.map(part), part(body), decode_gain.max(0.0) as f32)
-                .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
-        let (intro_rate, body_rate) = decoder.sample_rates();
-        if intro_rate != body_rate {
-            return Err(EthornellError::Other(format!(
-                "BGM pair sample-rate mismatch: intro={intro_rate}Hz loop={body_rate}Hz"
-            )));
-        }
+        let decoder = streamed::StreamedDecoder::new(
+            intro.map(part),
+            part(body),
+            decode_gain.max(0.0) as f32,
+        )
+        .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
         if let Some(loop_start) = loop_start {
-            let loop_start = decoder.body_start().saturating_add(loop_start);
+            let loop_start = decoder
+                .body_start()
+                .saturating_add(decoder.body_output_index(loop_start));
             settings = settings
                 .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
         }
+        self.stop_channel_now(channel)?;
         let handle = self
             .manager
             .play(StreamingSoundData::from_decoder(decoder, settings))
             .map_err(|err| EthornellError::Other(format!("play audio stream failed: {err}")))?;
-        if let Some(mut previous) = self.channels.remove(&channel) {
-            let _ = previous.stop(Tween::default());
-        }
-        if let Some(mut previous) = self.streams.insert(channel, handle) {
-            let _ = previous.stop(Tween::default());
-        }
+        self.streams.insert(channel, handle);
         Ok(true)
     }
 
     fn start_static_sound(&mut self, channel: i32, data: StaticSoundData) -> Result<bool> {
         self.channels
             .retain(|_, handle| handle.state() != PlaybackState::Stopped);
+        self.stop_channel_now(channel)?;
         let handle = self
             .manager
             .play(data)
             .map_err(|err| EthornellError::Other(format!("play audio bytes failed: {err}")))?;
-        if let Some(mut previous) = self.channels.insert(channel, handle) {
-            let _ = previous.stop(Tween::default());
-        }
-        if let Some(mut previous) = self.streams.remove(&channel) {
-            let _ = previous.stop(Tween::default());
-        }
+        self.channels.insert(channel, handle);
         Ok(true)
+    }
+
+    fn stop_channel_now(&mut self, channel: i32) -> Result<()> {
+        if let Some(handle) = self.channels.get_mut(&channel) {
+            handle.stop(immediate_tween()).map_err(|err| {
+                EthornellError::Other(format!("audio channel stop failed: {err}"))
+            })?;
+            self.channels.remove(&channel);
+        }
+        if let Some(handle) = self.streams.get_mut(&channel) {
+            handle.stop(immediate_tween()).map_err(|err| {
+                EthornellError::Other(format!("audio channel stop failed: {err}"))
+            })?;
+            self.streams.remove(&channel);
+        }
+        Ok(())
     }
 
     /// Plays `bytes` (any stream Symphonia can probe, such as a movie's MPEG
@@ -420,7 +438,10 @@ impl<B: Backend> AudioSystem<B> {
         start_ms: u64,
     ) -> Result<()> {
         #[cfg(not(target_arch = "wasm32"))]
-        let (settings, load) = (StreamingSoundSettings::default(), StreamingSoundData::from_cursor);
+        let (settings, load) = (
+            StreamingSoundSettings::default(),
+            StreamingSoundData::from_cursor,
+        );
         #[cfg(target_arch = "wasm32")]
         let (settings, load) = (StaticSoundSettings::default(), StaticSoundData::from_cursor);
         let mut settings = settings
@@ -431,16 +452,12 @@ impl<B: Backend> AudioSystem<B> {
         }
         let data = load(Cursor::new(bytes), settings)
             .map_err(|err| EthornellError::Other(format!("load audio stream failed: {err}")))?;
+        self.stop_channel_now(channel)?;
         let handle = self
             .manager
             .play(data)
             .map_err(|err| EthornellError::Other(format!("play audio stream failed: {err}")))?;
-        if let Some(mut previous) = self.channels.remove(&channel) {
-            let _ = previous.stop(Tween::default());
-        }
-        if let Some(mut previous) = self.streams.insert(channel, handle) {
-            let _ = previous.stop(Tween::default());
-        }
+        self.streams.insert(channel, handle);
         Ok(())
     }
 
@@ -456,20 +473,28 @@ impl<B: Backend> AudioSystem<B> {
     }
 
     pub fn stop_channel(&mut self, channel: i32, fade_out_ms: u64) {
-        if let Some(handle) = self.streams.get_mut(&channel) {
-            let _ = handle.stop(Tween {
-                duration: Duration::from_millis(fade_out_ms),
-                ..Tween::default()
-            });
-            return;
+        let _ = self.try_stop_channel(channel, fade_out_ms);
+    }
+
+    pub fn try_stop_channel(&mut self, channel: i32, fade_out_ms: u64) -> Result<()> {
+        if fade_out_ms == 0 {
+            return self.stop_channel_now(channel);
         }
-        let Some(handle) = self.channels.get_mut(&channel) else {
-            return;
-        };
-        let _ = handle.stop(Tween {
+        let tween = Tween {
             duration: Duration::from_millis(fade_out_ms),
             ..Tween::default()
-        });
+        };
+        if let Some(handle) = self.streams.get_mut(&channel) {
+            return handle
+                .stop(tween)
+                .map_err(|err| EthornellError::Other(format!("audio channel stop failed: {err}")));
+        }
+        if let Some(handle) = self.channels.get_mut(&channel) {
+            handle.stop(tween).map_err(|err| {
+                EthornellError::Other(format!("audio channel stop failed: {err}"))
+            })?;
+        }
+        Ok(())
     }
 
     pub fn pause_channel(&mut self, channel: i32, paused: bool, fade_ms: u64) {
@@ -500,26 +525,34 @@ impl<B: Backend> AudioSystem<B> {
     }
 
     pub fn set_channel_volume(&mut self, channel: i32, volume: f64, fade_ms: u64) {
-        if let Some(handle) = self.streams.get_mut(&channel) {
-            let _ = handle.set_volume(
-                volume.clamp(0.0, 1.0),
-                Tween {
-                    duration: Duration::from_millis(fade_ms),
-                    ..Tween::default()
-                },
-            );
-            return;
-        }
-        let Some(handle) = self.channels.get_mut(&channel) else {
-            return;
+        let _ = self.try_set_channel_volume(channel, volume, fade_ms);
+    }
+
+    pub fn try_set_channel_volume(
+        &mut self,
+        channel: i32,
+        volume: f64,
+        fade_ms: u64,
+    ) -> Result<()> {
+        let tween = Tween {
+            duration: Duration::from_millis(fade_ms),
+            ..Tween::default()
         };
-        let _ = handle.set_volume(
-            volume.clamp(0.0, 1.0),
-            Tween {
-                duration: Duration::from_millis(fade_ms),
-                ..Tween::default()
-            },
-        );
+        if let Some(handle) = self.streams.get_mut(&channel) {
+            return handle
+                .set_volume(volume.clamp(0.0, 1.0), tween)
+                .map_err(|err| {
+                    EthornellError::Other(format!("audio channel volume failed: {err}"))
+                });
+        }
+        if let Some(handle) = self.channels.get_mut(&channel) {
+            handle
+                .set_volume(volume.clamp(0.0, 1.0), tween)
+                .map_err(|err| {
+                    EthornellError::Other(format!("audio channel volume failed: {err}"))
+                })?;
+        }
+        Ok(())
     }
 
     pub fn set_channel_panning(&mut self, channel: i32, panning: f64, fade_ms: u64) {
@@ -812,17 +845,90 @@ mod tests {
         (0..frames).map(|_| backend.process()).collect()
     }
 
+    fn tone_data() -> StaticSoundData {
+        StaticSoundData {
+            sample_rate: 1000,
+            frames: vec![Frame::new(0.5, 0.5); 10000].into(),
+            settings: StaticSoundSettings::default(),
+        }
+    }
+
     fn start_tone(audio: &mut AudioSystem<MockBackend>, channel: i32) {
-        audio
-            .start_static_sound(
-                channel,
-                StaticSoundData {
-                    sample_rate: 1000,
-                    frames: vec![Frame::new(0.5, 0.5); 10000].into(),
-                    settings: StaticSoundSettings::default(),
-                },
-            )
-            .unwrap();
+        audio.start_static_sound(channel, tone_data()).unwrap();
+    }
+
+    #[test]
+    fn a_full_volume_queue_reports_failure_and_keeps_channel_tracked() {
+        let mut audio = mock_audio(128);
+        start_tone(&mut audio, 1);
+        process(&mut audio, 16);
+
+        let handle = audio.channels.get_mut(&1).unwrap();
+        while handle.set_volume(0.5, immediate_tween()).is_ok() {}
+
+        assert!(audio.try_set_channel_volume(1, 0.0, 0).is_err());
+        assert!(audio.channels.contains_key(&1));
+    }
+
+    #[test]
+    fn a_full_stop_queue_keeps_the_old_channel_and_rejects_replacement() {
+        let mut audio = mock_audio(128);
+        start_tone(&mut audio, 1);
+        process(&mut audio, 16);
+
+        let handle = audio.channels.get_mut(&1).unwrap();
+        while handle.set_volume(0.5, immediate_tween()).is_ok() {}
+
+        assert!(audio.start_static_sound(1, tone_data()).is_err());
+        assert!(audio.channels.contains_key(&1));
+        assert!(!audio.streams.contains_key(&1));
+    }
+
+    #[test]
+    fn replacing_a_channel_does_not_mix_two_sound_handles() {
+        let mut audio = mock_audio(128);
+        start_tone(&mut audio, 1);
+        let original = process(&mut audio, 16);
+        let baseline = original
+            .iter()
+            .map(|frame| frame.left.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(baseline > 0.0);
+
+        start_tone(&mut audio, 1);
+        assert_eq!(audio.channels.len(), 1);
+        assert!(!audio.streams.contains_key(&1));
+        let _transition = process(&mut audio, 1024);
+        let replacement = process(&mut audio, 512);
+        let peak = replacement
+            .iter()
+            .map(|frame| frame.left.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            peak <= baseline + 0.01,
+            "replacement peak {peak} exceeded one sound {baseline}"
+        );
+
+        audio.try_stop_channel(1, 0).unwrap();
+        assert!(!audio.channels.contains_key(&1));
+        let _stop_transition = process(&mut audio, 1024);
+        let stopped = process(&mut audio, 512);
+        assert!(stopped.iter().all(|frame| frame.left.abs() < 0.0001));
+    }
+
+    #[test]
+    fn stopping_one_channel_keeps_other_channels_playing() {
+        let mut audio = mock_audio(128);
+        start_tone(&mut audio, 1);
+        start_tone(&mut audio, 2);
+        process(&mut audio, 1024);
+
+        audio.try_stop_channel(1, 0).unwrap();
+        assert!(!audio.channels.contains_key(&1));
+        assert!(audio.channels.contains_key(&2));
+        process(&mut audio, 1024);
+        let remaining = process(&mut audio, 512);
+        assert!(remaining.iter().any(|frame| frame.left.abs() > 0.1));
     }
 
     #[test]

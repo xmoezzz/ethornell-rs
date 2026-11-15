@@ -6,6 +6,7 @@ use na_mpeg2_decoder::{Decoder, Frame, StreamType, frame_to_rgba_bt601_limited, 
 
 use crate::MovieBytes;
 use crate::audio_runtime::{AudioCommand, StreamBytes};
+use crate::mp4_movie::Mp4MovieDecoder;
 
 /// Audio channels for movie soundtracks: above the channels script sounds use.
 const MOVIE_AUDIO_CHANNEL_BASE: i32 = 0x4000_0000;
@@ -117,22 +118,24 @@ pub(crate) fn movie_audio_commands(
 
 #[derive(Debug)]
 struct MovieDecoder {
-    source: MovieBytes,
+    source: Option<MovieBytes>,
+    container: Option<Mp4MovieDecoder>,
     packets: Vec<MoviePacket>,
-    /// The MPEG audio elementary stream (Layer II in BGI movies), played as
-    /// one stream by the audio frontend.
+    /// The movie soundtrack, played as one stream by the audio frontend.
     audio: Option<StreamBytes>,
     decoder: Decoder,
     pending_frames: VecDeque<Arc<Frame>>,
     packet_index: usize,
     frame_index: Option<usize>,
     current_frame: Option<Arc<Frame>>,
+    audio_start_ms: i32,
     /// Index of the frame last handed to the bitmap. The target's renderer
     /// (DCVideoImageSender, sub_45C260) copies each sample once.
     delivered_index: Option<usize>,
     frame_interval_ms: i32,
     /// Picture size from the first sequence header.
     size: Option<(u32, u32)>,
+    duration_ms: i32,
     flushed: bool,
     failed: bool,
 }
@@ -144,8 +147,35 @@ struct MoviePacket {
 }
 
 impl MovieDecoder {
-    fn new(source: MovieBytes) -> Option<Self> {
+    fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
+        if Mp4MovieDecoder::supports_resource(_resource) || Mp4MovieDecoder::probe(source.as_slice()) {
+            let mut container = Mp4MovieDecoder::new(source, _resource)?;
+            let duration_ms = container.duration_ms();
+            let frame_interval_ms = 1;
+            let audio_start_ms = container.audio_start_ms();
+            let size = container.size();
+            let audio = container.take_audio();
+            return Some(Self {
+                source: None,
+                container: Some(container),
+                packets: Vec::new(),
+                audio,
+                decoder: Decoder::new(),
+                pending_frames: VecDeque::new(),
+                packet_index: 0,
+                frame_index: None,
+                current_frame: None,
+                audio_start_ms,
+                delivered_index: None,
+                frame_interval_ms,
+                size,
+                duration_ms,
+                flushed: false,
+                failed: false,
+            });
+        }
         let bytes = source.as_slice();
+        let duration_ms = probe_mpeg_duration_ms(bytes);
         let mut packets = Vec::new();
         let mut audio = Vec::new();
         for packet in packet_ranges(bytes) {
@@ -191,7 +221,8 @@ impl MovieDecoder {
             .iter()
             .find_map(|packet| sequence_frame_size(&bytes[packet.range.clone()]));
         Some(Self {
-            source,
+            source: Some(source),
+            container: None,
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
             decoder,
@@ -199,15 +230,20 @@ impl MovieDecoder {
             packet_index: 1,
             frame_index: None,
             current_frame: None,
+            audio_start_ms: 0,
             delivered_index: None,
             frame_interval_ms: (1000.0 / frame_rate).round().max(1.0) as i32,
             size,
+            duration_ms,
             flushed: false,
             failed: false,
         })
     }
 
     fn reset(&mut self) {
+        if let Some(container) = self.container.as_mut() {
+            container.reset();
+        }
         self.decoder = Decoder::new();
         self.pending_frames.clear();
         self.packet_index = 0;
@@ -219,6 +255,11 @@ impl MovieDecoder {
     }
 
     fn frame_at(&mut self, position_ms: i32) -> Option<DecodedImage> {
+        if let Some(container) = self.container.as_mut() {
+            let image = container.frame_at(position_ms);
+            self.frame_index = container.frame_index();
+            return image;
+        }
         let target = (position_ms.max(0) / self.frame_interval_ms.max(1)) as usize;
         if self.frame_index.is_some_and(|index| target < index) {
             self.reset();
@@ -259,7 +300,11 @@ impl MovieDecoder {
             }
             if let Some(packet) = self.packets.get(self.packet_index) {
                 self.packet_index += 1;
-                let data = &self.source.as_slice()[packet.range.clone()];
+                let data = &self
+                    .source
+                    .as_ref()
+                    .expect("MPEG movie retains its source bytes")
+                    .as_slice()[packet.range.clone()];
                 match self.decoder.decode_shared(data, packet.pts_90k) {
                     Ok(frames) => self.pending_frames.extend(frames),
                     Err(_) => self.failed = true,
@@ -349,15 +394,13 @@ impl GraphEffectRegistry {
         if handle < 0 || resource.is_empty() || bytes.as_slice().is_empty() {
             return 4;
         }
-        let duration_ms = probe_mpeg_duration_ms(bytes.as_slice());
-        if crate::file_policy::restricted() && duration_ms <= 0 {
-            // Do not install a permanently active zero-duration process and
-            // leave its native wait procedure blocked forever.
-            return 2;
-        }
-        let Some(movie) = MovieDecoder::new(bytes) else {
+        let Some(movie) = MovieDecoder::new(bytes, &resource) else {
             return 2;
         };
+        let duration_ms = movie.duration_ms;
+        if crate::file_policy::restricted() && duration_ms <= 0 {
+            return 2;
+        }
         self.processes.insert(
             handle,
             GraphEffectProcess {
@@ -492,6 +535,9 @@ impl GraphEffectRegistry {
             // A seek on a running graph renders the sample at the new
             // position again.
             movie.delivered_index = None;
+            if let Some(container) = movie.container.as_mut() {
+                container.invalidate_delivery();
+            }
         }
         0
     }
@@ -647,14 +693,15 @@ impl GraphEffectRegistry {
         self.processes
             .iter()
             .filter_map(|(&handle, process)| {
-                let bytes = process.movie.as_ref()?.audio.clone()?;
+                let movie = process.movie.as_ref()?;
+                let bytes = movie.audio.clone()?;
                 Some(MovieAudio {
                     handle,
                     generation: process.audio_generation,
-                    active: process.active,
+                    active: process.active && process.position_ms >= movie.audio_start_ms,
                     paused: process.paused,
                     volume: process.volume,
-                    position_ms: process.position_ms,
+                    position_ms: process.position_ms.saturating_sub(movie.audio_start_ms),
                     bytes,
                 })
             })
@@ -854,7 +901,7 @@ mod tests {
         let mut bytes = vec![0, 0, 1, 0xB3, 0x01, 0x00, 0x10, 0x13, 0, 0, 0x20, 0];
         bytes.extend_from_slice(&[0, 0, 1, 0xB7]);
         bytes.resize(2 * 1024 * 1024, 0);
-        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes)).unwrap();
+        let movie = MovieDecoder::new(MovieBytes::from_vec(bytes), "large.mpg").unwrap();
         assert_eq!(movie.packet_index, 1);
         assert!(movie.packets.iter().all(|p| p.range.len() <= 64 * 1024));
         assert!(movie.pending_frames.is_empty());

@@ -35,6 +35,9 @@ cargo run -p ethornell-cli -- run --game /path/to/game
 
 `--game` locates the resource archives, loose files, and user data.
 
+Movie playback includes MPEG/BMV and MP4. MP4 supports H.264, VP9 and AV1 video
+with AAC-LC audio through Rust decoders. No additional feature flags are needed.
+
 Without arguments (a double-click), `ethornell` asks for the game folder;
 `ethornell /path/to/sun_flower` plays it directly.
 
