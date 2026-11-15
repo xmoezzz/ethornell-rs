@@ -1165,7 +1165,15 @@ impl RuntimeTraceApi {
                 if let Err(error) = self.graph91_window_with_font(window) {
                     return Some(Err(error));
                 }
-                self.render_native_text_args(&args);
+                // H2O 453020/4531A0: both paths draw through the window's
+                // formatter and commit its cursor, including a lone 0x0A.
+                // Source order: window, text, RGB, [disable shadow], flags.
+                if let Some(text) = args.get(count - 2).and_then(value_to_string) {
+                    let rgb = args.get(count - 3).map(value_to_i32).unwrap_or_default();
+                    let no_shadow = id == 0x93
+                        && args.get(2).map(value_to_i32).unwrap_or_default() != 0;
+                    self.draw_legacy_window_text(window, &text, rgb, no_shadow);
+                }
                 ethornell_vm::Value::None
             }
             0x94 => {

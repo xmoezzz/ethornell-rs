@@ -1327,6 +1327,97 @@ impl RuntimeTraceApi {
         drawn
     }
 
+    /// Immediate window text shared by Graph91:91/93 and Graph92:91. A
+    /// control-only string still belongs to the window page and advances its
+    /// cursor; it must never replace the page with a screen-space text node.
+    pub(crate) fn draw_formatted_window_text(&mut self, target: i32, text: &str) {
+        let state = self.window_text_state(Some(target));
+        if !text.is_empty() {
+            // sub_486500 and the message procedure both enter
+            // sub_42B710, so direct formatted draws must preserve the
+            // same ruby spans and kinsoku wrapping as 92:90.
+            if self.graph_surfaces.contains_key(&target)
+                && self.message_text_node_is_free_for(target)
+            {
+                // Into the window's text bitmap, at its cursor, as
+                // a message draws. It is laid out on the window's
+                // page: from a cursor in mid-line it goes on to the
+                // window's right edge and wraps to its left edge.
+                let drawn = self.draw_window_text_at_once(target, text);
+                self.surface_text_buffers
+                    .entry(target)
+                    .or_default()
+                    .push_str(&drawn);
+            } else {
+                let parsed = parse_and_wrap_styled_message(text, &state);
+                self.surface_text_buffers
+                    .entry(target)
+                    .or_default()
+                    .push_str(&parsed.text);
+                let x = state.x;
+                let y = state.y;
+                // The window composes this text into its own
+                // surface, so it is drawn at the window's priority,
+                // as a 92:90 message is. The handle is not a
+                // priority: 0xB0000000 put the text under the whole
+                // scene.
+                let z = self
+                    .graph_surfaces
+                    .get(&target)
+                    .map(|surface| surface.z)
+                    .unwrap_or(target);
+                self.store_bitmap_text_run(
+                    target,
+                    RuntimeTextNode {
+                        text: parsed.text.clone(),
+                        enabled: true,
+                        owner_object: Some(target),
+                        screen_attached: false,
+                        target_surface: Some(target),
+                        x,
+                        y,
+                        size: state.font_size,
+                        line_height: state.line_height,
+                        formatted_layout: true,
+                        color: state.color,
+                        z,
+                        ruby_spans: parsed.ruby_spans,
+                        style_spans: parsed.style_spans,
+                    },
+                );
+            }
+        }
+    }
+
+    /// H2O 453020/4531A0 -> 43C7F0 -> 42ED00 -> 41BB70: the older
+    /// immediate calls use their RGB operand and the global shadow record;
+    /// 91:93's extra source operand 3 suppresses that shadow when nonzero.
+    pub(crate) fn draw_legacy_window_text(
+        &mut self,
+        target: i32,
+        text: &str,
+        rgb: i32,
+        no_shadow: bool,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let size = self.window_text_state(Some(target)).font_size as i32;
+        let shadow = if no_shadow {
+            None
+        } else {
+            self.graph_defaults.shadow_parameters()
+        };
+        let style = shadow.map_or([0; 5], |(x, y, alpha)| [1, x, y, 0, alpha]);
+        self.surface_text_states
+            .entry(target)
+            .or_default()
+            .message_style = Some(crate::graph_defaults::MessageTextStyle::from_operands(
+            rgb, style, size,
+        ));
+        self.draw_formatted_window_text(target, text);
+    }
+
     pub(crate) fn start_native_message(
         &mut self,
         text: String,

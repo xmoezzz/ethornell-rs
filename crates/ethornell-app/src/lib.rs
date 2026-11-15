@@ -17206,6 +17206,74 @@ mod input_tests {
         assert_eq!(shown_message(&api), "Third line.");
     }
 
+    #[test]
+    fn graph91_window_text_preserves_nvl_paragraphs_and_cursor() {
+        for selector in [0x91, 0x93] {
+            let manager =
+                ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+            let mut api = super::RuntimeTraceApi::new(manager);
+            let window = message_window(&mut api);
+            api.surface_text_states.entry(window).or_default().font_size = 24;
+            api.graph_defaults.shadow_enabled = true;
+            api.graph_defaults.configure_shadow(5, 5, 192);
+            let home = api.surface_text_states[&window];
+            api.start_native_message("First sentence.".into(), Some(window));
+            api.tick_text(10_000);
+            // H2O scrmsg._bp:91:91(window, "\n", colour, 1, 1).
+            // The extended 91:93 has a shadow-disable operand after colour.
+            let mut args = vec![
+                Value::Int(window),
+                Value::Str("\n".into()),
+                Value::Int(0xffffff),
+            ];
+            if selector == 0x93 {
+                args.push(Value::Int(1));
+            }
+            args.extend([Value::Int(1), Value::Int(1)]);
+            call_graph(&mut api, 0x91, selector, &mut args).unwrap();
+            assert_eq!(
+                shown_message(&api),
+                "First sentence.\n",
+                "selector {selector:x}"
+            );
+            let cursor = api.surface_text_states[&window];
+            assert_eq!(cursor.cursor_x, home.cursor_x);
+            assert!(cursor.cursor_y > home.cursor_y);
+            api.start_native_message("Second sentence.".into(), Some(window));
+            api.tick_text(10_000);
+            assert_eq!(shown_message(&api), "First sentence.\nSecond sentence.");
+            // A skipped paragraph is drawn at the same window cursor too.
+            let mut args = vec![
+                Value::Int(window),
+                Value::Str(" More text.".into()),
+                Value::Int(0x112233),
+            ];
+            if selector == 0x93 {
+                args.push(Value::Int(1));
+            }
+            args.extend([Value::Int(1), Value::Int(1)]);
+            call_graph(&mut api, 0x91, selector, &mut args).unwrap();
+            assert_eq!(
+                shown_message(&api),
+                "First sentence.\nSecond sentence. More text."
+            );
+            assert_eq!(
+                api.text_nodes[&api.text_runtime.target_node.unwrap()].target_surface,
+                Some(window)
+            );
+            assert!(!api.text_nodes[&api.text_runtime.target_node.unwrap()].screen_attached);
+            let node = &api.text_nodes[&api.text_runtime.target_node.unwrap()];
+            assert_eq!(node.color, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0, 1.0]);
+            let super::snapshot::TextNodeShadow::Message(shadow) = api.text_node_shadow(node)
+            else {
+                panic!("window text style");
+            };
+            assert_eq!(shadow.is_none(), selector == 0x93);
+            call_graph(&mut api, 0x92, 0x8e, &mut vec![Value::Int(window)]).unwrap();
+            assert!(api.text_runtime.current_visible_text().is_empty());
+        }
+    }
+
     fn draw_at_once(api: &mut super::RuntimeTraceApi, window: i32, text: &str) {
         // Wonderful Everyday's scrmsg._bp draws a skipped line at once with
         // Graph92:91 (its text colour setting and edge style), in a window
@@ -28460,61 +28528,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         [int(4), int(3), int(2), int(1), int(0)],
                     );
                 }
-                let state = self.window_text_state(Some(target));
-                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
-                    // sub_486500 and the message procedure both enter
-                    // sub_42B710, so direct formatted draws must preserve the
-                    // same ruby spans and kinsoku wrapping as 92:90.
-                    if self.graph_surfaces.contains_key(&target)
-                        && self.message_text_node_is_free_for(target)
-                    {
-                        // Into the window's text bitmap, at its cursor, as
-                        // a message draws. It is laid out on the window's
-                        // page: from a cursor in mid-line it goes on to the
-                        // window's right edge and wraps to its left edge.
-                        let drawn = self.draw_window_text_at_once(target, text);
-                        self.surface_text_buffers
-                            .entry(target)
-                            .or_default()
-                            .push_str(&drawn);
-                    } else {
-                        let parsed = text::parse_and_wrap_styled_message(text, &state);
-                        self.surface_text_buffers
-                            .entry(target)
-                            .or_default()
-                            .push_str(&parsed.text);
-                        let x = state.x;
-                        let y = state.y;
-                        // The window composes this text into its own
-                        // surface, so it is drawn at the window's priority,
-                        // as a 92:90 message is. The handle is not a
-                        // priority: 0xB0000000 put the text under the whole
-                        // scene.
-                        let z = self
-                            .graph_surfaces
-                            .get(&target)
-                            .map(|surface| surface.z)
-                            .unwrap_or(target);
-                        self.store_bitmap_text_run(
-                            target,
-                            RuntimeTextNode {
-                                text: parsed.text.clone(),
-                                enabled: true,
-                                owner_object: Some(target),
-                                screen_attached: false,
-                                target_surface: Some(target),
-                                x,
-                                y,
-                                size: state.font_size,
-                                line_height: state.line_height,
-                                formatted_layout: true,
-                                color: state.color,
-                                z,
-                                ruby_spans: parsed.ruby_spans,
-                                style_spans: parsed.style_spans,
-                            },
-                        );
-                    }
+                if let Some(text) = text.as_deref() {
+                    self.draw_formatted_window_text(target, text);
                 }
                 tracing::debug!(
                     target,
