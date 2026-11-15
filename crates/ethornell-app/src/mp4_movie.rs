@@ -1,4 +1,4 @@
-//! Optional MP4/H.264/AAC-LC playback. The container yields Annex-B samples,
+//! Optional MP4/H.264, VP9 and AV1 video with AAC-LC audio. The container yields Annex-B samples,
 //! including SPS/PPS. Display PTS follows each picture through B-frame reorder;
 //! neither average frame duration nor integer milliseconds select pictures.
 use std::collections::VecDeque;
@@ -13,6 +13,9 @@ use rust_h264::nal::{NalUnitType, parse_annex_b};
 
 use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
+
+#[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+mod codecs;
 
 const MAX_PENDING_FRAMES: usize = 32;
 const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
@@ -36,8 +39,13 @@ struct Timing {
     pts: i64,
     color: Color,
 }
+enum Picture {
+    H264(Frame),
+    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+    Extra(codecs::Picture),
+}
 struct TimedFrame {
-    frame: Frame,
+    frame: Picture,
     timing: Timing,
 }
 
@@ -47,6 +55,8 @@ pub(crate) struct Mp4MovieDecoder {
     video_index: usize,
     time_base: Rational,
     decoder: OrderedDecoder<Timing>,
+    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+    extra: Option<codecs::Decoder>,
     pending: VecDeque<TimedFrame>,
     current: Option<TimedFrame>,
     delivered: bool,
@@ -91,13 +101,28 @@ impl Mp4MovieDecoder {
     pub(crate) fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
         let (mut scan, streams) = open(source.clone())?;
         let video = streams.iter().find(|s| s.media_type == MediaType::Video)?;
-        if video.codec_id != CodecId::H264 || video.time_base.num <= 0 || video.time_base.den <= 0 {
-            tracing::warn!(codec=?video.codec_id, "mp4-h264 requires an H.264 video track with valid timestamps");
+        if video.time_base.num <= 0 || video.time_base.den <= 0 {
+            tracing::warn!(codec=?video.codec_id, "MP4 requires valid timestamps");
             return None;
         }
         let size = (video.width, video.height);
         let pixels = (size.0 as usize).checked_mul(size.1 as usize)?;
         if pixels == 0 || pixels > MAX_FRAME_PIXELS {
+            return None;
+        }
+        #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+        let extra = if video.codec_id != CodecId::H264 {
+            Some(codecs::Decoder::new(
+                source.as_slice(),
+                video.codec_id,
+                size,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(any(feature = "mp4-vp9", feature = "mp4-av1")))]
+        if video.codec_id != CodecId::H264 {
+            tracing::warn!(codec=?video.codec_id, "MP4 video codec is not enabled");
             return None;
         }
         let video_index = video.index;
@@ -108,7 +133,7 @@ impl Mp4MovieDecoder {
                 Some(AacConfig::from_stream(&track.extradata)?)
             }
             Some(track) => {
-                tracing::warn!(codec=?track.codec_id, "mp4-h264 supports AAC-LC movie audio");
+                tracing::warn!(codec=?track.codec_id, "MP4 supports AAC-LC movie audio");
                 return None;
             }
             None => None,
@@ -163,6 +188,8 @@ impl Mp4MovieDecoder {
             video_index,
             time_base,
             decoder: OrderedDecoder::new(),
+            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+            extra,
             pending: VecDeque::new(),
             current: None,
             delivered: false,
@@ -210,6 +237,12 @@ impl Mp4MovieDecoder {
         self.decoder = OrderedDecoder::new();
         self.eof = false;
         self.failed = false;
+        #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+        if let Some(extra) = self.extra.as_mut() {
+            if extra.reset().is_none() {
+                self.failed = true;
+            }
+        }
         match open(self.source.clone()) {
             Some((demuxer, _)) => self.demuxer = demuxer,
             None => self.failed = true,
@@ -242,7 +275,11 @@ impl Mp4MovieDecoder {
             return None;
         }
         let selected = self.current.as_ref()?;
-        let image = h264_to_image(&selected.frame, selected.timing.color);
+        let image = match &selected.frame {
+            Picture::H264(frame) => h264_to_image(frame, selected.timing.color),
+            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+            Picture::Extra(frame) => frame.to_image(),
+        };
         if image.is_none() {
             self.failed = true;
             tracing::warn!("unsupported MP4 picture layout/color metadata");
@@ -262,6 +299,14 @@ impl Mp4MovieDecoder {
                 Ok(packet) => packet,
                 Err(DemuxError::Eof) => {
                     self.eof = true;
+                    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+                    if let Some(extra) = self.extra.as_mut() {
+                        let frames = extra.drain();
+                        if !self.queue_extra(frames) {
+                            return None;
+                        }
+                        continue;
+                    }
                     let frames = self.decoder.flush_with_meta();
                     if !self.queue(frames) {
                         return None;
@@ -281,6 +326,14 @@ impl Mp4MovieDecoder {
                 self.failed = true;
                 return None;
             };
+            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+            if let Some(extra) = self.extra.as_mut() {
+                let frames = extra.decode(&packet.data, pts, packet.duration);
+                if !self.queue_extra(frames) {
+                    return None;
+                }
+                continue;
+            }
             let nals = parse_annex_b(&packet.data);
             if nals.is_empty() {
                 self.failed = true;
@@ -320,11 +373,32 @@ impl Mp4MovieDecoder {
             tracing::warn!("MP4 picture queue exceeded its bound");
             return false;
         }
-        self.pending.extend(
-            frames
-                .into_iter()
-                .map(|(frame, timing)| TimedFrame { frame, timing }),
-        );
+        self.pending
+            .extend(frames.into_iter().map(|(frame, timing)| TimedFrame {
+                frame: Picture::H264(frame),
+                timing,
+            }));
+        true
+    }
+    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
+    fn queue_extra(&mut self, frames: Option<Vec<(codecs::Picture, i64)>>) -> bool {
+        let Some(frames) = frames else {
+            self.failed = true;
+            tracing::warn!("MP4 VP9/AV1 decode failed");
+            return false;
+        };
+        if self.pending.len().saturating_add(frames.len()) > MAX_PENDING_FRAMES {
+            self.failed = true;
+            return false;
+        }
+        self.pending
+            .extend(frames.into_iter().map(|(frame, pts)| TimedFrame {
+                frame: Picture::Extra(frame),
+                timing: Timing {
+                    pts,
+                    color: Color::default(),
+                },
+            }));
         true
     }
 }
@@ -340,13 +414,50 @@ fn end_ms(ticks: i64, base: Rational) -> i32 {
     ((n + base.den as i128 - 1) / base.den as i128).clamp(0, i32::MAX as i128) as i32
 }
 fn h264_to_image(frame: &Frame, color: Color) -> Option<DecodedImage> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
+    let sub_y = match frame.chroma_format {
+        rust_h264::decoder::ChromaFormat::Yuv420 => 1,
+        rust_h264::decoder::ChromaFormat::Yuv422 => 0,
+    };
+    let b = frame.bytes_per_sample();
+    planar_to_image(
+        Planar {
+            size: (frame.width, frame.height),
+            depth: frame.bit_depth as usize,
+            sub: (1, sub_y),
+            strides: [
+                frame.width as usize * b,
+                frame.chroma_width() as usize * b,
+                frame.chroma_width() as usize * b,
+            ],
+            planes: [&frame.y, &frame.u, &frame.v],
+            monochrome: false,
+        },
+        color,
+    )
+}
+struct Planar<'a> {
+    size: (u32, u32),
+    depth: usize,
+    sub: (usize, usize),
+    strides: [usize; 3], // Bytes, including high-bit-depth decoder padding.
+    planes: [&'a [u8]; 3],
+    monochrome: bool,
+}
+fn planar_to_image(frame: Planar<'_>, color: Color) -> Option<DecodedImage> {
+    let (width, height) = (frame.size.0 as usize, frame.size.1 as usize);
     let pixels = width.checked_mul(height)?;
-    if pixels == 0 || pixels > MAX_FRAME_PIXELS || !matches!(frame.bit_depth, 8 | 10) {
+    if pixels == 0
+        || pixels > MAX_FRAME_PIXELS
+        || !matches!(frame.depth, 8 | 10 | 12)
+        || frame.sub.0 > 1
+        || frame.sub.1 > 1
+    {
         return None;
     }
+    let identity =
+        color.matrix == 0 && color.full_range && frame.sub == (0, 0) && !frame.monochrome;
     let (kr, kb) = match color.matrix {
+        0 if identity => (0.0, 0.0),
         1 => (0.2126, 0.0722),
         2 if width >= 1280 || height > 576 => (0.2126, 0.0722),
         2 | 5 | 6 => (0.299, 0.114),
@@ -367,47 +478,71 @@ fn h264_to_image(frame: &Frame, color: Color) -> Option<DecodedImage> {
         2.0 * (1.0 - kb) * cscale,
     ]
     .map(|v| (v * scale).round() as i32);
-    let sub_y = match frame.chroma_format {
-        rust_h264::decoder::ChromaFormat::Yuv420 => 1,
-        rust_h264::decoder::ChromaFormat::Yuv422 => 0,
-    };
-    let shift = frame.bit_depth - 8;
-    let sample_bytes = frame.bytes_per_sample();
-    let sample = |plane: &[u8], i: usize| -> Option<i32> {
-        let offset = i.checked_mul(sample_bytes)?;
-        let value = if sample_bytes == 1 {
-            u16::from(*plane.get(offset)?)
+    let shift = frame.depth - 8;
+    let bytes = if frame.depth == 8 { 1 } else { 2 };
+    // Check the last visible sample in each plane before allocating output.
+    for p in 0..if frame.monochrome { 1 } else { 3 } {
+        let sx = if p == 0 { 0 } else { frame.sub.0 };
+        let sy = if p == 0 { 0 } else { frame.sub.1 };
+        let w = (width + (1 << sx) - 1) >> sx;
+        let h = (height + (1 << sy) - 1) >> sy;
+        let row_bytes = w.checked_mul(bytes)?;
+        if frame.strides[p] < row_bytes
+            || (h - 1)
+                .checked_mul(frame.strides[p])?
+                .checked_add(row_bytes)?
+                > frame.planes[p].len()
+        {
+            return None;
+        }
+    }
+    let sample = |p: usize, y: usize, x: usize| -> i32 {
+        let offset = y * frame.strides[p] + x * bytes;
+        let plane = frame.planes[p];
+        let v = if bytes == 1 {
+            u16::from(plane[offset])
         } else {
-            u16::from_le_bytes(plane.get(offset..offset + 2)?.try_into().ok()?)
+            u16::from_le_bytes([plane[offset], plane[offset + 1]])
         };
-        Some(i32::from(value >> shift))
+        i32::from(v >> shift)
     };
     let mut rgba = vec![0; pixels.checked_mul(4)?];
     for y in 0..height {
         for x in 0..width {
-            let yy = sample(&frame.y, y * width + x)? - if color.full_range { 0 } else { 16 };
-            let ci = (y >> sub_y) * frame.chroma_width() as usize + (x >> 1);
-            let u = sample(&frame.u, ci)? - 128;
-            let v = sample(&frame.v, ci)? - 128;
-            let luma = coeff[0] * yy;
-            let rgb = [
-                luma + coeff[1] * v,
-                luma + coeff[2] * u + coeff[3] * v,
-                luma + coeff[4] * u,
-            ];
+            let yy = sample(0, y, x);
+            let (u, v) = if frame.monochrome {
+                (128, 128)
+            } else {
+                (
+                    sample(1, y >> frame.sub.1, x >> frame.sub.0),
+                    sample(2, y >> frame.sub.1, x >> frame.sub.0),
+                )
+            };
+            let rgb = if identity {
+                [v, yy, u]
+            } else {
+                let luma = coeff[0] * (yy - if color.full_range { 0 } else { 16 });
+                [
+                    luma + coeff[1] * (v - 128),
+                    luma + coeff[2] * (u - 128) + coeff[3] * (v - 128),
+                    luma + coeff[4] * (u - 128),
+                ]
+                .map(|v| (v + 8192) >> 14)
+            };
             let offset = (y * width + x) * 4;
             for i in 0..3 {
-                rgba[offset + i] = ((rgb[i] + 8192) >> 14).clamp(0, 255) as u8;
+                rgba[offset + i] = rgb[i].clamp(0, 255) as u8;
             }
             rgba[offset + 3] = 255;
         }
     }
     Some(DecodedImage {
-        width: frame.width,
-        height: frame.height,
+        width: frame.size.0,
+        height: frame.size.1,
         rgba,
     })
 }
+
 struct AacConfig {
     frequency_index: u8,
     channels: u8,
@@ -773,5 +908,170 @@ mod tests {
                 assert!(host.movie_audio().is_empty());
             }
         }
+    }
+    #[cfg(all(feature = "mp4-vp9", feature = "mp4-av1"))]
+    #[test]
+    #[ignore = "requires generated VP9/AV1 MP4, reference YUV and PTS in ETHORNELL_MP4_FIXTURES"]
+    fn mp4_external_vp9_av1_depth_pts_reference_and_lifecycle() {
+        let dir = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_FIXTURES").unwrap());
+        for codec in ["vp9", "av1"] {
+            for depth in [8, 10] {
+                let name = format!("{codec}-{depth}");
+                let file = format!("{name}.mp4");
+                let source = MovieBytes::from_vec(std::fs::read(dir.join(&file)).unwrap());
+                let yuv = std::fs::read(dir.join(format!("{name}.yuv"))).unwrap();
+                let pts: Vec<i64> = std::fs::read_to_string(dir.join(format!("{name}.pts")))
+                    .unwrap()
+                    .lines()
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                assert_eq!(pts.len(), 60);
+                let b = if depth == 8 { 1 } else { 2 };
+                let y_len = 96 * 64 * b;
+                let c_len = 48 * 32 * b;
+                let frame_len = y_len + 2 * c_len;
+                assert_eq!(yuv.len(), pts.len() * frame_len);
+                let mut movie = Mp4MovieDecoder::new(source.clone(), &file).expect(&name);
+                assert!(movie.extra.is_some());
+                assert_eq!(movie.size(), Some((96, 64)));
+                let mut first = None;
+                for (i, &pts) in pts.iter().enumerate() {
+                    let at = end_ms(pts, movie.time_base);
+                    if i != 0 {
+                        assert!(
+                            movie.frame_at(at - 1).is_none(),
+                            "{name}: no premature picture {i}"
+                        );
+                        assert_eq!(movie.frame_index(), Some(i - 1));
+                    }
+                    let image = movie.frame_at(at).expect(&format!("{name}: picture {i}"));
+                    assert_eq!(movie.frame_index(), Some(i));
+                    assert!(!movie.failed, "{name}: picture {i}");
+                    let raw = &yuv[i * frame_len..(i + 1) * frame_len];
+                    let expected = planar_to_image(
+                        Planar {
+                            size: (96, 64),
+                            depth,
+                            sub: (1, 1),
+                            strides: [96 * b, 48 * b, 48 * b],
+                            planes: [
+                                &raw[..y_len],
+                                &raw[y_len..y_len + c_len],
+                                &raw[y_len + c_len..],
+                            ],
+                            monochrome: false,
+                        },
+                        Color {
+                            matrix: 1,
+                            full_range: false,
+                        },
+                    )
+                    .unwrap();
+                    // Independent FFmpeg-decoded planar reference, with identical
+                    // range/matrix conversion. Checks every visible pixel, not a hash.
+                    assert!(
+                        image.rgba == expected.rgba,
+                        "{name}: reference pixels differ at picture {i}"
+                    );
+                    if i == 0 {
+                        first = Some(image.rgba);
+                    }
+                }
+                movie.frame_at(movie.duration_ms() + 1);
+                assert!(!movie.failed);
+                assert_eq!(movie.frame_index(), Some(59));
+                assert_eq!(movie.frame_at(0).unwrap().rgba, *first.as_ref().unwrap());
+                movie.reset();
+                assert_eq!(movie.frame_at(0).unwrap().rgba, *first.as_ref().unwrap());
+                assert!(movie.take_audio().is_some());
+                let mut host = crate::graph_effect::GraphEffectRegistry::default();
+                assert_eq!(host.configure_media(7, String::new(), file, source), 0);
+                assert!(host.prepare_initial_movie_frame(7).is_some());
+                assert_eq!(host.invoke(7).status, 0);
+                assert!(!host.tick_movies(500).is_empty());
+                assert_eq!(host.seek(7, 0), 0);
+                assert!(!host.tick_movies(1).is_empty());
+                assert_eq!(host.set_paused(7, true), 0);
+                assert!(host.tick_movies(500).is_empty());
+                assert_eq!(host.position_ms(7).unwrap(), 1);
+                assert_eq!(host.set_paused(7, false), 0);
+                assert_eq!(host.set_movie_options(7, true, 128), 0);
+                let generation = host.movie_audio()[0].generation;
+                host.tick_movies(10_000);
+                assert!(host.movie_playing(7));
+                assert!(host.movie_audio()[0].generation > generation);
+                assert_eq!(host.close_movie_slot(7), 0);
+                assert!(host.movie_audio().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn mp4_odd_padded_twelve_bit_and_monochrome_planes() {
+        // A 3x3 12-bit image with padding in every plane. Chroma needs ceil
+        // dimensions (2x2), and strides are bytes, not sample counts.
+        let mut y = vec![0xff; 24];
+        let mut c = vec![0xff; 12];
+        for row in 0..3 {
+            for x in 0..3 {
+                y[row * 8 + x * 2..row * 8 + x * 2 + 2].copy_from_slice(&2048u16.to_le_bytes());
+            }
+        }
+        for row in 0..2 {
+            for x in 0..2 {
+                c[row * 6 + x * 2..row * 6 + x * 2 + 2].copy_from_slice(&2048u16.to_le_bytes());
+            }
+        }
+        let image = planar_to_image(
+            Planar {
+                size: (3, 3),
+                depth: 12,
+                sub: (1, 1),
+                strides: [8, 6, 6],
+                planes: [&y, &c, &c],
+                monochrome: false,
+            },
+            Color {
+                matrix: 1,
+                full_range: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .all(|p| p == [128, 128, 128, 255])
+        );
+        let mono = planar_to_image(
+            Planar {
+                size: (3, 3),
+                depth: 12,
+                sub: (0, 0),
+                strides: [8, 0, 0],
+                planes: [&y, &[], &[]],
+                monochrome: true,
+            },
+            Color {
+                matrix: 1,
+                full_range: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(mono.rgba, image.rgba);
+        assert!(
+            planar_to_image(
+                Planar {
+                    size: (3, 3),
+                    depth: 12,
+                    sub: (1, 1),
+                    strides: [8, 6, 6],
+                    planes: [&y, &c[..9], &c],
+                    monochrome: false,
+                },
+                Color::default()
+            )
+            .is_none()
+        );
     }
 }

@@ -12,6 +12,9 @@ workspace = true
 
 [features]
 mp4-h264 = ["ethornell-app/mp4-h264"]
+mp4-vp9 = ["ethornell-app/mp4-vp9"]
+mp4-av1 = ["ethornell-app/mp4-av1"]
+mp4-all = ["ethornell-app/mp4-all"]
 
 [dependencies]
 anyhow.workspace = true

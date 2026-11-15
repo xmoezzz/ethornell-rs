@@ -6,7 +6,7 @@ use na_mpeg2_decoder::{Decoder, Frame, StreamType, frame_to_rgba_bt601_limited, 
 
 use crate::MovieBytes;
 use crate::audio_runtime::{AudioCommand, StreamBytes};
-#[cfg(feature = "mp4-h264")]
+#[cfg(feature = "mp4")]
 use crate::mp4_movie::Mp4MovieDecoder;
 
 /// Audio channels for movie soundtracks: above the channels script sounds use.
@@ -120,7 +120,7 @@ pub(crate) fn movie_audio_commands(
 #[derive(Debug)]
 struct MovieDecoder {
     source: Option<MovieBytes>,
-    #[cfg(feature = "mp4-h264")]
+    #[cfg(feature = "mp4")]
     container: Option<Mp4MovieDecoder>,
     packets: Vec<MoviePacket>,
     /// The movie soundtrack, played as one stream by the audio frontend.
@@ -150,7 +150,7 @@ struct MoviePacket {
 
 impl MovieDecoder {
     fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
-        #[cfg(feature = "mp4-h264")]
+        #[cfg(feature = "mp4")]
         if Mp4MovieDecoder::supports_resource(_resource) || Mp4MovieDecoder::probe(source.as_slice()) {
             let mut container = Mp4MovieDecoder::new(source, _resource)?;
             let duration_ms = container.duration_ms();
@@ -225,7 +225,7 @@ impl MovieDecoder {
             .find_map(|packet| sequence_frame_size(&bytes[packet.range.clone()]));
         Some(Self {
             source: Some(source),
-            #[cfg(feature = "mp4-h264")]
+            #[cfg(feature = "mp4")]
             container: None,
             packets,
             audio: (!audio.is_empty()).then(|| StreamBytes(audio.into())),
@@ -245,7 +245,7 @@ impl MovieDecoder {
     }
 
     fn reset(&mut self) {
-        #[cfg(feature = "mp4-h264")]
+        #[cfg(feature = "mp4")]
         if let Some(container) = self.container.as_mut() {
             container.reset();
         }
@@ -260,7 +260,7 @@ impl MovieDecoder {
     }
 
     fn frame_at(&mut self, position_ms: i32) -> Option<DecodedImage> {
-        #[cfg(feature = "mp4-h264")]
+        #[cfg(feature = "mp4")]
         if let Some(container) = self.container.as_mut() {
             let image = container.frame_at(position_ms);
             self.frame_index = container.frame_index();
@@ -541,7 +541,7 @@ impl GraphEffectRegistry {
             // A seek on a running graph renders the sample at the new
             // position again.
             movie.delivered_index = None;
-            #[cfg(feature = "mp4-h264")]
+            #[cfg(feature = "mp4")]
             if let Some(container) = movie.container.as_mut() {
                 container.invalidate_delivery();
             }
