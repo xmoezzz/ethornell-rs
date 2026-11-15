@@ -5963,8 +5963,10 @@ impl RuntimeTraceApi {
     }
 
     /// CProcCtrlDspObj reads virtual position/alpha getters. BackML's
-    /// overrides address the selected layer (Itsusora 410680/4106C0), not
-    /// CDspObj's otherwise unused ordinary coordinate and alpha fields.
+    /// overrides address the selected layer (Itsusora 410680/4106C0).
+    /// BackF likewise returns its source origin (KiraKira 410870), not the
+    /// unused CDspObj coordinates. Reading the base zero turns a 600->0
+    /// camera pan into a stationary 0->0 control (issue #144).
     fn graph_control_origin(&self, object: i32) -> ((i32, i32), i32) {
         if self
             .graph_object_properties
@@ -5976,10 +5978,19 @@ impl RuntimeTraceApi {
                 [self.graph91_multilayer_background.selected_layer];
             return ((layer.x_16_16, layer.y_16_16), layer.blend_parameter);
         }
-        let position = self.graph_native_base_position(object).unwrap_or_else(|| {
-            let (x, y) = self.graph_object_position(object);
-            (x.round() as i32, y.round() as i32)
-        });
+        let position = self
+            .graph_object_properties
+            .get(&object)
+            .and_then(|p| p.background)
+            .and_then(|background| match background.position {
+                native_background::NativeBackgroundPosition::BackFSource { x, y } => Some((x, y)),
+                _ => None,
+            })
+            .or_else(|| self.graph_native_base_position(object))
+            .unwrap_or_else(|| {
+                let (x, y) = self.graph_object_position(object);
+                (x.round() as i32, y.round() as i32)
+            });
         // Sprite mode 1 overrides GetAlpha with its transition value.
         let alpha = self
             .graph_transition_nodes
@@ -13111,6 +13122,52 @@ mod input_tests {
             api.graph_images["runtime:bitmap:1086"].rgba,
             pixel.repeat(4 * 2)
         );
+    }
+
+    #[test]
+    fn graph90_23_pans_backf_from_its_source_origin_to_the_top_of_a_tall_image() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.screen_width = 4;
+        api.screen_height = 2;
+        activate_backgrounds(&mut api);
+        api.store_runtime_bitmap(
+            128,
+            DecodedImage {
+                width: 4,
+                height: 4,
+                rgba: [10, 20, 30, 40]
+                    .into_iter()
+                    .flat_map(|red| [red, 0, 0, 0].repeat(4))
+                    .collect(),
+            },
+            1,
+        );
+        let mut configure = [0, 2, 128, 0, 0, 0x7000, -1, 0, 0]
+            .into_iter()
+            .map(Value::Int)
+            .collect();
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let frame = |api: &super::RuntimeTraceApi| {
+            super::snapshot::compose_runtime_frame(api, false).rgba
+        };
+        assert_eq!(frame(&api)[0], 30, "initial viewport shows the lower half");
+        assert_eq!(api.graph_native_base_position(0), Some((0, 0)));
+
+        let mut control = [0, 0, 0, 0, 0, 1000, 1000, 0, 0, 113]
+            .into_iter()
+            .map(Value::Int)
+            .collect();
+        call_graph(&mut api, 0x90, 0x23, &mut control).unwrap();
+        let events = api.layer_animations.tick_native_object_controls(500);
+        api.apply_native_control_events(events);
+        assert_eq!(api.graph_control_origin(0).0, (0, 1));
+        assert_eq!(frame(&api)[0], 20, "midpoint actually moves the viewport");
+        let events = api.layer_animations.tick_native_object_controls(500);
+        api.apply_native_control_events(events);
+        assert_eq!(api.graph_control_origin(0).0, (0, 0));
+        assert_eq!(frame(&api)[0], 10, "endpoint reaches the upper half");
     }
 
     #[test]
