@@ -1,4 +1,4 @@
-//! Optional MP4/H.264, VP9 and AV1 video with AAC-LC audio. The container yields Annex-B samples,
+//! MP4/H.264, VP9 and AV1 video with AAC-LC audio. The container yields Annex-B samples,
 //! including SPS/PPS. Display PTS follows each picture through B-frame reorder;
 //! neither average frame duration nor integer milliseconds select pictures.
 use std::collections::VecDeque;
@@ -18,7 +18,6 @@ use rust_h264::threading::ThreadedDecoder as H264Decoder;
 use crate::MovieBytes;
 use crate::audio_runtime::StreamBytes;
 
-#[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
 mod codecs;
 
 const MAX_PENDING_FRAMES: usize = 32;
@@ -45,7 +44,6 @@ struct Timing {
 }
 enum Picture {
     H264(Frame),
-    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
     Extra(codecs::Picture),
 }
 struct TimedFrame {
@@ -59,7 +57,6 @@ pub(crate) struct Mp4MovieDecoder {
     video_index: usize,
     time_base: Rational,
     decoder: H264Decoder,
-    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
     extra: Option<codecs::Decoder>,
     pending: VecDeque<TimedFrame>,
     pending_timings: Vec<Timing>,
@@ -115,7 +112,6 @@ impl Mp4MovieDecoder {
         if pixels == 0 || pixels > MAX_FRAME_PIXELS {
             return None;
         }
-        #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
         let extra = if video.codec_id != CodecId::H264 {
             Some(codecs::Decoder::new(
                 source.as_slice(),
@@ -125,11 +121,6 @@ impl Mp4MovieDecoder {
         } else {
             None
         };
-        #[cfg(not(any(feature = "mp4-vp9", feature = "mp4-av1")))]
-        if video.codec_id != CodecId::H264 {
-            tracing::warn!(codec=?video.codec_id, "MP4 video codec is not enabled");
-            return None;
-        }
         let video_index = video.index;
         let time_base = video.time_base;
         let audio_track = streams.iter().find(|s| s.media_type == MediaType::Audio);
@@ -193,7 +184,6 @@ impl Mp4MovieDecoder {
             video_index,
             time_base,
             decoder: h264_decoder(),
-            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
             extra,
             pending: VecDeque::new(),
             pending_timings: Vec::new(),
@@ -244,7 +234,6 @@ impl Mp4MovieDecoder {
         self.decoder = h264_decoder();
         self.eof = false;
         self.failed = false;
-        #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
         if let Some(extra) = self.extra.as_mut() {
             if extra.reset().is_none() {
                 self.failed = true;
@@ -284,7 +273,6 @@ impl Mp4MovieDecoder {
         let selected = self.current.as_ref()?;
         let image = match &selected.frame {
             Picture::H264(frame) => h264_to_image(frame, selected.timing.color),
-            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
             Picture::Extra(frame) => frame.to_image(),
         };
         if image.is_none() {
@@ -306,7 +294,6 @@ impl Mp4MovieDecoder {
                 Ok(packet) => packet,
                 Err(DemuxError::Eof) => {
                     self.eof = true;
-                    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
                     if let Some(extra) = self.extra.as_mut() {
                         let frames = extra.drain();
                         if !self.queue_extra(frames) {
@@ -333,7 +320,6 @@ impl Mp4MovieDecoder {
                 self.failed = true;
                 return None;
             };
-            #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
             if let Some(extra) = self.extra.as_mut() {
                 let frames = extra.decode(&packet.data, pts, packet.duration);
                 if !self.queue_extra(frames) {
@@ -420,7 +406,6 @@ impl Mp4MovieDecoder {
             .map(|(index, _)| index)?;
         Some(self.pending_timings.swap_remove(index))
     }
-    #[cfg(any(feature = "mp4-vp9", feature = "mp4-av1"))]
     fn queue_extra(&mut self, frames: Option<Vec<(codecs::Picture, i64)>>) -> bool {
         let Some(frames) = frames else {
             self.failed = true;
@@ -962,7 +947,6 @@ mod tests {
             }
         }
     }
-    #[cfg(all(feature = "mp4-vp9", feature = "mp4-av1"))]
     #[test]
     #[ignore = "requires generated VP9/AV1 MP4, reference YUV and PTS in ETHORNELL_MP4_FIXTURES"]
     fn mp4_external_vp9_av1_depth_pts_reference_and_lifecycle() {

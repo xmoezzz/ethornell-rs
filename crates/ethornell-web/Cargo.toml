@@ -11,12 +11,6 @@ crate-type = ["cdylib", "rlib"]
 [lints]
 workspace = true
 
-[features]
-mp4-h264 = ["ethornell-app/mp4-h264"]
-mp4-vp9 = ["ethornell-app/mp4-vp9"]
-mp4-av1 = ["ethornell-app/mp4-av1"]
-mp4-all = ["ethornell-app/mp4-all"]
-
 [dependencies]
 ethornell-app = { path = "../ethornell-app", default-features = false, features = ["host-driven"] }
 ethornell-archive = { path = "../ethornell-archive" }

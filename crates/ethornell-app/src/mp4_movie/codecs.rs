@@ -6,15 +6,12 @@ use ethornell_image::DecodedImage;
 use rff_core::CodecId;
 
 pub(super) enum Picture {
-    #[cfg(feature = "mp4-vp9")]
     Vp9(rusty_vp9::DecodedFrame, Color),
-    #[cfg(feature = "mp4-av1")]
     Av1(rusty_av1d::rust_api::Picture),
 }
 impl Picture {
     pub(super) fn to_image(&self) -> Option<DecodedImage> {
         match self {
-            #[cfg(feature = "mp4-vp9")]
             Self::Vp9(frame, color) => planar_to_image(
                 Planar {
                     size: (frame.width, frame.height),
@@ -34,7 +31,6 @@ impl Picture {
                 },
                 *color,
             ),
-            #[cfg(feature = "mp4-av1")]
             Self::Av1(frame) => {
                 use rusty_av1d::{PixelLayout, rust_api::PlanarImageComponent as P};
                 let (sub, mono) = match frame.pixel_layout() {
@@ -75,13 +71,11 @@ impl Picture {
 }
 
 pub(super) enum Decoder {
-    #[cfg(feature = "mp4-vp9")]
     Vp9 {
         decoder: Box<rusty_vp9::Vp9Decoder>,
         color: Color,
         refs: [(u32, u32); 8],
     },
-    #[cfg(feature = "mp4-av1")]
     Av1 {
         decoder: rusty_av1d::rust_api::Decoder,
         prefix: Vec<u8>,
@@ -95,32 +89,28 @@ impl Decoder {
             return None;
         }
         match &config.fourcc {
-            #[cfg(feature = "mp4-vp9")]
             b"vp09" if codec == CodecId::None || codec == CodecId::Vp9 => Some(Self::Vp9 {
                 decoder: Box::new(rusty_vp9::Vp9Decoder::new()),
                 color: config.vp9_color?,
                 refs: [(0, 0); 8],
             }),
-            #[cfg(feature = "mp4-av1")]
             b"av01" if codec == CodecId::Avif => Some(Self::Av1 {
                 decoder: av1_decoder()?,
                 prefix: config.av1_prefix?,
                 first: true,
             }),
             _ => {
-                tracing::warn!(?codec, fourcc=?config.fourcc, "MP4 codec is not enabled or its configuration is unsupported");
+                tracing::warn!(?codec, fourcc=?config.fourcc, "Unsupported MP4 codec or configuration");
                 None
             }
         }
     }
     pub(super) fn reset(&mut self) -> Option<()> {
         match self {
-            #[cfg(feature = "mp4-vp9")]
             Self::Vp9 { decoder, refs, .. } => {
                 *decoder = Box::new(rusty_vp9::Vp9Decoder::new());
                 *refs = [(0, 0); 8];
             }
-            #[cfg(feature = "mp4-av1")]
             Self::Av1 { decoder, first, .. } => {
                 *decoder = av1_decoder()?;
                 *first = true;
@@ -138,7 +128,6 @@ impl Decoder {
             return None;
         }
         match self {
-            #[cfg(feature = "mp4-vp9")]
             Self::Vp9 {
                 decoder,
                 refs,
@@ -186,7 +175,6 @@ impl Decoder {
                 }
                 Some(output)
             }
-            #[cfg(feature = "mp4-av1")]
             Self::Av1 {
                 decoder,
                 prefix,
@@ -226,9 +214,7 @@ impl Decoder {
     pub(super) fn drain(&mut self) -> Option<Vec<(Picture, i64)>> {
         let mut output = Vec::new();
         match self {
-            #[cfg(feature = "mp4-vp9")]
             Self::Vp9 { .. } => (), // each packet's superframe queue was consumed
-            #[cfg(feature = "mp4-av1")]
             Self::Av1 { decoder, .. } => {
                 drain_av1(decoder, &mut output)?;
             }
@@ -237,7 +223,6 @@ impl Decoder {
         Some(output)
     }
 }
-#[cfg(feature = "mp4-av1")]
 fn av1_decoder() -> Option<rusty_av1d::rust_api::Decoder> {
     let mut settings = rusty_av1d::rust_api::Settings::new();
     settings.set_n_threads(1);
@@ -245,7 +230,6 @@ fn av1_decoder() -> Option<rusty_av1d::rust_api::Decoder> {
     settings.set_frame_size_limit(MAX_FRAME_PIXELS as u32);
     rusty_av1d::rust_api::Decoder::with_settings(&settings).ok()
 }
-#[cfg(feature = "mp4-av1")]
 fn drain_av1(
     decoder: &mut rusty_av1d::rust_api::Decoder,
     output: &mut Vec<(Picture, i64)>,
@@ -265,7 +249,6 @@ fn drain_av1(
     }
 }
 
-#[cfg(feature = "mp4-vp9")]
 fn vp9_parts(data: &[u8]) -> Option<Vec<&[u8]>> {
     let marker = *data.last()?;
     if marker & 0xe0 != 0xc0 {

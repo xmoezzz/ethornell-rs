@@ -58,7 +58,6 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
-#[cfg(feature = "mp4")]
 mod mp4_movie;
 mod native_background;
 mod native_background_effect;

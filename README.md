@@ -35,11 +35,8 @@ cargo run -p ethornell-cli -- run --game /path/to/game
 
 `--game` locates the resource archives, loose files, and user data.
 
-MPEG/BMV movie playback is included by default. Optional MP4 playback uses Rust
-decoders for H.264, VP9 and AV1 video with AAC-LC audio:
-`cargo build --release -p ethornell-cli --features mp4-all`.
-For smaller builds, `mp4-h264` enables H.264 only; `mp4-vp9` or `mp4-av1` adds
-the corresponding codec alongside H.264. These features are off by default.
+Movie playback includes MPEG/BMV and MP4. MP4 supports H.264, VP9 and AV1 video
+with AAC-LC audio through Rust decoders. No additional feature flags are needed.
 
 Without arguments (a double-click), `ethornell` asks for the game folder;
 `ethornell /path/to/sun_flower` plays it directly.
