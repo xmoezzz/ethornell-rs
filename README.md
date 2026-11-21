@@ -41,7 +41,7 @@ with AAC-LC audio through Rust decoders. No additional feature flags are needed.
 Without arguments (a double-click), `ethornell` asks for the game folder;
 `ethornell /path/to/sun_flower` plays it directly.
 
-Builds for Windows (x86_64), Linux (x86_64 and AArch64), FreeBSD (x86_64),
+Builds for Windows (x86_64), Linux (x86_64 and AArch64),
 macOS (a universal `Ethornell.app`), Android (APK), iOS (unsigned IPA), the
 web (a static page), Nintendo Switch (NRO) and PS Vita (VPK) are published on
 [GitHub Releases](https://github.com/xmoezzz/ethornell-rs/releases).
