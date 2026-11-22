@@ -279,6 +279,14 @@ pub(crate) fn rasterize_text(
     let line_pitch = line_pitch
         .filter(|pitch| pitch.is_finite() && *pitch > 0.0)
         .unwrap_or(line_height as f32);
+    // The last line needs room for its descent below the baseline. The face's
+    // line box is not sufficient: it is measured at a different scale and may
+    // be shorter than the descender of a substituted face, which clipped the
+    // bottom of "g" when it was on the final line. Keep the old line-box room
+    // as a floor and add the scaled descent on top of the baseline.
+    let ascent = FontProvider::cell_ascent(font, px_height);
+    let descent = (-scaled.descent()).max(0.0);
+    let bottom = descent.max(line_height as f32 - ascent).ceil().max(1.0) as u32;
     let widths: Vec<u32> = lines
         .iter()
         .map(|line| measure_line(font, line, px_height))
@@ -295,7 +303,10 @@ pub(crate) fn rasterize_text(
         .unwrap_or(1)
         .saturating_add(style_overhang)
         .max(1);
-    let height = ((lines.len().max(1) - 1) as f32 * line_pitch).ceil() as u32 + line_height;
+    let height = ((((lines.len().max(1) - 1) as f32 * line_pitch).round() + ascent)
+        .ceil()
+        .max(0.0) as u32)
+        .saturating_add(bottom);
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
 
     let mut char_index = 0usize;
@@ -484,6 +495,24 @@ mod font_size_tests {
         }
         let multiline = rasterize_text(&font, "日\n月", 24.0, Some(32.0), [1.0; 4], &[]);
         assert_eq!(multiline.height, image.height + 32);
+    }
+
+    #[test]
+    fn final_line_descender_is_not_clipped() {
+        let font = FontProvider::load_system_cjk_font().expect("system CJK font");
+        let image = rasterize_text(&font, "H\ng", 32.0, Some(32.0), [1.0; 4], &[]);
+        let ink = |y: u32| {
+            (0..image.width).any(|x| image.rgba[((y * image.width + x) * 4 + 3) as usize] > 0)
+        };
+        let last = (0..image.height)
+            .rev()
+            .find(|&y| ink(y))
+            .expect("rendered ink");
+        assert!(
+            last + 1 < image.height,
+            "descender touches the raster edge: row {last} of {}",
+            image.height
+        );
     }
 }
 
