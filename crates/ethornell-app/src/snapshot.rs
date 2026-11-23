@@ -790,7 +790,7 @@ fn draw_transformed_text_node(
         let bold = style.is_some_and(|style| style.style.bold);
         let italic = style.is_some_and(|style| style.style.italic);
         let glyph_id = font.glyph_id(ch);
-        let advance = scaled.h_advance(glyph_id).max(node.size * 0.5)
+        let advance = scaled.h_advance(glyph_id)
             + transform.map_or(0.0, |t| t.advance_adjustment(node.size));
         if x + advance > max_x {
             x = node.x;
@@ -893,7 +893,7 @@ fn draw_text_run(
     let baseline = y + FontProvider::cell_ascent(font, size);
     for ch in text.chars() {
         let glyph_id = font.glyph_id(ch);
-        let advance = scaled.h_advance(glyph_id).max(size * 0.5);
+        let advance = scaled.h_advance(glyph_id);
         let glyph = glyph_id.with_scale_and_position(scale, point(x, baseline));
         if let Some((shadow_x, shadow_y, shadow_alpha)) = resolve_text_shadow(shadow, size) {
             draw_glyph(
@@ -1005,7 +1005,7 @@ pub(crate) fn rasterize_bitmap_text(
             continue;
         }
         let glyph_id = font.glyph_id(ch);
-        let advance = scaled.h_advance(glyph_id).max(size * 0.5);
+        let advance = scaled.h_advance(glyph_id);
         let baseline = line_y + FontProvider::cell_ascent(&font, size);
         let glyph = glyph_id.with_scale_and_position(scale, point(x, baseline));
         draw_glyph(dst, &font, glyph, color, 0, 0, false, false, None);
@@ -1259,8 +1259,7 @@ pub(crate) fn glyph_advance(ch: char, size: f32, horizontal_scale_percent: f32) 
     let base = match snapshot_font() {
         Some(font) => font
             .as_scaled(FontProvider::pixel_em_scale(&font, size))
-            .h_advance(font.glyph_id(ch))
-            .max(size * 0.5),
+            .h_advance(font.glyph_id(ch)),
         None if ch.is_ascii() => size * 0.5,
         None => size,
     };
@@ -2117,6 +2116,21 @@ mod font_session_tests {
             assert!(!take_missing_glyphs());
             assert!(take_raster_error().is_none());
         });
+    }
+
+    #[test]
+    fn latin_glyph_advances_stay_proportional() {
+        let font = ethornell_render::FontProvider::load_system_cjk_font().expect("system CJK font");
+        let _session = enter_font_session(&font);
+        let size = 40.0;
+        let i = glyph_advance('i', size, 100.0);
+        let m = glyph_advance('m', size, 100.0);
+        assert!(i < size * 0.5, "narrow glyph was padded to half an em: {i}");
+        assert!(m > i);
+        let mut image = new_raster(400, 80).unwrap();
+        let (end_x, _) =
+            rasterize_bitmap_text(&mut image, "im", 0, 0, size, 0.0, 100.0, [1.0; 4]);
+        assert_eq!(end_x, measure_text_advance("im", size, 0.0));
     }
 
     #[test]
