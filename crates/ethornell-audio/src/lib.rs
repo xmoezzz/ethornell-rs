@@ -430,7 +430,30 @@ impl<B: Backend> AudioSystem<B> {
         Ok(true)
     }
 
+    /// Forgets the channel's handle once its sound has stopped. Kira drops a
+    /// finished sound from the mixer, and nothing drains that handle's
+    /// eight-slot command queue after that: once it fills, every command to
+    /// the handle fails with "command queue is full", for good. A stopped
+    /// sound has nothing left to change, so a command to it is a no-op.
+    fn forget_stopped_channel(&mut self, channel: i32) {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|handle| handle.state() == PlaybackState::Stopped)
+        {
+            self.channels.remove(&channel);
+        }
+        if self
+            .streams
+            .get(&channel)
+            .is_some_and(|handle| handle.state() == PlaybackState::Stopped)
+        {
+            self.streams.remove(&channel);
+        }
+    }
+
     fn stop_channel_now(&mut self, channel: i32) -> Result<()> {
+        self.forget_stopped_channel(channel);
         if let Some(handle) = self.channels.get_mut(&channel) {
             handle.stop(immediate_tween()).map_err(|err| {
                 EthornellError::Other(format!("audio channel stop failed: {err}"))
@@ -501,6 +524,7 @@ impl<B: Backend> AudioSystem<B> {
         if fade_out_ms == 0 {
             return self.stop_channel_now(channel);
         }
+        self.forget_stopped_channel(channel);
         let tween = Tween {
             duration: Duration::from_millis(fade_out_ms),
             ..Tween::default()
@@ -523,6 +547,7 @@ impl<B: Backend> AudioSystem<B> {
     }
 
     pub fn try_pause_channel(&mut self, channel: i32, paused: bool, fade_ms: u64) -> Result<()> {
+        self.forget_stopped_channel(channel);
         let tween = Tween {
             duration: Duration::from_millis(fade_ms),
             ..Tween::default()
@@ -555,6 +580,7 @@ impl<B: Backend> AudioSystem<B> {
         volume: f64,
         fade_ms: u64,
     ) -> Result<()> {
+        self.forget_stopped_channel(channel);
         let tween = Tween {
             duration: Duration::from_millis(fade_ms),
             ..Tween::default()
@@ -577,6 +603,7 @@ impl<B: Backend> AudioSystem<B> {
     }
 
     pub fn set_channel_panning(&mut self, channel: i32, panning: f64, fade_ms: u64) {
+        self.forget_stopped_channel(channel);
         if let Some(handle) = self.streams.get_mut(&channel) {
             let _ = handle.set_panning(
                 panning.clamp(0.0, 1.0),
@@ -889,6 +916,33 @@ mod tests {
 
         assert!(audio.try_set_channel_volume(1, 0.0, 0).is_err());
         assert!(audio.channels.contains_key(&1));
+    }
+
+    #[test]
+    fn commands_to_a_finished_sound_never_fill_its_dead_queue() {
+        let mut audio = mock_audio(128);
+        let data = StaticSoundData {
+            frames: vec![Frame::new(0.5, 0.5); 10].into(),
+            ..tone_data()
+        };
+        audio.start_static_sound(1, data).unwrap();
+        process(&mut audio, 100);
+        process(&mut audio, 1); // the mixer drops the finished sound
+        assert_eq!(audio.channels[&1].state(), PlaybackState::Stopped);
+
+        // A volume ramp outliving its sound, one command per frame: far
+        // more than the handle's queue holds.
+        for step in 0..64 {
+            audio
+                .try_set_channel_volume(1, f64::from(step) / 64.0, 0)
+                .unwrap();
+            audio.set_channel_panning(1, 0.5, 0);
+            audio.try_pause_channel(1, step % 2 == 0, 0).unwrap();
+            audio.try_stop_channel(1, 100).unwrap();
+        }
+        assert!(!audio.channels.contains_key(&1));
+        start_tone(&mut audio, 1);
+        assert!(process(&mut audio, 100).iter().any(|frame| frame.left > 0.0));
     }
 
     #[test]
