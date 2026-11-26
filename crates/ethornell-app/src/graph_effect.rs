@@ -148,7 +148,7 @@ struct MoviePacket {
 
 impl MovieDecoder {
     fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
-        if Mp4MovieDecoder::supports_resource(_resource) || Mp4MovieDecoder::probe(source.as_slice()) {
+        if Mp4MovieDecoder::supports_resource(_resource) || source.probe_mp4() {
             let mut container = Mp4MovieDecoder::new(source, _resource)?;
             let duration_ms = container.duration_ms();
             let frame_interval_ms = 1;
@@ -391,7 +391,7 @@ impl GraphEffectRegistry {
         resource: String,
         bytes: MovieBytes,
     ) -> i32 {
-        if handle < 0 || resource.is_empty() || bytes.as_slice().is_empty() {
+        if handle < 0 || resource.is_empty() || bytes.is_empty() {
             return 4;
         }
         let Some(movie) = MovieDecoder::new(bytes, &resource) else {
@@ -493,7 +493,15 @@ impl GraphEffectRegistry {
         process.result = -1;
         process.audio_generation += 1;
         if let Some(movie) = process.movie.as_mut() {
-            movie.reset();
+            if let Some(container) = movie.container.as_mut()
+                && container.is_pristine_at_start()
+            {
+                // Avoid tearing down the freshly warmed MP4 demuxer/prefetch
+                // worker when invoke() runs immediately after configure_media().
+                container.invalidate_delivery();
+            } else {
+                movie.reset();
+            }
         }
         ethornell_vm::GraphEffectInvocation {
             status: 0,
@@ -531,13 +539,15 @@ impl GraphEffectRegistry {
         process.position_ms = position_ms;
         process.audio_generation += 1;
         if let Some(movie) = process.movie.as_mut() {
-            let _ = movie.frame_at(position_ms);
+            if let Some(container) = movie.container.as_mut() {
+                container.seek_to(position_ms);
+                movie.frame_index = container.frame_index();
+            } else {
+                let _ = movie.frame_at(position_ms);
+            }
             // A seek on a running graph renders the sample at the new
             // position again.
             movie.delivered_index = None;
-            if let Some(container) = movie.container.as_mut() {
-                container.invalidate_delivery();
-            }
         }
         0
     }

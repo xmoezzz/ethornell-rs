@@ -254,6 +254,35 @@ impl Renderer<'_> {
             height: image.height,
         })
     }
+    pub fn insert_opaque_rgba(&mut self, image: &DecodedImage) -> Result<TextureHandle> {
+        validate_rgba(image)?;
+        let native = unsafe { (self.gpu.create)(image.width, image.height, image.rgba.as_ptr()) };
+        if native == 0 {
+            return Err(EthornellError::Other(format!(
+                "native GPU texture allocation failed: {}x{} RGBA",
+                image.width, image.height,
+            )));
+        }
+        let id = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| EthornellError::Other("texture IDs exhausted".into()))?;
+        self.textures.insert(
+            id,
+            Texture {
+                native,
+                width: image.width,
+                height: image.height,
+                opaque: true,
+            },
+        );
+        Ok(TextureHandle {
+            id,
+            width: image.width,
+            height: image.height,
+        })
+    }
     pub fn update_rgba(
         &mut self,
         handle: &TextureHandle,
@@ -271,6 +300,26 @@ impl Renderer<'_> {
             }
         }
         let replacement = self.insert_rgba(image)?;
+        self.remove_texture(handle.id);
+        Ok(replacement)
+    }
+    pub fn update_opaque_rgba(
+        &mut self,
+        handle: &TextureHandle,
+        image: &DecodedImage,
+    ) -> Result<TextureHandle> {
+        validate_rgba(image)?;
+        if let Some(t) = self.textures.get_mut(&handle.id) {
+            if (t.width, t.height) == (image.width, image.height) {
+                check(
+                    unsafe { (self.gpu.update)(t.native, t.width, t.height, image.rgba.as_ptr()) },
+                    "texture upload",
+                )?;
+                t.opaque = true;
+                return Ok(handle.clone());
+            }
+        }
+        let replacement = self.insert_opaque_rgba(image)?;
         self.remove_texture(handle.id);
         Ok(replacement)
     }

@@ -600,6 +600,18 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn insert_rgba(&mut self, image: &DecodedImage) -> Result<TextureHandle> {
+        self.insert_rgba_with_opaque(image, None)
+    }
+
+    pub fn insert_opaque_rgba(&mut self, image: &DecodedImage) -> Result<TextureHandle> {
+        self.insert_rgba_with_opaque(image, Some(true))
+    }
+
+    fn insert_rgba_with_opaque(
+        &mut self,
+        image: &DecodedImage,
+        known_opaque: Option<bool>,
+    ) -> Result<TextureHandle> {
         self.check_gpu()?;
         validate_rgba(image)?;
         self.validate_texture_size(image)?;
@@ -608,7 +620,7 @@ impl<'w> Renderer<'w> {
             .next_texture_id
             .checked_add(1)
             .ok_or_else(|| EthornellError::Other("texture ID space exhausted".into()))?;
-        let record = self.create_texture_record(image);
+        let record = self.create_texture_record(image, known_opaque);
         self.textures.insert(id, record);
         Ok(TextureHandle {
             id,
@@ -621,6 +633,23 @@ impl<'w> Renderer<'w> {
         &mut self,
         handle: &TextureHandle,
         image: &DecodedImage,
+    ) -> Result<TextureHandle> {
+        self.update_rgba_with_opaque(handle, image, None)
+    }
+
+    pub fn update_opaque_rgba(
+        &mut self,
+        handle: &TextureHandle,
+        image: &DecodedImage,
+    ) -> Result<TextureHandle> {
+        self.update_rgba_with_opaque(handle, image, Some(true))
+    }
+
+    fn update_rgba_with_opaque(
+        &mut self,
+        handle: &TextureHandle,
+        image: &DecodedImage,
+        known_opaque: Option<bool>,
     ) -> Result<TextureHandle> {
         self.check_gpu()?;
         validate_rgba(image)?;
@@ -636,15 +665,17 @@ impl<'w> Renderer<'w> {
                 .ok_or_else(|| EthornellError::Parse("unknown texture handle".into()))?;
             self.write_texture(&record.texture, image);
             if let Some(record) = self.textures.get_mut(&handle.id) {
-                record.opaque = image
-                    .rgba
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .all(|pixel| pixel[3] == 255);
+                record.opaque = known_opaque.unwrap_or_else(|| {
+                    image
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 255)
+                });
             }
         } else {
-            let record = self.create_texture_record(image);
+            let record = self.create_texture_record(image, known_opaque);
             self.textures.insert(handle.id, record);
         }
         Ok(TextureHandle {
@@ -683,7 +714,11 @@ impl<'w> Renderer<'w> {
         Ok(())
     }
 
-    fn create_texture_record(&self, image: &DecodedImage) -> TextureRecord {
+    fn create_texture_record(
+        &self,
+        image: &DecodedImage,
+        known_opaque: Option<bool>,
+    ) -> TextureRecord {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ethornell-rgba-texture"),
             size: wgpu::Extent3d {
@@ -729,12 +764,14 @@ impl<'w> Renderer<'w> {
             nearest_bind_group,
             width: image.width,
             height: image.height,
-            opaque: image
-                .rgba
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|pixel| pixel[3] == 255),
+            opaque: known_opaque.unwrap_or_else(|| {
+                image
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255)
+            }),
         }
     }
 

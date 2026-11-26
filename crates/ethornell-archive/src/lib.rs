@@ -234,6 +234,95 @@ pub struct ResourceManager {
     view: Option<Arc<localized::ArchiveView>>,
 }
 
+/// Seekable, bounded reader backed directly by an authorized archive descriptor
+/// held inside [`ResourceManager`]. Avoids copying large uncompressed media
+/// entries (such as MP4 videos) into heap RAM while preserving descriptor policy.
+#[derive(Debug, Clone)]
+pub struct ResourceSliceReader {
+    inner: Arc<ResourceManagerInner>,
+    archive_index: usize,
+    offset: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl ResourceSliceReader {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clone_at_start(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            archive_index: self.archive_index,
+            offset: self.offset,
+            len: self.len,
+            pos: 0,
+        }
+    }
+
+    pub fn read_header(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut reader = self.clone_at_start();
+        let target = buf.len().min(self.len as usize);
+        reader.read_exact(&mut buf[..target])?;
+        Ok(target)
+    }
+
+    pub fn read_all(&self) -> std::io::Result<Vec<u8>> {
+        let size = usize::try_from(self.len)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "slice too large"))?;
+        let mut reader = self.clone_at_start();
+        let mut out = vec![0u8; size];
+        reader.read_exact(&mut out)?;
+        Ok(out)
+    }
+}
+
+impl Read for ResourceSliceReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = (self.len - self.pos) as usize;
+        let to_read = buf.len().min(remaining);
+        let file = self.inner.archive_files.get(self.archive_index).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "archive handle out of range")
+        })?;
+        let mut guard = file.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "archive handle poisoned")
+        })?;
+        guard.seek(SeekFrom::Start(self.offset + self.pos))?;
+        let n = guard.read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for ResourceSliceReader {
+    fn seek(&mut self, style: SeekFrom) -> std::io::Result<u64> {
+        let next = match style {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::End(delta) => i128::from(self.len) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.pos) + i128::from(delta),
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        let next = u64::try_from(next).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek position overflow")
+        })?;
+        self.pos = next;
+        Ok(self.pos)
+    }
+}
+
 impl ResourceManager {
     /// Host-policy entry point. The host opens and authorizes every descriptor;
     /// archives are parsed and retained from those exact descriptors, never
@@ -622,6 +711,111 @@ impl ResourceManager {
             })?;
         self.read_locator_decoded_to_slice(archive_index, entry_index, out)
     }
+    /// Open a streaming, seekable slice over an uncompressed archive entry
+    /// without loading the entire payload into heap memory. Returns `Ok(None)`
+    /// for wrapped/compressed entries (`DSC`, `BSE`) so callers can fall back
+    /// to `read_by_entry_decoded`.
+    pub fn open_raw_slice_by_entry(
+        &self,
+        entry: &ResourceEntry,
+    ) -> Result<Option<ResourceSliceReader>> {
+        let archive_index = self.archive_index_for_path(&entry.archive_path)?;
+        let key = normalize_resource_name(&entry.entry_name);
+        let candidates = self.inner.by_name.get(&key).ok_or_else(|| {
+            EthornellError::Parse(format!(
+                "resource entry not found: {}:{}",
+                entry.archive_path.display(),
+                entry.entry_name
+            ))
+        })?;
+        let entry_index = candidates
+            .iter()
+            .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
+            .find_map(|&(_, candidate_entry)| {
+                let candidate = self.inner.set.archives[archive_index]
+                    .entries
+                    .get(candidate_entry)?;
+                (candidate.name == entry.entry_name && candidate.packed_size == entry.packed_size)
+                    .then_some(candidate_entry)
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
+                    .find_map(|&(_, candidate_entry)| {
+                        let candidate = self.inner.set.archives[archive_index]
+                            .entries
+                            .get(candidate_entry)?;
+                        (candidate.packed_size == entry.packed_size).then_some(candidate_entry)
+                    })
+            })
+            .ok_or_else(|| {
+                EthornellError::Parse(format!(
+                    "resource entry not found: {}:{}",
+                    entry.archive_path.display(),
+                    entry.entry_name
+                ))
+            })?;
+
+        let archive = self.inner.set.archives.get(archive_index).ok_or_else(|| {
+            EthornellError::Parse(format!("archive index out of range: {archive_index}"))
+        })?;
+        let actual = archive.entries.get(entry_index).ok_or_else(|| {
+            EthornellError::Parse(format!(
+                "resource entry index out of range: {archive_index}:{entry_index}"
+            ))
+        })?;
+        checked_buffer_size(
+            actual.packed_size,
+            self.inner.limits.max_packed_bytes,
+            "packed bytes",
+        )?;
+        if let Some(unpacked) = actual.unpacked_size {
+            checked_buffer_size(
+                unpacked,
+                self.inner.limits.max_decoded_bytes,
+                "declared decoded bytes",
+            )?;
+        }
+        let end = actual
+            .offset
+            .checked_add(actual.packed_size)
+            .ok_or_else(|| EthornellError::Parse("entry range overflows".into()))?;
+        let file = self.inner.archive_files.get(archive_index).ok_or_else(|| {
+            EthornellError::Parse(format!("archive handle index out of range: {archive_index}"))
+        })?;
+        let mut header = [0u8; 0x20];
+        let header_len = (actual.packed_size as usize).min(header.len());
+        {
+            let mut guard = file.lock().map_err(|_| {
+                EthornellError::Other(format!(
+                    "archive handle poisoned: {}",
+                    archive.path.display()
+                ))
+            })?;
+            if end > guard.byte_len()? {
+                return Err(EthornellError::Parse(
+                    "entry extends past archive end".into(),
+                ));
+            }
+            guard.seek(SeekFrom::Start(actual.offset))?;
+            guard.read_exact(&mut header[..header_len])?;
+        }
+        if header[..header_len].starts_with(MAGIC_DSC_FORMAT)
+            || header[..header_len].starts_with(b"BSE 1.")
+        {
+            return Ok(None);
+        }
+        check_decoded_size(&header[..header_len], actual.packed_size, &self.inner.limits)?;
+        Ok(Some(ResourceSliceReader {
+            inner: Arc::clone(&self.inner),
+            archive_index,
+            offset: actual.offset,
+            len: actual.packed_size,
+            pos: 0,
+        }))
+    }
+
     /// Size of the same decoded payload returned by read_by_entry_decoded.
     /// Read at most a stack header from the retained authorized archive FD;
     /// never reopen a checked path or allocate/decompress the whole resource.

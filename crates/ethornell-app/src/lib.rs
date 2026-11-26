@@ -148,8 +148,9 @@ use timeline::{TimelineEvent, TimelineSystem};
 use timing::{NATIVE_TICK_MS, normalize_engine_elapsed_ms};
 use user_files::{
     bgi_xxx_pattern_matches, find_runtime_file_from_root, game_root_path, is_empty_archive_arg,
-    read_runtime_bytes, resolve_existing_path_case_insensitive, runtime_file_cache_key,
-    runtime_file_exists_from_root, runtime_file_path, runtime_file_path_from_root,
+    read_runtime_bytes, read_runtime_movie_bytes, resolve_existing_path_case_insensitive,
+    runtime_file_cache_key, runtime_file_exists_from_root, runtime_file_path,
+    runtime_file_path_from_root,
 };
 #[cfg(feature = "desktop-window")]
 use winit::keyboard::KeyCode;
@@ -738,6 +739,12 @@ enum MovieReadBuffer {
 #[derive(Debug, Clone)]
 pub(crate) enum MovieBytes {
     Heap(std::sync::Arc<[u8]>),
+    ArchiveSlice(ethornell_archive::ResourceSliceReader),
+    #[cfg(not(target_arch = "wasm32"))]
+    LooseFile {
+        file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+        len: u64,
+    },
     #[cfg(target_os = "vita")]
     Cdram {
         buffer: std::sync::Arc<VitaMovieReadBuffer>,
@@ -745,14 +752,137 @@ pub(crate) enum MovieBytes {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct SharedFileReader {
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    len: u64,
+    pos: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::io::Read for SharedFileReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Seek as _;
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let to_read = buf.len().min((self.len - self.pos) as usize);
+        let mut guard = self.file.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "movie file mutex poisoned")
+        })?;
+        guard.seek(std::io::SeekFrom::Start(self.pos))?;
+        let n = guard.read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::io::Seek for SharedFileReader {
+    fn seek(&mut self, style: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match style {
+            std::io::SeekFrom::Start(offset) => i128::from(offset),
+            std::io::SeekFrom::End(delta) => i128::from(self.len) + i128::from(delta),
+            std::io::SeekFrom::Current(delta) => i128::from(self.pos) + i128::from(delta),
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        self.pos = u64::try_from(next).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek position overflow")
+        })?;
+        Ok(self.pos)
+    }
+}
+
 impl MovieBytes {
     pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
         Self::Heap(bytes.into())
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Heap(bytes) => bytes.is_empty(),
+            Self::ArchiveSlice(slice) => slice.is_empty(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::LooseFile { len, .. } => *len == 0,
+            #[cfg(target_os = "vita")]
+            Self::Cdram { len, .. } => *len == 0,
+        }
+    }
+
+    pub(crate) fn probe_mp4(&self) -> bool {
+        match self {
+            Self::Heap(bytes) => mp4_movie::Mp4MovieDecoder::probe(bytes),
+            Self::ArchiveSlice(slice) => {
+                let mut hdr = [0u8; 8];
+                slice
+                    .read_header(&mut hdr)
+                    .is_ok_and(|n| mp4_movie::Mp4MovieDecoder::probe(&hdr[..n]))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::LooseFile { file, len } => {
+                use std::io::{Read as _, Seek as _};
+                if *len < 8 {
+                    return false;
+                }
+                let mut hdr = [0u8; 8];
+                file.lock().ok().is_some_and(|mut guard| {
+                    guard.seek(std::io::SeekFrom::Start(0)).is_ok()
+                        && guard.read_exact(&mut hdr).is_ok()
+                        && mp4_movie::Mp4MovieDecoder::probe(&hdr)
+                })
+            }
+            #[cfg(target_os = "vita")]
+            Self::Cdram { buffer, len } => {
+                mp4_movie::Mp4MovieDecoder::probe(&buffer.as_slice()[..*len])
+            }
+        }
+    }
+
+    pub(crate) fn open_seekable(&self) -> Option<rff_format::SeekInput> {
+        match self {
+            Self::Heap(_) => Some(Box::new(std::io::Cursor::new(self.clone()))),
+            Self::ArchiveSlice(slice) => Some(Box::new(slice.clone_at_start())),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::LooseFile { file, len } => Some(Box::new(SharedFileReader {
+                file: std::sync::Arc::clone(file),
+                len: *len,
+                pos: 0,
+            })),
+            #[cfg(target_os = "vita")]
+            Self::Cdram { .. } => Some(Box::new(std::io::Cursor::new(self.clone()))),
+        }
+    }
+
+    pub(crate) fn read_all_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Heap(bytes) => Some(bytes.to_vec()),
+            Self::ArchiveSlice(slice) => slice.read_all().ok(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::LooseFile { file, len } => {
+                use std::io::{Read as _, Seek as _};
+                let size = usize::try_from(*len).ok()?;
+                let mut out = vec![0u8; size];
+                let mut guard = file.lock().ok()?;
+                guard.seek(std::io::SeekFrom::Start(0)).ok()?;
+                guard.read_exact(&mut out).ok()?;
+                Some(out)
+            }
+            #[cfg(target_os = "vita")]
+            Self::Cdram { buffer, len } => Some(buffer.as_slice()[..*len].to_vec()),
+        }
+    }
+
     pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Heap(bytes) => bytes,
+            Self::ArchiveSlice(_) => &[],
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::LooseFile { .. } => &[],
             #[cfg(target_os = "vita")]
             Self::Cdram { buffer, len } => &buffer.as_slice()[..*len],
         }
@@ -1972,7 +2102,7 @@ impl RuntimeTraceApi {
             self.movie_read_buffer.load_decoded(&self.manager, &entry).ok()?
         };
         #[cfg(not(feature = "console"))]
-        let bytes = MovieBytes::from_vec(read_runtime_bytes(&self.manager, archive, resource)?);
+        let bytes = read_runtime_movie_bytes(&self.manager, archive, resource)?;
         if self.graph_effects.configure_media(
             handle,
             archive.to_string(),
@@ -29271,13 +29401,13 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     }
                     #[cfg(not(feature = "console"))]
                     {
-                        read_runtime_bytes(&self.manager, &archive, &resource)
+                        read_runtime_movie_bytes(&self.manager, &archive, &resource)
                             .map(|bytes| {
                                 self.graph_effects.configure_media(
                                     bitmap,
                                     archive.clone(),
                                     resource.clone(),
-                                    MovieBytes::from_vec(bytes),
+                                    bytes,
                                 )
                             })
                             .unwrap_or(2)

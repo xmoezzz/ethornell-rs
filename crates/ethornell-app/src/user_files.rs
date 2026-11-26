@@ -466,6 +466,103 @@ pub(crate) fn read_runtime_bytes(
     manager.read_by_entry_decoded(&entry).ok()
 }
 
+/// Open a movie resource for playback. Uncompressed MP4 containers are backed
+/// directly by an authorized archive slice or open file descriptor so large
+/// videos are streamed on demand instead of copied whole into heap RAM.
+pub(crate) fn read_runtime_movie_bytes(
+    manager: &ResourceManager,
+    archive: &str,
+    file: &str,
+) -> Option<super::MovieBytes> {
+    if super::mp4_movie::Mp4MovieDecoder::supports_resource(file) {
+        if let Some(policy) = super::file_policy::active() {
+            if !authorized_archive_arg(archive) {
+                return None;
+            }
+            if named_archive(archive) {
+                let entry = find_runtime_resource(manager, archive, file)?;
+                if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                    let movie = super::MovieBytes::ArchiveSlice(slice);
+                    if movie.probe_mp4() {
+                        return Some(movie);
+                    }
+                }
+                return manager
+                    .read_by_entry_decoded(&entry)
+                    .ok()
+                    .map(super::MovieBytes::from_vec);
+            }
+            // Fall through to policy-authorized read for loose/aliased files,
+            // trying streaming archive slice when no loose file matches.
+            let scoped = super::file_policy::user_data_alias(&scoped_name(archive, file)?);
+            let scoped_str = scoped.as_str();
+            match policy.read_loose(scoped_str) {
+                Ok(bytes) => return Some(super::MovieBytes::from_vec(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            if scoped_str.replace('\\', "/").starts_with("bgi-user/")
+                || scoped_str.replace('\\', "/").starts_with("bgi-resource/")
+            {
+                return None;
+            }
+            if let Some(container) = authorized_container_name(manager, scoped_str) {
+                return policy
+                    .read_resource(&container, 256 * 1024 * 1024)
+                    .ok()
+                    .map(super::MovieBytes::from_vec);
+            }
+            let entry = find_runtime_resource(manager, archive, file)?;
+            if entry.packed_size > 256 * 1024 * 1024
+                || entry.unpacked_size.unwrap_or(0) > 256 * 1024 * 1024
+            {
+                return None;
+            }
+            if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                let movie = super::MovieBytes::ArchiveSlice(slice);
+                if movie.probe_mp4() {
+                    return Some(movie);
+                }
+            }
+            return manager
+                .read_by_entry_decoded(&entry)
+                .ok()
+                .filter(|b| b.len() <= 256 * 1024 * 1024)
+                .map(super::MovieBytes::from_vec);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = find_runtime_file(manager, archive, file)
+            && let Ok(open_file) = std::fs::File::open(&path)
+            && let Ok(meta) = open_file.metadata()
+        {
+            let len = meta.len();
+            if len > 0 && len <= 256 * 1024 * 1024 {
+                let movie = super::MovieBytes::LooseFile {
+                    file: std::sync::Arc::new(std::sync::Mutex::new(open_file)),
+                    len,
+                };
+                if movie.probe_mp4() {
+                    return Some(movie);
+                }
+            }
+        }
+        if let Some(entry) = find_runtime_resource(manager, archive, file) {
+            if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                let movie = super::MovieBytes::ArchiveSlice(slice);
+                if movie.probe_mp4() {
+                    return Some(movie);
+                }
+            }
+            return manager
+                .read_by_entry_decoded(&entry)
+                .ok()
+                .map(super::MovieBytes::from_vec);
+        }
+    }
+    read_runtime_bytes(manager, archive, file).map(super::MovieBytes::from_vec)
+}
+
 pub(crate) fn authorized_container_name(manager: &ResourceManager, file: &str) -> Option<String> {
     // Only a container already indexed from an authorized FD can satisfy the
     // BGI data01xxx.arc family alias. Never interpret it as a host glob.
