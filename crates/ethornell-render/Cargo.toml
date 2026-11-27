@@ -17,6 +17,7 @@ tracing.workspace = true
 bytemuck.workspace = true
 ethornell-image = { path = "../ethornell-image" }
 ab_glyph.workspace = true
+ttf-parser.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { workspace = true, features = ["webgl"] }
