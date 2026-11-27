@@ -10,6 +10,22 @@ fn elapsed_ms_with_carry(delta_ns: u64, remainder: &mut u64) -> u64 {
     total / 1_000_000
 }
 
+fn admit_step(last_tick: &mut Option<u64>, remainder: &mut u64, now: u64) -> Result<Option<u64>> {
+    let Some(last) = *last_tick else {
+        *last_tick = Some(now);
+        return Ok(None);
+    };
+    if now < last {
+        *last_tick = Some(now);
+        return Err(EthornellError::Other("non-monotonic host clock".into()));
+    }
+    if now - last < 16_000_000 {
+        return Ok(None);
+    }
+    *last_tick = Some(now);
+    Ok(Some(elapsed_ms_with_carry(now - last, remainder)))
+}
+
 // A bounded admission profile, not a process RSS limit. Real Amairo bootstrap
 // measured 648,441,292 retained VM/shared/journal bytes at 14 VMs (before
 // threads handed one heap around instead of copying it). Preserve the
@@ -716,20 +732,11 @@ impl HostRuntime {
             self.tick_remainder_ns = 0;
             return Ok(());
         }
-        let Some(last) = self.last_tick else {
-            self.last_tick = Some(now);
+        let Some(raw_elapsed) = admit_step(&mut self.last_tick, &mut self.tick_remainder_ns, now)?
+        else {
             return Ok(());
         };
-        if now < last {
-            self.last_tick = Some(now);
-            return Err(EthornellError::Other("non-monotonic host clock".into()));
-        }
-        if now - last < 16_000_000 {
-            return Ok(());
-        }
         self.engine_frames += 1;
-        self.last_tick = Some(now);
-        let raw_elapsed = elapsed_ms_with_carry(now - last, &mut self.tick_remainder_ns);
         let elapsed = raw_elapsed;
         #[cfg(feature = "console")]
         let elapsed =
@@ -1316,24 +1323,41 @@ mod tests {
     #[test]
     fn display_refresh_elapsed_carries_submilliseconds_without_extra_vm_passes() {
         for hz in [60u64, 90, 120] {
+            let mut last_tick = None;
+            let mut carry = 0;
+            assert_eq!(admit_step(&mut last_tick, &mut carry, 0).unwrap(), None);
             let mut last = 0;
             let mut sum = 0;
-            let mut carry = 0;
             let mut passes = 0;
             for frame in 1..=hz * 10 {
                 let now = frame * 1_000_000_000 / hz;
-                if now - last < 16_000_000 {
+                let Some(elapsed) = admit_step(&mut last_tick, &mut carry, now).unwrap() else {
                     continue;
-                }
-                sum += elapsed_ms_with_carry(now - last, &mut carry);
+                };
+                sum += elapsed;
                 passes += 1;
                 last = now;
             }
             assert_eq!(sum, last / 1_000_000);
             assert!(passes <= 600);
             assert!(carry < 1_000_000);
+            if hz == 60 {
+                assert_eq!(passes, 600);
+            }
         }
         assert_eq!(normalize_engine_elapsed_ms(501, 500), 0);
+    }
+
+    #[test]
+    fn backwards_clock_restarts_step_timing() {
+        let mut last_tick = Some(50_000_000);
+        let mut carry = 0;
+        assert!(admit_step(&mut last_tick, &mut carry, 40_000_000).is_err());
+        assert_eq!(last_tick, Some(40_000_000));
+        assert_eq!(
+            admit_step(&mut last_tick, &mut carry, 56_000_000).unwrap(),
+            Some(16)
+        );
     }
     #[test]
     fn native_host_routing_is_group_specific_and_nonhost_queries_fall_through() {
