@@ -466,6 +466,105 @@ pub(crate) fn read_runtime_bytes(
     manager.read_by_entry_decoded(&entry).ok()
 }
 
+/// Open a movie resource for playback. Uncompressed MP4 containers are backed
+/// directly by an authorized archive slice or open file descriptor so large
+/// videos are streamed on demand instead of copied whole into heap RAM.
+pub(crate) fn read_runtime_movie_bytes(
+    manager: &ResourceManager,
+    archive: &str,
+    file: &str,
+) -> Option<super::MovieBytes> {
+    if super::mp4_movie::Mp4MovieDecoder::supports_resource(file) {
+        if let Some(policy) = super::file_policy::active() {
+            if !authorized_archive_arg(archive) {
+                return None;
+            }
+            if named_archive(archive) {
+                let entry = find_runtime_resource(manager, archive, file)?;
+                if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                    let movie = super::MovieBytes::ArchiveSlice(slice);
+                    if movie.probe_mp4() {
+                        return Some(movie);
+                    }
+                }
+                return manager
+                    .read_by_entry_decoded(&entry)
+                    .ok()
+                    .map(super::MovieBytes::from_vec);
+            }
+            // Fall through to policy-authorized read for loose/aliased files,
+            // trying streaming archive slice when no loose file matches.
+            let scoped = super::file_policy::user_data_alias(&scoped_name(archive, file)?);
+            let scoped_str = scoped.as_str();
+            match policy.read_loose(scoped_str) {
+                Ok(bytes) => return Some(super::MovieBytes::from_vec(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            if scoped_str.replace('\\', "/").starts_with("bgi-user/")
+                || scoped_str.replace('\\', "/").starts_with("bgi-resource/")
+            {
+                return None;
+            }
+            if let Some(container) = authorized_container_name(manager, scoped_str) {
+                return policy
+                    .read_resource(&container, 256 * 1024 * 1024)
+                    .ok()
+                    .map(super::MovieBytes::from_vec);
+            }
+            let entry = find_runtime_resource(manager, archive, file)?;
+            if entry.packed_size > 256 * 1024 * 1024
+                || entry.unpacked_size.unwrap_or(0) > 256 * 1024 * 1024
+            {
+                return None;
+            }
+            if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                let movie = super::MovieBytes::ArchiveSlice(slice);
+                if movie.probe_mp4() {
+                    return Some(movie);
+                }
+            }
+            return manager
+                .read_by_entry_decoded(&entry)
+                .ok()
+                .filter(|b| b.len() <= 256 * 1024 * 1024)
+                .map(super::MovieBytes::from_vec);
+        }
+
+        if let Some(path) = find_runtime_file(manager, archive, file) {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Ok(open_file) = std::fs::File::open(&path)
+                && let Ok(meta) = open_file.metadata()
+                && meta.is_file()
+            {
+                // The .mp4 extension already selects the container decoder.
+                // Preserve loose-file priority even if probing would fail.
+                return Some(super::MovieBytes::LooseFile {
+                    file: std::sync::Arc::new(std::sync::Mutex::new(open_file)),
+                    len: meta.len(),
+                });
+            }
+            if let Ok(bytes) = std::fs::read(path) {
+                return Some(super::MovieBytes::from_vec(bytes));
+            }
+        }
+        if let Some(entry) = find_runtime_resource(manager, archive, file) {
+            if let Ok(Some(slice)) = manager.open_raw_slice_by_entry(&entry) {
+                let movie = super::MovieBytes::ArchiveSlice(slice);
+                if movie.probe_mp4() {
+                    return Some(movie);
+                }
+            }
+            return manager
+                .read_by_entry_decoded(&entry)
+                .ok()
+                .map(super::MovieBytes::from_vec);
+        }
+        return None;
+    }
+    read_runtime_bytes(manager, archive, file).map(super::MovieBytes::from_vec)
+}
+
 pub(crate) fn authorized_container_name(manager: &ResourceManager, file: &str) -> Option<String> {
     // Only a container already indexed from an authorized FD can satisfy the
     // BGI data01xxx.arc family alias. Never interpret it as a host glob.
@@ -695,6 +794,43 @@ mod tests {
         let manager = ResourceManager::open_game(&root).unwrap();
         assert_eq!(read_runtime_bytes(&manager, "", ""), None);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mp4_loose_file_takes_priority_over_archive_entry() {
+        use crate::MovieBytes;
+
+        let root = temporary_root("movie-source-priority");
+        let movie_name = "opening.mp4";
+        let archived = b"\0\0\0\x08free\0\0\0\x10ftypisom\0\0\0\0";
+        let mut archive = b"BURIKO ARC20".to_vec();
+        archive.extend_from_slice(&1u32.to_le_bytes());
+        let mut name = [0; 0x60];
+        name[..movie_name.len()].copy_from_slice(movie_name.as_bytes());
+        archive.extend_from_slice(&name);
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&(archived.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&[0; 24]);
+        archive.extend_from_slice(archived);
+        std::fs::write(root.join("data01000.arc"), archive).unwrap();
+        let manager = ResourceManager::open_game(&root).unwrap();
+
+        let loose_path = root.join(movie_name);
+        // Even if content probing fails, the loose file still owns this name.
+        std::fs::write(&loose_path, b"loose file without an MP4 signature").unwrap();
+        let loose = read_runtime_movie_bytes(&manager, "", movie_name).unwrap();
+        assert!(matches!(loose, MovieBytes::LooseFile { .. }));
+        assert!(!loose.probe_mp4());
+        drop(loose);
+        std::fs::remove_file(&loose_path).unwrap();
+
+        let source = read_runtime_movie_bytes(&manager, "", movie_name).unwrap();
+        assert!(matches!(source, MovieBytes::ArchiveSlice(_)));
+        assert_eq!(source.read_all_bytes().as_deref(), Some(archived.as_slice()));
+        drop(source);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

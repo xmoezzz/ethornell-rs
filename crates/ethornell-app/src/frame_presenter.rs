@@ -45,13 +45,13 @@ pub(crate) fn prepare_frame(
             }
             match presenter.movie_texture.as_mut() {
                 Some((_, cached)) if cached.revision != revision => {
-                    cached.handle = renderer.update_rgba(&cached.handle, image)?;
+                    cached.handle = renderer.update_opaque_rgba(&cached.handle, image)?;
                     cached.revision = revision;
                 }
                 Some(_) => {}
                 None => {
                     presenter.movie_texture = Some((item.key.clone(), CachedGraphTexture {
-                        handle: renderer.insert_rgba(image)?, revision,
+                        handle: renderer.insert_opaque_rgba(image)?, revision,
                     }));
                 }
             }
