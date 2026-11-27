@@ -61,7 +61,8 @@ pub(crate) fn load_default_font() -> Result<FontArc> {
 }
 
 /// Desktop selection: explicit fonts, then a usable game-folder font, then
-/// a system font. The chosen face is shared by GPU text, bitmap text and metrics.
+/// BGI's default text face if it is installed, then any system font. The
+/// chosen face is shared by GPU text, bitmap text and metrics.
 pub(crate) fn load_game_font(root: &Path, gbk: bool) -> Result<FontArc> {
     if let Some(font) = SESSION_FONT.with(|session| session.borrow().clone()) {
         return Ok(font);
@@ -79,7 +80,10 @@ pub(crate) fn load_game_font(root: &Path, gbk: bool) -> Result<FontArc> {
     if let Some(font) = super::game_font::load(root, required) {
         return Ok(font);
     }
-    ethornell_render::FontProvider::load_system_for_text(required)
+    ethornell_render::FontProvider::load_system_for_text_preferring(
+        &[crate::native_user::STOCK_FONT_FACES[0]],
+        required,
+    )
 }
 
 /// The snapshot font when one is named, else the text font: the file

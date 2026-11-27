@@ -88,8 +88,30 @@ impl FontProvider {
     /// Hosts should pass their own required SJIS/GBK repertoire/sample here,
     /// or validate their explicit font with require_coverage before bootstrap.
     pub fn load_system_for_text(required_text: &str) -> Result<FontArc> {
+        Self::load_system_for_text_preferring(&[], required_text)
+    }
+
+    /// Like [`Self::load_system_for_text`], but first takes an installed face
+    /// whose family name is one of `families`, as GDI's CreateFont resolves
+    /// the face a game names. Family names (name ID 1) match in any language
+    /// the face records, without case, as GDI matches `lfFaceName`. A named
+    /// face that lacks `required_text` is passed over.
+    pub fn load_system_for_text_preferring(
+        families: &[&str],
+        required_text: &str,
+    ) -> Result<FontArc> {
         let mut search = SystemFontSearch::new(required_text);
-        search.first_match().ok_or_else(|| {
+        for family in families {
+            if let Some(font) = search.first_match(Some(&family.trim().to_lowercase())) {
+                tracing::info!(family, "loaded the requested font face from the system");
+                return Ok(font);
+            }
+            tracing::info!(
+                family,
+                "requested font face is not installed; using a substitute"
+            );
+        }
+        search.first_match(None).ok_or_else(|| {
             EthornellError::Other(format!(
                 "no usable system font with required glyph coverage (tried {} faces in {} files; set ETHORNELL_FONT to a CJK-capable font file)",
                 search.faces, search.files
@@ -108,10 +130,13 @@ fn required_chars(text: &str) -> Vec<char> {
 }
 
 /// Tries system font files for the first face covering the required text,
-/// and counts what it read for the failure message.
+/// and counts what the last search read for the failure message.
 struct SystemFontSearch {
     chars: Vec<char>,
     candidates: Vec<PathBuf>,
+    /// Font files under the system roots, minus the candidates; walked only
+    /// when a search misses every candidate.
+    discovered: Option<Vec<PathBuf>>,
     files: usize,
     faces: usize,
 }
@@ -124,6 +149,7 @@ impl SystemFontSearch {
                 .iter()
                 .filter_map(|path| std::fs::canonicalize(path).ok())
                 .collect(),
+            discovered: None,
             files: 0,
             faces: 0,
         }
@@ -133,17 +159,19 @@ impl SystemFontSearch {
     /// are walked only when none of them does. A TTC can contain regional
     /// faces, so every face of each file is checked rather than assuming
     /// face 0 supports the session's language. Only the winning file is read
-    /// whole and parsed.
-    fn first_match(&mut self) -> Option<FontArc> {
+    /// whole and parsed. `family` is lowercased.
+    fn first_match(&mut self, family: Option<&str>) -> Option<FontArc> {
         let Self {
             chars,
             candidates,
+            discovered,
             files,
             faces,
         } = self;
+        (*files, *faces) = (0, 0);
         let mut check = |path: &PathBuf| {
             *files += 1;
-            let face = covering_face(path, chars, faces)?;
+            let face = covering_face(path, family, chars, faces)?;
             let font = FontProvider::load_file(path, face).ok()?;
             // Confirm on the parsed face, so a disagreement with the cmap
             // check can never pick a font that lacks a glyph.
@@ -153,9 +181,14 @@ impl SystemFontSearch {
             })
         };
         candidates.iter().find_map(&mut check).or_else(|| {
-            let mut discovered = discovered_font_files(&system_font_roots());
-            discovered.retain(|path| !candidates.contains(path));
-            discovered.iter().find_map(&mut check)
+            discovered
+                .get_or_insert_with(|| {
+                    let mut files = discovered_font_files(&system_font_roots());
+                    files.retain(|path| !candidates.contains(path));
+                    files
+                })
+                .iter()
+                .find_map(&mut check)
         })
     }
 }
@@ -276,10 +309,17 @@ fn is_font_file(path: &Path) -> bool {
 }
 
 /// The first face of the font file at `path` whose `cmap` maps every char of
-/// `required`. Reads only the collection header, each face's table directory
-/// and its `cmap`, not the whole file: glyph outlines are most of a CJK font,
-/// so a miss costs a few KiB instead of megabytes. Counts the faces it checks.
-fn covering_face(path: &Path, required: &[char], faces: &mut usize) -> Option<u32> {
+/// `required` and, when `family` (lowercased) is given, whose `name` table
+/// records that family. Reads only the collection header, each face's table
+/// directory and the tables checked, not the whole file: glyph outlines are
+/// most of a CJK font, so a miss costs a few KiB instead of megabytes. Counts
+/// the faces it checks.
+fn covering_face(
+    path: &Path,
+    family: Option<&str>,
+    required: &[char],
+    faces: &mut usize,
+) -> Option<u32> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let header = read_at(&mut file, len, 0, 12)?;
@@ -305,6 +345,14 @@ fn covering_face(path: &Path, required: &[char], faces: &mut usize) -> Option<u3
             continue;
         };
         *faces += 1;
+        if let Some(family) = family {
+            let named = table_location(&tables, b"name")
+                .and_then(|(at, size)| read_at(&mut file, len, at, size as usize))
+                .is_some_and(|data| names_family(&data, family));
+            if !named {
+                continue;
+            }
+        }
         let covers = match checked {
             Some((location, covers)) if location == cmap => covers,
             _ => read_at(&mut file, len, cmap.0, cmap.1 as usize)
@@ -338,6 +386,21 @@ fn table_location(records: &[u8], tag: &[u8; 4]) -> Option<(u64, u64)> {
                 be_u32(&record[12..16]).into(),
             )
         })
+}
+
+/// Whether a `name` table records `family` (lowercased) as a family name
+/// (name ID 1) in any language. A face carries localized family names, such
+/// as both "MS Gothic" and "ＭＳ ゴシック", and GDI accepts either.
+fn names_family(name: &[u8], family: &str) -> bool {
+    let Some(table) = ttf_parser::name::Table::parse(name) else {
+        return false;
+    };
+    table.names.into_iter().any(|record| {
+        record.name_id == ttf_parser::name_id::FAMILY
+            && record
+                .to_string()
+                .is_some_and(|name| name.trim().to_lowercase() == family)
+    })
 }
 
 /// Mirrors ttf-parser's `Face::glyph_index`, which ab_glyph's `glyph_id`
@@ -460,10 +523,72 @@ mod tests {
                     })
                     .find(|(_, font)| FontProvider::missing_glyphs(font, required).is_empty())
                     .map(|(face, _)| face);
-                let checked = covering_face(path, &required_chars(required), &mut 0);
+                let checked = covering_face(path, None, &required_chars(required), &mut 0);
                 assert_eq!(checked, parsed, "{} for {required:?}", path.display());
             }
         }
+    }
+
+    /// A `name` table (format 0) of Windows Unicode records.
+    fn name_table(records: &[(u16, u16, &str)]) -> Vec<u8> {
+        let strings: Vec<Vec<u8>> = records
+            .iter()
+            .map(|(_, _, text)| text.encode_utf16().flat_map(u16::to_be_bytes).collect())
+            .collect();
+        let count = records.len() as u16;
+        let mut table = Vec::new();
+        for value in [0, count, 6 + 12 * count] {
+            table.extend(value.to_be_bytes());
+        }
+        let mut offset = 0u16;
+        for ((language, name_id, _), bytes) in records.iter().zip(&strings) {
+            for value in [3, 1, *language, *name_id, bytes.len() as u16, offset] {
+                table.extend(value.to_be_bytes());
+            }
+            offset += bytes.len() as u16;
+        }
+        strings.iter().for_each(|bytes| table.extend(bytes));
+        table
+    }
+
+    #[test]
+    fn family_matches_any_localized_name_without_case() {
+        let table = name_table(&[
+            (0x409, 1, "MS Gothic"),
+            (0x411, 1, "ＭＳ ゴシック"),
+            (0x409, 4, "MS Mincho"),
+        ]);
+        assert!(names_family(&table, &"ＭＳ ゴシック".to_lowercase()));
+        assert!(names_family(&table, &"MS GOTHIC".to_lowercase()));
+        // Only family names (ID 1) count, not the full name (ID 4).
+        assert!(!names_family(&table, "ms mincho"));
+        assert!(!names_family(&table, "ms"));
+        assert!(!names_family(&[0, 0], "ms gothic"));
+    }
+
+    #[test]
+    fn installed_face_is_found_by_family_name() {
+        let path = super::super::SYSTEM_CJK_FONT_CANDIDATES
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .chain(discovered_font_files(&system_font_roots()))
+            .next()
+            .expect("system font file");
+        let bytes = std::fs::read(&path).unwrap();
+        let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+        let family = face
+            .names()
+            .into_iter()
+            .find(|name| name.name_id == ttf_parser::name_id::FAMILY)
+            .and_then(|name| name.to_string())
+            .expect("family name");
+        let mut search = SystemFontSearch::new("A");
+        assert!(search.first_match(Some(&family.to_lowercase())).is_some());
+        assert!(search.first_match(Some("ethornell no such face")).is_none());
+        // A missing face falls back to the coverage search.
+        assert!(
+            FontProvider::load_system_for_text_preferring(&["Ethornell No Such Face"], "A").is_ok()
+        );
     }
 
     #[test]
@@ -482,7 +607,7 @@ mod tests {
         ] {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();
-            assert_eq!(covering_face(&path, &['A'], &mut 0), None, "{name}");
+            assert_eq!(covering_face(&path, None, &['A'], &mut 0), None, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

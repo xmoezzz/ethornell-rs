@@ -231,7 +231,10 @@ impl HostRuntime {
                 let required = if config.gbk { "A日本語中文简体繁體" } else { "A日本語中文" };
                 match file_policy::scope(&policy, || game_font::load(&policy.resource, required)) {
                     Some(font) => font,
-                    None => ethornell_render::FontProvider::load_system_for_text(required)?,
+                    None => ethornell_render::FontProvider::load_system_for_text_preferring(
+                        &[crate::native_user::STOCK_FONT_FACES[0]],
+                        required,
+                    )?,
                 }
             }
         };

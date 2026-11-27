@@ -420,6 +420,11 @@ pub(super) struct NativeUserState {
     last_window_bitmap_draw: Option<(i32, i32, i32)>,
 }
 
+/// The stock faces sub_468B70 interns first: id 0 Gothic, the engine's
+/// default text face, and id 1 Mincho (the Japanese names on a Japanese
+/// system, sub_46F6F0). The session font prefers an installed Gothic.
+pub(crate) const STOCK_FONT_FACES: [&str; 2] = ["ＭＳ ゴシック", "ＭＳ 明朝"];
+
 impl Default for NativeUserState {
     fn default() -> Self {
         Self {
@@ -442,7 +447,7 @@ impl Default for NativeUserState {
             next_font_id: 2,
             fonts: BTreeMap::from([
                 (
-                    "ＭＳ ゴシック".to_string(),
+                    STOCK_FONT_FACES[0].to_string(),
                     NativeFontRecord {
                         id: 0,
                         option: -1,
@@ -450,7 +455,7 @@ impl Default for NativeUserState {
                     },
                 ),
                 (
-                    "ＭＳ 明朝".to_string(),
+                    STOCK_FONT_FACES[1].to_string(),
                     NativeFontRecord {
                         id: 1,
                         option: -1,
