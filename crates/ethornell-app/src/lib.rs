@@ -766,7 +766,7 @@ impl std::io::Read for SharedFileReader {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
-        let to_read = buf.len().min((self.len - self.pos) as usize);
+        let to_read = (buf.len() as u64).min(self.len - self.pos) as usize;
         let mut guard = self.file.lock().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "movie file mutex poisoned")
         })?;
@@ -815,32 +815,9 @@ impl MovieBytes {
     }
 
     pub(crate) fn probe_mp4(&self) -> bool {
-        match self {
-            Self::Heap(bytes) => mp4_movie::Mp4MovieDecoder::probe(bytes),
-            Self::ArchiveSlice(slice) => {
-                let mut hdr = [0u8; 8];
-                slice
-                    .read_header(&mut hdr)
-                    .is_ok_and(|n| mp4_movie::Mp4MovieDecoder::probe(&hdr[..n]))
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            Self::LooseFile { file, len } => {
-                use std::io::{Read as _, Seek as _};
-                if *len < 8 {
-                    return false;
-                }
-                let mut hdr = [0u8; 8];
-                file.lock().ok().is_some_and(|mut guard| {
-                    guard.seek(std::io::SeekFrom::Start(0)).is_ok()
-                        && guard.read_exact(&mut hdr).is_ok()
-                        && mp4_movie::Mp4MovieDecoder::probe(&hdr)
-                })
-            }
-            #[cfg(target_os = "vita")]
-            Self::Cdram { buffer, len } => {
-                mp4_movie::Mp4MovieDecoder::probe(&buffer.as_slice()[..*len])
-            }
-        }
+        self.open_seekable().is_some_and(|input| {
+            mp4_movie::Mp4MovieDecoder::probe(input).unwrap_or(false)
+        })
     }
 
     pub(crate) fn open_seekable(&self) -> Option<rff_format::SeekInput> {

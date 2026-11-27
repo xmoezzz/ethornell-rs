@@ -3,6 +3,7 @@
 //! neither average frame duration nor integer milliseconds select pictures.
 use std::collections::VecDeque;
 use std::fmt;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
@@ -522,8 +523,34 @@ impl Mp4MovieDecoder {
             .rsplit_once('.')
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("mp4"))
     }
-    pub(crate) fn probe(bytes: &[u8]) -> bool {
-        bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
+    pub(crate) fn probe(mut input: impl Read + Seek) -> io::Result<bool> {
+        // Walk top-level boxes by size so leading padding is allowed and large
+        // media boxes can be skipped without reading their contents.
+        let len = input.seek(SeekFrom::End(0))?;
+        let mut offset = 0;
+        let mut header = [0; 8];
+        while len - offset >= 8 {
+            input.seek(SeekFrom::Start(offset))?;
+            input.read_exact(&mut header)?;
+            let size = u32::from_be_bytes(header[..4].try_into().unwrap());
+            let (size, header_size) = match size {
+                0 => (len - offset, 8),
+                1 => {
+                    let mut extended = [0; 8];
+                    input.read_exact(&mut extended)?;
+                    (u64::from_be_bytes(extended), 16)
+                }
+                size => (u64::from(size), 8),
+            };
+            if size < header_size || size > len - offset {
+                return Ok(false);
+            }
+            if matches!(&header[4..], b"ftyp" | b"moov") && size >= header_size + 8 {
+                return Ok(true);
+            }
+            offset += size;
+        }
+        Ok(false)
     }
     pub(crate) fn new(source: MovieBytes, _resource: &str) -> Option<Self> {
         let (mut scan, streams) = open(&source)?;
@@ -1321,6 +1348,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mp4_probe_reads_top_level_box_headers() {
+        let probe = |bytes: &[u8]| MovieBytes::from_vec(bytes.to_vec()).probe_mp4();
+
+        assert!(probe(b"\0\0\0\x08free\0\0\0\x10ftypisom\0\0\0\0"));
+        assert!(probe(
+            b"\0\0\0\x01free\0\0\0\0\0\0\0\x10\0\0\0\x10ftypisom\0\0\0\0"
+        ));
+        assert!(probe(b"\0\0\0\x08wide\0\0\0\x08mdat\0\0\0\0moov\0\0\0\x08mvhd"));
+        assert!(!probe(b"\0\0\0\x18free\0\0\0\x10ftypisom\0\0\0\0"));
+        assert!(!probe(b"\0\0\0\x07free\0\0\0\x10ftypisom\0\0\0\0"));
+        assert!(!probe(b"\0\0\0\x14ftypisom\0\0\0\0"));
+        assert!(!probe(b"\0\0\0\x01free\0\0\0\0"));
+    }
+
+    #[test]
     fn mp4_rational_deadlines_keep_fractional_cadence() {
         let base = Rational {
             num: 1,
@@ -1429,7 +1471,14 @@ mod tests {
         use kira::manager::{AudioManagerSettings, backend::mock::MockBackend};
         let dir = std::path::PathBuf::from(std::env::var_os("ETHORNELL_MP4_FIXTURES").unwrap());
         for (file, full_range, matrix) in [("cfr.mp4", false, 1), ("vfr.mp4", true, 6)] {
-            let source = MovieBytes::from_vec(std::fs::read(dir.join(file)).unwrap());
+            let mut bytes = std::fs::read(dir.join(file)).unwrap();
+            if file == "vfr.mp4" {
+                // Preserve box offsets while exercising a movie without ftyp.
+                assert_eq!(&bytes[4..8], b"ftyp");
+                bytes[4..8].copy_from_slice(b"free");
+            }
+            let source = MovieBytes::from_vec(bytes);
+            assert!(source.probe_mp4());
             let mut movie = Mp4MovieDecoder::new(source.clone(), file).expect("configured movie");
             assert_eq!(movie.size(), Some((96, 64)));
             assert_eq!(movie.color.full_range, full_range);

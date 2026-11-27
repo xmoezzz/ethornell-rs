@@ -265,13 +265,6 @@ impl ResourceSliceReader {
         }
     }
 
-    pub fn read_header(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut reader = self.clone_at_start();
-        let target = buf.len().min(self.len as usize);
-        reader.read_exact(&mut buf[..target])?;
-        Ok(target)
-    }
-
     pub fn read_all(&self) -> std::io::Result<Vec<u8>> {
         let size = usize::try_from(self.len)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "slice too large"))?;
